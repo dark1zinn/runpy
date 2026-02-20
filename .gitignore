@@ -1,3 +1,16 @@
 /target
 .direnv
+
+# Python stuff
 .venv
+venv
+.env
+__pycache__
+*.pyc
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+*.egg-info/
+dist/
+build/
