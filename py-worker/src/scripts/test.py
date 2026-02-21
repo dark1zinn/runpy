@@ -1,18 +1,21 @@
-from bridge.base_worker import BaseWorker
-import sys
+from bridge.base_worker import BaseWorker, RunScript
 
 class ScraperWorker(BaseWorker):
     def handle_request(self, request_data):
         # Business logic is isolated here
-        print(f"Received HTML: {request_data['html'][:50]}...")  # Just a preview
-        
-        return {
-            "status": "success",
-            "title": "Hello from Python!",
-            "links_count": 1
-        }
+        try:
+            self.notify_rust("INFO", "Starting parse operation", {"message": f"Received HTML: {request_data}"})
+            # logic here...
+            self.notify_rust("DONE", "Scraping complete", {
+                "status": "success",
+                "title": "Hello from Python!",
+                "links_count": 1
+            })
+            return
+        except Exception as e:
+            self.notify_rust("ERROR", str(e))
+            return
 
 if __name__ == "__main__":
-    # Rust will pass the socket path as the first argument
-    worker = ScraperWorker(sys.argv[1])
-    worker.run()
+    # The RunScript function abstracts away the worker initialization and execution
+    RunScript(ScraperWorker)

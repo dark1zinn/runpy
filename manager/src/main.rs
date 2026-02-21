@@ -1,7 +1,9 @@
 use serde::{Serialize, Deserialize};
-use std::os::unix::net::UnixStream;
-use std::io::{Write, Read};
+use tokio::net::UnixListener;
 use std::process::{Command, Child};
+
+mod protocol;
+use protocol::ControlPlane;
 
 #[derive(Serialize)]
 pub struct ScrapingRequest {
@@ -18,43 +20,60 @@ pub struct ScrapingResponse {
 pub struct PythonManager {
     _process: Child, // Keep it alive
     pub socket_path: String,
+    plane: ControlPlane,
 }
 
 impl PythonManager {
-    pub fn new(script: &str, sock: &str) -> Self {
+    pub async fn new(script: &str, sock: &str) -> Self {
+        if std::path::Path::new(sock).exists() {
+            std::fs::remove_file(sock).expect("Failed to remove existing socket");
+        }
+
+        let listener = UnixListener::bind(sock).expect("Failed to remove existing socket");
+        let mut plane = ControlPlane::new(listener);
+        plane.start().await;
+        // tokio::spawn(async move {
+        // });
+        
         let child = Command::new("./py-worker/.venv/bin/python")
-            .arg(script)
-            .arg(sock)
-            .spawn()
-            .expect("Failed to start worker");
+        .arg(script)
+        .arg(sock)
+        .spawn()
+        .expect("Failed to start worker");
         
         // Give the socket a moment to initialize
         std::thread::sleep(std::time::Duration::from_millis(500));
 
-        Self { _process: child, socket_path: sock.to_string() }
+        Self { _process: child, socket_path: sock.to_string(), plane }
     }
 
-    pub fn call(&self, req: ScrapingRequest) -> ScrapingResponse {
-        let mut stream = UnixStream::connect(&self.socket_path).expect("Connect failed");
-        
-        let payload = serde_json::to_string(&req).unwrap();
-        stream.write_all(payload.as_bytes()).unwrap();
-        stream.shutdown(std::net::Shutdown::Write).unwrap();
+    // fn spawn(script: &str, sock: &str) -> Child {
+    //     Command::new("./py-worker/.venv/bin/python")
+    //         .arg(script)
+    //         .arg(sock)
+    //         .spawn()
+    //         .expect("Failed to start worker")
+    // }
 
-        let mut response_raw = String::new();
-        stream.read_to_string(&mut response_raw).unwrap();
+    // pub async fn call(&mut self, req: ScrapingRequest) -> ScrapingResponse {
         
-        serde_json::from_str(&response_raw).expect("Failed to parse Python response")
-    }
+    //     let payload = serde_json::to_string(&req).unwrap();
+    //     self.plane.listener.write_all(payload.as_bytes()).unwrap();
+    //     self.plane.listener.shutdown(std::net::Shutdown::Write).unwrap();
+        
+    //     let mut response_raw = String::new();
+    //     self.plane.listener.read_to_string(&mut response_raw).unwrap();
+        
+    //     serde_json::from_str(&response_raw).expect("Failed to parse Python response")
+    // }
 }
 
-fn main() {
-    let manager = PythonManager::new("py-worker/src/scripts/test.py", "/tmp/rust_py.sock");
+#[tokio::main]
+async fn main() {
+    let _ = PythonManager::new("./py-worker/src/scripts/test.py", "./sockets/runpy_rp.sock");
     
-    let req = ScrapingRequest {
-        html: "<html><title>Hello from Rust!</title><body><a href='#'>Link</a></body></html>".into()
-    };
+    
 
-    let response = manager.call(req);
-    println!("Python says: {:?}", response);
+    // let response = manager.call(req).await;
+    // println!("Python says: {:?}", response);
 }

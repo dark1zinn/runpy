@@ -1,5 +1,6 @@
 /target
 .direnv
+sockets
 
 # Python stuff
 .venv
