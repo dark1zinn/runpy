@@ -2,6 +2,7 @@ import socket
 import json
 import os
 import sys
+import struct
 
 from typing import Type
 
@@ -35,18 +36,51 @@ class BaseWorker:
         self._sock_path = sock
 
         try:
-            if os.path.exists(self._sock_path):
-                os.remove(self._sock_path)
-            self.server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            self.server.connect(self._sock_path)
+            # if os.path.exists(self._sock_path):
+            #     os.remove(self._sock_path)
+            self.stream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.stream.connect(self._sock_path)
         except Exception as e:
             print(f"Failed to set up socket: {e}")
             exit(1)
 
         self.__ok = True
-        self.notify_rust("READY", "Worker is ready to receive requests")
+        self.send("READY", "Worker is ready to receive requests")
 
-    def notify_rust(self, msg_type: str, message: str, data=None):
+    def __send_message(self, data: bytes):
+        """Send a length-prefixed message"""
+        try:
+            # Pack size as little-endian u64 (8 bytes)
+            size = struct.pack('<Q', len(data))
+            self.stream.sendall(size + data)
+        except Exception as e:
+            print(f"Failed to send message: {e}")
+            self.__ok = False
+    
+    def __recv_message(self) -> dict:
+        """Receive a length-prefixed message"""
+        try:
+            # Read 8 bytes for the size
+            size_data = self.stream.recv(8)
+            if not size_data:
+                return None
+            
+            size = struct.unpack('<Q', size_data)[0]
+            
+            # Read exactly `size` bytes
+            data = b""
+            while len(data) < size:
+                chunk = self.stream.recv(size - len(data))
+                if not chunk:
+                    raise ConnectionError("Connection closed unexpectedly")
+                data += chunk
+            
+            return json.loads(data.decode())
+        except Exception as e:
+            print(f"Error receiving message: {e}")
+            return None
+    
+    def send(self, msg_type: str, message: str, data=None):
         """Sends a message back to Rust's Control Plane"""
         payload = {
             "type": msg_type.upper(),
@@ -54,7 +88,7 @@ class BaseWorker:
             "data": data or {}
         }
         try:
-            self.server.sendall(json.dumps(payload).encode())
+            self.__send_message(json.dumps(payload).encode())
         except Exception as e:
             print(f"Failed to notify Rust: {e}")
             self.__ok = False
@@ -71,21 +105,16 @@ class BaseWorker:
         self.__run()
 
     def __run(self):
-        server = self.server
         print(f"Worker listening on {self._sock_path}")
 
         while self.__ok:
             try:
-                conn, _ = server.accept()
-                with conn:
-                    raw_data = conn.recv(1024 * 10).decode() # Adjust buffer as needed
-                    if not raw_data: continue
-                    
-                    request = json.loads(raw_data)
-                    # The actual logic happens here
-                    self.handle_request(request)
+                request = self.__recv_message()
+                if not request: continue
+                # The actual logic happens here
+                self.handle_request(request)
             except Exception as e:
                 print(f"Error handling request: {e}")
-                self.notify_rust("ERROR", str(e))
+                self.send("ERROR", str(e))
                 self.__ok = False
                 exit(1)

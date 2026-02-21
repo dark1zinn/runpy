@@ -20,7 +20,6 @@ pub struct ScrapingResponse {
 pub struct Runpy {
     _process: Child, // Keep it alive
     pub socket_path: String,
-    plane: ControlPlane,
 }
 
 impl Runpy {
@@ -31,9 +30,10 @@ impl Runpy {
 
         let listener = UnixListener::bind(sock).expect("Failed to remove existing socket");
         let mut plane = ControlPlane::new(listener);
-        plane.start().await;
-        // tokio::spawn(async move {
-        // });
+
+        tokio::spawn(async move {
+            plane.start().await;
+        });
         
         let child = Command::new("./py-worker/.venv/bin/python")
         .arg(script)
@@ -44,7 +44,7 @@ impl Runpy {
         // Give the socket a moment to initialize
         std::thread::sleep(std::time::Duration::from_millis(500));
 
-        Self { _process: child, socket_path: sock.to_string(), plane }
+        Self { _process: child, socket_path: sock.to_string() }
     }
 
     // fn spawn(script: &str, sock: &str) -> Child {
@@ -70,10 +70,8 @@ impl Runpy {
 
 #[tokio::main]
 async fn main() {
-    let _ = Runpy::new("./py-worker/src/scripts/test.py", "./sockets/runpy_rp.sock");
+    let _manager = Runpy::new("./py-worker/src/scripts/test.py", "./sockets/runpy_rp.sock").await;
     
-    
-
-    // let response = manager.call(req).await;
-    // println!("Python says: {:?}", response);
+    // tokio::signal::ctrl_c().await.expect("Failed to listen for Ctrl+C");
+    println!("\nShutting down...");
 }
