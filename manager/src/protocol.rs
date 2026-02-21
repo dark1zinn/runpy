@@ -15,8 +15,12 @@ pub enum Message {
     Get { key: String },
     Action { action: String, params: Value },
     Done { message: String, data: Value },
+    Debug { message: String, data: Value },
     Terminate,
     Ready { message: String },
+    Retry,
+    Meta { data: Value },
+    Execute { payload: Value },
 }
 
 pub struct ControlPlane {
@@ -45,8 +49,24 @@ impl ControlPlane {
             let mut size_buf = [0u8; 8];
             match stream.read_exact(&mut size_buf).await {
                 Ok(_) => {},
-                Err(_) => {
-                    eprintln!("Connection closed or read error");
+                Err(e) => {
+                    match e.kind() {
+                        std::io::ErrorKind::UnexpectedEof => {
+                            println!("Connection closed by peer");
+                        }
+                        std::io::ErrorKind::ConnectionReset => {
+                            eprintln!("Connection reset by peer");
+                        }
+                        std::io::ErrorKind::PermissionDenied => {
+                            eprintln!("Permission denied on socket operation");
+                        }
+                        std::io::ErrorKind::BrokenPipe => {
+                            eprintln!("Broken pipe - peer closed unexpectedly");
+                        }
+                        _ => {
+                            eprintln!("Unknown error: {} (kind: {:?})", e, e.kind());
+                        }
+                    }
                     break;
                 }
             }
@@ -57,8 +77,12 @@ impl ControlPlane {
             let mut message_buf = vec![0u8; message_size];
             match stream.read_exact(&mut message_buf).await {
                 Ok(_) => {},
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    eprintln!("Connection closed by peer while reading message body");
+                    break;
+                }
                 Err(e) => {
-                    eprintln!("Failed to read message: {}", e);
+                    eprintln!("Error reading message body: {} (kind: {:?})", e, e.kind());
                     break;
                 }
             }
@@ -71,7 +95,7 @@ impl ControlPlane {
                     Self::handle_message(msg, stream).await;
                 }
                 Err(e) => {
-                    eprintln!("JSON parse error: {} | Raw: {}", e, message_str);
+                    eprintln!("JSON parse error: {} \n  Raw: {}", e, message_str);
                 }
             }
         }
@@ -86,24 +110,42 @@ impl ControlPlane {
                     html: "<html><title>Hello from Rust!</title><body><a href='#'>Link</a></body></html>".into()
                 };
                 
-                let payload = serde_json::to_string(&req).unwrap();
-                let size = payload.len() as u64;
-                
-                // Send length prefix + payload
-                if let Err(e) = stream.write_all(&size.to_le_bytes()).await {
-                    eprintln!("Failed to write size: {}", e);
-                    return;
-                }
-                if let Err(e) = stream.write_all(payload.as_bytes()).await {
-                    eprintln!("Failed to write payload: {}", e);
-                    return;
+                let req_msg = Message::Execute {
+                    payload: serde_json::to_value(req).unwrap()
+                };
+                if let Err(e) = Self::send_message(stream, &req_msg).await {
+                    eprintln!("Failed to send scraping request: {}", e);
                 }
             },
             Message::Info { message, .. } => println!("LOG: {}", message),
-            Message::Error { message, .. } => eprintln!("PY ERROR: {}", message),
-            // TODO: THE PYHTON PROCESS BECOMES A ZOMBIE AFTER SENDING THIS MESSAGE, NEED TO HANDLE THE TERMINATION OF THE PROCESS!!!
-            Message::Done { message, data } => { println!("DONE: {} with data: {}", message, data) },
+            Message::Debug { message, data } => println!("DEBUG: {} \n  With data: {}", message, data),
+            Message::Error { message, stack_trace } => {
+                eprintln!("Worker ERROR: {} \n  Stack trace: {:?}", message, stack_trace);
+                let req: Message = Message::Terminate;
+                if let Err(e) = Self::send_message(stream, &req).await {
+                    eprintln!("Failed to send termination message: {}", e);
+                }
+            },
+            Message::Done { message, data } => {
+                println!("DONE: {} with data: {}", message, data);
+                
+                let req: Message = Message::Terminate;
+                
+                if let Err(e) = Self::send_message(stream, &req).await {
+                    eprintln!("Failed to send termination message: {}", e);
+                }
+            },
             _ => println!("Received message type: {:?}", msg),
         }
+    }
+    
+    // Send length prefix + payload
+    pub async fn send_message(stream: &mut tokio::net::UnixStream, msg: &Message) -> Result<(), Box<dyn std::error::Error>> {
+        let payload = serde_json::to_string(msg)?;
+        let size = payload.len() as u64;
+        
+        stream.write_all(&size.to_le_bytes()).await?;
+        stream.write_all(payload.as_bytes()).await?;
+        Ok(())
     }
 }
