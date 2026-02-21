@@ -17,13 +17,13 @@ pub struct ScrapingResponse {
     pub links_count: usize,
 }
 
-pub struct PythonManager {
+pub struct Runpy {
     _process: Child, // Keep it alive
     pub socket_path: String,
     plane: ControlPlane,
 }
 
-impl PythonManager {
+impl Runpy {
     pub async fn new(script: &str, sock: &str) -> Self {
         if std::path::Path::new(sock).exists() {
             std::fs::remove_file(sock).expect("Failed to remove existing socket");
@@ -70,7 +70,7 @@ impl PythonManager {
 
 #[tokio::main]
 async fn main() {
-    let _ = PythonManager::new("./py-worker/src/scripts/test.py", "./sockets/runpy_rp.sock");
+    let _ = Runpy::new("./py-worker/src/scripts/test.py", "./sockets/runpy_rp.sock");
     
     
 

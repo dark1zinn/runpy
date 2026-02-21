@@ -1,6 +1,6 @@
 from bridge.base_worker import BaseWorker, RunScript
 
-class ScraperWorker(BaseWorker):
+class TestWorker(BaseWorker):
     def handle_request(self, request_data):
         # Business logic is isolated here
         try:
@@ -18,4 +18,4 @@ class ScraperWorker(BaseWorker):
 
 if __name__ == "__main__":
     # The RunScript function abstracts away the worker initialization and execution
-    RunScript(ScraperWorker)
+    RunScript(TestWorker)
