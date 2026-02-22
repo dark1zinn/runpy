@@ -19,19 +19,29 @@
  Here's a simple breakdown for you to quickly test it:
 
 - First clone this repository (duh)
-- Alright, once your cwd (at the terminal, text-editor, whatever), `cd py-worker` then `python -m venv .venv` (yeah you need Python, who would've guessed).
+- Alright, once your get to the project directory (at the terminal, text-editor, whatever), `cd py-worker` then `python -m venv .venv` (yeah you need Python, who would've guessed).
 - Now just run `pip install -e .`, and the Python part is done.
-- Expectating that you've already heve Rust/Cargo (if you don't, wth you even doing here?), at the root of this project just `cargo run -p manager`.
+- Expectating that you've already heve Rust/Cargo (if you don't, wth you even doing here?), at the root of this project just `cargo run -p runpy`.
 
  What is expected to be printed to your terminal is the follwoing:
 
 ```bash
-   Compiling manager v0.1.0 (/home/dark1zin/repos/2-Personal-projects/runpy/manager)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.41s
-     Running `target/debug/manager`
-Worker listening on /tmp/rust_py.sock
-Received HTML: <html><title>Hello from Rust!</title><body><a href...
-Python says: ScrapingResponse { status: "success", title: "Hello from Python!", links_count: 1 }
+❯ cargo run -p runpy
+   Compiling runpy v0.1.0 (/home/dark1zin/repos/2-Personal-projects/runpy/runpy)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.65s
+     Running `target/debug/runpy`
+Control plane started at "./sockets/runpy_rp.sock" (pathname)
+Worker listening on ./sockets/runpy_rp.sock
+READY: Worker is ready to receive requests
+DEBUG: Received EXECUTE request 
+  With data: {"payload":null}
+LOG: Starting parse operation
+DONE: Execution completed with data: {"links_count":1,"status":"success","title":"Hello from Python!"}
+DEBUG: Received request 
+  With data: {"request":{"payload":{"html":"<html><title>Hello from Rust!</title><body><a href='#'>Link</a></body></html>"},"type":"EXECUTE"}}
+Connection closed by peer
+
+Shutting down...
 ```
 
  Doesn't appear like that or a error have occurred?
