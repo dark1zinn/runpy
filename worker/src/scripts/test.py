@@ -1,6 +1,6 @@
-from bridge.base_worker import BaseWorker, RunScript
+from bridge.worker import Worker, RunScript
 
-class TestWorker(BaseWorker):
+class TestWorker(Worker):
 
     def handle_request(self, request_data: dict):
         match request_data.get("type"):

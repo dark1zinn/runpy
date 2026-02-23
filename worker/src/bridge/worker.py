@@ -6,7 +6,7 @@ import struct
 
 from typing import Type
 
-def RunScript(worker_class: Type[BaseWorker]):
+def RunScript(worker_class: Type[Worker]):
     """A simple wrapper to safely instantiate and run a worker class"""
     try:
         if len(sys.argv) < 2:
@@ -16,7 +16,7 @@ def RunScript(worker_class: Type[BaseWorker]):
         socket_path = sys.argv[1]
         
         # Validate that worker_class is a BaseWorker subclass
-        if not issubclass(worker_class, BaseWorker):
+        if not issubclass(worker_class, Worker):
             raise TypeError(f"{worker_class.__name__} must inherit from BaseWorker")
         
         # Instantiate and run
@@ -30,7 +30,7 @@ def RunScript(worker_class: Type[BaseWorker]):
         print(f"Worker initialization failed: {e}")
         sys.exit(1)
 
-class BaseWorker:
+class Worker:
     def __init__(self, sock):
         self.__ok = False
         self.__clycles = 0
