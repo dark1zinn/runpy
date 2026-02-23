@@ -1,9 +1,7 @@
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::UnixListener};
-
-use crate::ScrapingRequest;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
@@ -106,9 +104,11 @@ impl ControlPlane {
             Message::Ready { message } => {
                 println!("READY: {}", message);
                 
-                let req = ScrapingRequest {
-                    html: "<html><title>Hello from Rust!</title><body><a href='#'>Link</a></body></html>".into()
-                };
+                let req = json!(
+                    {
+                        "html": "<html><title>Hello from Rust!</title><body><a href='#'>Link</a></body></html>"
+                    }
+                );
                 
                 let req_msg = Message::Execute {
                     payload: serde_json::to_value(req).unwrap()
