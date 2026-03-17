@@ -11,6 +11,10 @@ chrono = "0.4"
 rand = "0.8"
 libc = "0.2"
 
+[dev-dependencies]
+tempfile = "3"
+serde_json = "1.0"
+
 [lib]
 name = "runpy"
 path = "src/lib.rs"
