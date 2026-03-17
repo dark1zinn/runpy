@@ -9,7 +9,7 @@ serde_json = "1.0"
 tokio = { version = "1.49.0", features = ["full"] }
 chrono = "0.4"
 rand = "0.8"
-walkdir = "2" # For easy script discovery
+libc = "0.2"
 
 [lib]
 name = "runpy"
