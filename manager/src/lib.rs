@@ -1,57 +1,125 @@
-
 mod integrity;
+mod protocol;
+mod manager;
+mod watchdog;
+
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
 use crate::integrity::IntegrityChecker;
+use crate::manager::WorkerHandle;
+use crate::protocol::{Envelope, MessageHandler};
+use crate::watchdog::WatchdogService;
 
-mod manager;
-pub use manager::{WorkerIdentity, ActiveWorker};
+// ── Public re-exports ──────────────────────────────────────────────────
+pub use protocol::{Message, Envelope as MessageEnvelope, MessageSender};
+pub use manager::{Worker, WorkerIdentity};
+pub use watchdog::{WatchdogService as Watchdog, WorkerReport, ProcessState};
 
-mod protocol;
+// ── Manager ────────────────────────────────────────────────────────────
 
-pub struct Runpy {
+/// Top-level orchestrator. Create one per application to manage all Python
+/// worker processes.
+///
+/// ```ignore
+/// let mut manager = Manager::new("path/to/.venv", "path/to/scripts");
+/// manager.on_message(|env| { /* global handler */ });
+///
+/// let mut worker = manager.worker("my_script");
+/// worker.env("KEY", "VALUE");
+/// worker.on_message(|env| { /* per-worker handler */ });
+/// worker.spawn().await.unwrap();
+/// ```
+pub struct Manager {
     integrity: IntegrityChecker,
-    active_workers: Vec<ActiveWorker>,
-    socket_path: PathBuf,
+    workers: Arc<RwLock<HashMap<String, WorkerHandle>>>,
+    socket_dir: PathBuf,
+    global_handler: Option<MessageHandler>,
+
+    /// Watchdog service — use `manager.dog.report().await` for health reports.
+    pub dog: WatchdogService,
 }
 
-impl Runpy {
+impl Manager {
+    /// Create a new Manager, performing an initial integrity check.
+    ///
+    /// * `venv_path` — path to the Python virtual environment (must contain `bin/python`).
+    /// * `scripts_path` — path to the directory holding `.py` scripts.
     pub fn new(venv_path: &str, scripts_path: &str) -> Self {
         let integrity = IntegrityChecker::new(venv_path, scripts_path);
-        let active_workers = vec![];
 
-        // Initial check
+        // Run initial integrity check (non-fatal — logs errors)
         if let Err(e) = integrity.perform_check() {
-            eprintln!("Integrity check failed: {}", e);
+            eprintln!("[Manager] Integrity check failed: {}", e);
         }
 
-        
-        Self { integrity, socket_path: PathBuf::from("/tmp/runpy"), active_workers }
+        let socket_dir = PathBuf::from("/tmp/runpy");
+        let workers: Arc<RwLock<HashMap<String, WorkerHandle>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+
+        let dog = WatchdogService::new(workers.clone());
+
+        // Start background watchdog with a 5-second interval
+        dog.start_monitoring(5);
+
+        Self {
+            integrity,
+            workers,
+            socket_dir,
+            global_handler: None,
+            dog,
+        }
     }
 
-    pub async fn spawn_worker(&mut self, script: &str) -> Result<String, String> {
-        // 1. Check script existence via Registry
-        if !self.integrity.check_script(script) {
-            return Err(format!("Script '{}' does not exist or failed integrity check", script));
-        }
+    /// Create a new `Worker` builder for the given script name (without `.py`).
+    pub fn worker(&self, script: &str) -> Worker {
+        Worker::new(
+            script,
+            &self.integrity.venv_path,
+            &self.integrity.scripts_dir,
+            &self.socket_dir,
+            self.global_handler.clone(),
+            self.workers.clone(),
+        )
+    }
 
-        let worker = ActiveWorker::new(&self.integrity.venv_path, &self.socket_path, script);
-        let identity = worker.identity.name.clone();
+    /// Register a **global** message handler that fires for every message from
+    /// every worker, *before* worker-specific handlers.
+    pub fn on_message<F>(&mut self, handler: F)
+    where
+        F: Fn(Envelope) + Send + Sync + 'static,
+    {
+        self.global_handler = Some(Arc::new(handler));
+    }
 
-        self.active_workers.push(worker);
-        println!("Spawned worker: {}", identity);
-        Ok(identity)
+    /// Re-run the full integrity check (venv, scripts dir, script index).
+    pub fn check_integrity(&self) -> Result<(), String> {
+        self.integrity.perform_check()
     }
 }
 
-impl Drop for Runpy {
+impl Drop for Manager {
     fn drop(&mut self) {
         println!("Shutting down all workers...");
-        for worker in &mut self.active_workers {
-            let _ = worker.child.kill();
-            println!("Terminated worker: {}", worker.identity.name);
+
+        // `try_write()` is non-blocking and safe inside an async runtime
+        // (unlike `blocking_write()` which panics on a current-thread runtime).
+        match self.workers.try_write() {
+            Ok(mut workers) => {
+                for (id, mut handle) in workers.drain() {
+                    let _ = handle.child.kill();
+                    let _ = std::fs::remove_file(&handle.sock_path);
+                    println!("Terminated worker: {} ({})", handle.identity.name, id);
+                }
+            }
+            Err(_) => {
+                eprintln!("[Manager] Warning: could not acquire worker lock during shutdown");
+            }
         }
-        println!("All workers terminated. Cleaning up sockets...");
-        let _ = std::fs::remove_dir_all("/tmp/runpy");
+
+        let _ = std::fs::remove_dir_all(&self.socket_dir);
+        println!("All workers terminated. Socket directory cleaned.");
     }
 }
