@@ -4,8 +4,28 @@ Python worker SDK for [Runpy](https://github.com/dark1zinn/runpy) — write Pyth
 
 ## Installation
 
+**NOT YET AVAILABLE IN PYPI!!**
+
 ```bash
 pip install runpyrs
+```
+
+or
+
+```bash
+uv add runpyrs
+```
+
+or
+
+```bash
+poetry add runpyrs
+```
+
+or
+
+```bash
+pdm add runpyrs
 ```
 
 ## Quick Start

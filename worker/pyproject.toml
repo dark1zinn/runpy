@@ -17,15 +17,10 @@ dev = ["pytest>=7.0"]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
-[tool.hatch.build.targets.wheel]
+[tool.hatch.build]
 packages = ["src/runpyrs"]
-# This ensures it also ends up in the .whl (the installed version)
-force-include = { "../LICENSE" = "LICENSE" }
-
-[tool.hatch.build.targets.sdist]
-packages = ["src/runpyrs"]
-# This maps the parent file to a local name inside the .tar.gz
-force-include = { "../LICENSE" = "LICENSE" }
+# This ensures it also ends up in the built distributions.
+include = ["../LICENSE"]
 
 [dependency-groups]
 dev = [
