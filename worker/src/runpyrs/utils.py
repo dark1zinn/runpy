@@ -27,14 +27,18 @@ MessageType = Union[InternalMessageType, BuiltinResponseType, str]
 
 # ── Inbound (Rust → Python) ────────────────────────────────────────────
 
-class Envelope(TypedDict, total=False):
+class _EnvelopeRequired(TypedDict):
+    """Required fields in every Envelope."""
+    type: str
+
+
+class Envelope(_EnvelopeRequired, total=False):
     """Shape of every message received from the Rust manager.
 
     ``type`` is always present; the remaining fields are optional
     depending on the message kind.
     """
 
-    type: str
     message: str
     data: Dict[str, Any]
     payload: Dict[str, Any]

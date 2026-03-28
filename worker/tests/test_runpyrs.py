@@ -1,7 +1,6 @@
 """Basic sanity checks for the runpyrs package."""
 
 import sys
-import types
 import pytest
 
 from runpyrs import Worker, RunScript
