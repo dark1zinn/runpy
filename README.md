@@ -210,4 +210,4 @@ The protocol supports these message types (exchanged as JSON over Unix sockets):
 Feel free to fork and open PRs.
 PRs that improve stability, reliability, and test coverage are prioritized.
 
-> With ❤️ @dark1zinn
+> With ❤️ [@dark1zinn](https://github.com/dark1zinn)

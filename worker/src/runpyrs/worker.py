@@ -1,10 +1,18 @@
 import socket
 import json
-import os
 import sys
 import struct
 
-from typing import Type
+from .utils import (
+    Envelope,
+    ExecutePayload,
+    ExecuteResult,
+    HandleRequestResult,
+    MessageType,
+    OutboundMessage,
+    RequestData,
+    SendData,
+)
 
 
 class Worker:
@@ -50,7 +58,7 @@ class Worker:
             print(f"Failed to send message: {e}")
             self.__ok = False
 
-    def __recv_message(self) -> dict:
+    def __recv_message(self) -> Envelope | None:
         """Receive a length-prefixed message"""
         try:
             size_data = self.stream.recv(8)
@@ -71,12 +79,12 @@ class Worker:
             print(f"Error receiving message: {e}")
             return None
 
-    def send(self, msg_type: str, message: str = None, data=None):
+    def send(self, msg_type: MessageType, message: str = None, data: SendData = None):
         """Send a typed message back to Rust's Control Plane."""
         try:
             if not msg_type:
                 raise ValueError("Message type is required")
-            payload = {
+            payload: OutboundMessage = {
                 "type": msg_type.upper(),
                 "message": message or "",
                 "data": data or {},
@@ -89,7 +97,7 @@ class Worker:
 
     # ── Overridable hooks ───────────────────────────────────────────
 
-    def handle_request(self, request_data: dict) -> dict:
+    def handle_request(self, request_data: RequestData) -> HandleRequestResult:
         """Handle incoming requests from Rust.
 
         Override this method in your worker subclass to implement custom
@@ -101,7 +109,7 @@ class Worker:
         """
         pass
 
-    def execute(self, payload: dict) -> dict:
+    def execute(self, payload: ExecutePayload) -> ExecuteResult:
         """Main business logic.
 
         Called when an EXECUTE message is received.  Override this in your
@@ -116,7 +124,7 @@ class Worker:
     # NOT be called for these.
     _INTERNAL_TYPES = frozenset({"TERMINATE", "META", "EXECUTE", "RETRY"})
 
-    def __handle_request(self, request_data: dict):
+    def __handle_request(self, request_data: Envelope):
         """Internal dispatcher for protocol-level messages."""
         try:
             msg_type = request_data.get("type")
@@ -197,31 +205,3 @@ class Worker:
                 self.send("ERROR", str(e))
                 self.__ok = False
                 sys.exit(1)
-
-
-# ── Helper ──────────────────────────────────────────────────────────────
-
-def RunScript(worker_class: Type[Worker]):
-    """Instantiate and run a Worker subclass.
-
-    Reads the socket path from ``sys.argv[1]``.
-    """
-    try:
-        if len(sys.argv) < 2:
-            print("Error: Socket path argument required")
-            sys.exit(1)
-
-        socket_path = sys.argv[1]
-
-        if not issubclass(worker_class, Worker):
-            raise TypeError(f"{worker_class.__name__} must inherit from Worker")
-
-        worker = worker_class(socket_path)
-        worker.run()
-
-    except TypeError as e:
-        print(f"Configuration error: {e}")
-        sys.exit(1)
-    except Exception as e:
-        print(f"Worker initialization failed: {e}")
-        sys.exit(1)
