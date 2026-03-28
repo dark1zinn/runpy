@@ -2,11 +2,21 @@
 ///
 /// Tests Message serialization/deserialization, Envelope construction,
 /// ControlPlane socket communication, and MessageSender channel behaviour.
-use runpy::{Message, MessageEnvelope, MessageSender};
+use runpy::{Message, MessageEnvelope, MessageSender, Mailer};
 use serde_json::json;
 use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
+
+/// Helper function to create a test envelope with a dummy mailer
+fn test_envelope(worker_id: &str, message: Message) -> MessageEnvelope {
+    let mailer = Mailer::for_testing(worker_id.to_string());
+    MessageEnvelope {
+        worker_id: worker_id.to_string(),
+        message,
+        mailer,
+    }
+}
 
 // ─── Message serde round-trips ─────────────────────────────────────────
 
@@ -213,24 +223,18 @@ fn message_clone_is_independent() {
 
 // ─── Envelope construction ─────────────────────────────────────────────
 
-#[test]
-fn envelope_carries_worker_id() {
-    let env = MessageEnvelope {
-        worker_id: "worker_abc".into(),
-        message: Message::Ready {
-            message: "up".into(),
-        },
-    };
+#[tokio::test]
+async fn envelope_carries_worker_id() {
+    let env = test_envelope("worker_abc", Message::Ready {
+        message: "up".into(),
+    });
     assert_eq!(env.worker_id, "worker_abc");
     assert!(matches!(env.message, Message::Ready { .. }));
 }
 
-#[test]
-fn envelope_clone_is_independent() {
-    let env = MessageEnvelope {
-        worker_id: "w1".into(),
-        message: Message::Terminate,
-    };
+#[tokio::test]
+async fn envelope_clone_is_independent() {
+    let env = test_envelope("w1", Message::Terminate);
     let cloned = env.clone();
     assert_eq!(cloned.worker_id, "w1");
     assert!(matches!(cloned.message, Message::Terminate));
@@ -291,9 +295,11 @@ async fn control_plane_receives_messages_and_dispatches_to_handlers() {
             stream.read_exact(&mut buf).await.unwrap();
 
             let msg: Message = serde_json::from_slice(&buf).unwrap();
+            let mailer = Mailer::for_testing("test_worker".to_string());
             let envelope = MessageEnvelope {
                 worker_id: "test_worker".into(),
                 message: msg,
+                mailer,
             };
             handler(envelope);
         }

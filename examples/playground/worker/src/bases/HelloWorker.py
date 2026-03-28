@@ -1,3 +1,5 @@
+# If you hover over the Worker class, you notice that it's typed as Any.
+# This is due some dev environment limitations (as of now, march 2026) which seems to cause Pylance in vscode unable to properly infer the types from the runpyrs package. 
 from runpyrs import Worker
 
 class HelloWorker(Worker):

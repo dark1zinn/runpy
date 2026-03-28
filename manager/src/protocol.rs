@@ -20,6 +20,14 @@ impl Mailer {
         Self { tx, worker_id }
     }
 
+    /// Create a test mailer for unit tests (does not actually send messages).
+    /// **Warning**: This creates a disconnected channel - messages sent will be dropped.
+    #[doc(hidden)]
+    pub fn for_testing(worker_id: String) -> Self {
+        let (tx, _rx) = mpsc::channel::<Message>(1);
+        Self { tx, worker_id }
+    }
+
     /// Send a message back to the worker that sent the original message.
     /// This is a fire-and-forget method that spawns a task to send the message.
     pub fn send(&self, msg: Message) {

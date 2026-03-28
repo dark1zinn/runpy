@@ -14,7 +14,7 @@ use crate::protocol::{Envelope, MessageHandler};
 use crate::watchdog::WatchdogService;
 
 // ── Public re-exports ──────────────────────────────────────────────────
-pub use protocol::{Message, Envelope as MessageEnvelope, MessageSender};
+pub use protocol::{Message, Envelope as MessageEnvelope, MessageSender, Mailer};
 pub use manager::{Worker, WorkerIdentity};
 pub use watchdog::{WatchdogService as Watchdog, WorkerReport, ProcessState};
 
