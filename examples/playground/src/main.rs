@@ -1,4 +1,9 @@
-use runpy::{Manager, Message, Method};
+use runpy::{scribbler, Manager, Message, Method};
+
+/// Scribbler instance for structured logging
+fn log() -> &'static runpy::Scribbler {
+    scribbler()
+}
 
 
 ///! Note that this "example" is actually to thinker and test the Runpy functionality during development !
@@ -14,14 +19,14 @@ async fn main() {
     // ── 1. Create the Manager ─────────────────────────────────────
 
     let mut manager = Manager::new(&venv_path, &scripts_path);
-    println!("✓ Manager initialized");
+    log().success("Manager initialized");
 
     // ── 2. (Optional) Global message handler ──────────────────────
 
     manager.on_message(|envelope| {
-        println!(
-            "[GLOBAL] Worker '{}' → {:?}",
-            envelope.worker_id, envelope.message
+        log().verbose_with(
+            "Global",
+            &format!("Worker '{}' → {:?}", envelope.worker_id, envelope.message),
         );
     });
 
@@ -43,7 +48,7 @@ async fn main() {
                     .and_then(|b| b.get("message"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("(no message)");
-                println!("READY: {}", message);
+                log().info_with("Ready", message);
                 
                 // Send EXECUTE with payload
                 envelope.mailer.send(Message::execute(
@@ -56,7 +61,12 @@ async fn main() {
                     .and_then(|v| v.as_str())
                     .unwrap_or("(no message)");
                 let level = msg.get_header("X-Log-Level").unwrap_or("info");
-                println!("LOG [{}]: {}", level, message);
+                match level {
+                    "debug" => log().debug_with("Worker", message),
+                    "warning" | "warn" => log().warning_with("Worker", message),
+                    "error" => log().error_with("Worker", message),
+                    _ => log().info_with("Worker", message),
+                }
             }
             Method::Done => {
                 let message = body
@@ -67,7 +77,7 @@ async fn main() {
                     .and_then(|b| b.get("data"))
                     .cloned()
                     .unwrap_or(serde_json::json!({}));
-                println!("DONE: {} → {}", message, data);
+                log().success(&format!("{} → {}", message, data));
             }
             Method::Error => {
                 let message = body
@@ -76,16 +86,19 @@ async fn main() {
                     .unwrap_or("(no message)");
                 let stack_trace = msg.get_header("X-Stack-Trace");
                 let error_level = msg.get_header("X-Error-Level").unwrap_or("unknown");
-                eprintln!("ERROR [{}]: {} ({:?})", error_level, message, stack_trace);
+                log().error_with(
+                    "Worker",
+                    &format!("[{}] {} ({:?})", error_level, message, stack_trace),
+                );
             }
-            _ => println!("OTHER: {:?}", msg),
+            _ => log().debug_with("Worker", &format!("{:?}", msg)),
         }
     });
 
     match worker.spawn().await {
-        Ok(id) => println!("✓ Worker spawned: {}", id),
+        Ok(id) => log().success(&format!("Worker spawned: {}", id)),
         Err(e) => {
-            eprintln!("✗ Failed to spawn worker: {}", e);
+            log().error(&format!("Failed to spawn worker: {}", e));
             return;
         }
     }
@@ -96,10 +109,12 @@ async fn main() {
 
     // Check health via watchdog
     let reports = manager.dog.report().await;
+    log().separator();
+    log().info("Watchdog Report:");
     for r in &reports {
-        println!("  [{:?}] {} (pid {})", r.state, r.worker_name, r.pid);
+        log().info_with("Health", &format!("[{:?}] {} (pid {})", r.state, r.worker_name, r.pid));
     }
 
-    println!("\n✓ Shutting down...");
+    log().info("Shutting down...");
     // Manager's Drop automatically kills workers and cleans sockets.
 }

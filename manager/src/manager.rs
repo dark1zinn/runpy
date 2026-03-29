@@ -8,6 +8,7 @@ use tokio::net::UnixListener;
 use tokio::sync::RwLock;
 
 use crate::protocol::{ControlPlane, Envelope, Message, MessageHandler, MessageSender};
+use crate::scribbler::scribbler;
 use crate::watchdog::WatchdogService;
 
 // ── Worker Identity ────────────────────────────────────────────────────
@@ -151,11 +152,11 @@ impl Worker {
         let listener = UnixListener::bind(&sock_path)
             .map_err(|e| format!("Failed to bind socket at '{}': {}", sock_path.display(), e))?;
 
-        println!(
-            "Starting worker '{}' with socket at '{}'",
+        scribbler().debug_with("Worker", &format!(
+            "Starting '{}' with socket at '{}'",
             identity.name,
             sock_path.display()
-        );
+        ));
 
         // Start the control plane (runs in background, returns a MessageSender)
         let plane = ControlPlane::new(
@@ -220,7 +221,7 @@ impl Worker {
         self.worker_id = Some(name.clone());
         self.sender = Some(sender);
 
-        println!("Spawned worker: {}", name);
+        scribbler().success(&format!("Spawned worker: {}", name));
         Ok(name)
     }
 

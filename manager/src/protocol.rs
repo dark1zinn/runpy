@@ -6,6 +6,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
 use tokio::sync::mpsc;
 
+use crate::scribbler::scribbler;
+
 // ══════════════════════════════════════════════════════════════════════════
 // HTTP-LIKE MESSAGE PROTOCOL
 // ══════════════════════════════════════════════════════════════════════════
@@ -313,7 +315,7 @@ impl Mailer {
         let tx = self.tx.clone();
         tokio::spawn(async move {
             if let Err(e) = tx.send(msg).await {
-                eprintln!("Failed to send message: {}", e);
+                scribbler().error_with("Mailer", &format!("Failed to send message: {}", e));
             }
         });
     }
@@ -398,10 +400,7 @@ impl ControlPlane {
             let (mut stream, _) = match accept_result {
                 Ok(conn) => conn,
                 Err(e) => {
-                    eprintln!(
-                        "[ControlPlane {}] Accept error: {}",
-                        self.worker_id, e
-                    );
+                    scribbler().error_with("ControlPlane", &format!("{} Accept error: {}", self.worker_id, e));
                     break;
                 }
             };
@@ -447,7 +446,7 @@ impl ControlPlane {
                     // Outbound: messages from the main outbound channel
                     Some(msg) = outbound_rx.recv() => {
                         if let Err(e) = Self::send_message(&mut stream, &msg).await {
-                            eprintln!("[ControlPlane {}] Send error: {}", wid, e);
+                            scribbler().error_with("ControlPlane", &format!("{} Send error: {}", wid, e));
                             break;
                         }
                     }
@@ -455,7 +454,7 @@ impl ControlPlane {
                     // Responses: messages from the envelope mailer
                     Some(msg) = response_rx.recv() => {
                         if let Err(e) = Self::send_message(&mut stream, &msg).await {
-                            eprintln!("[ControlPlane {}] Response send error: {}", wid, e);
+                            scribbler().error_with("ControlPlane", &format!("{} Response send error: {}", wid, e));
                             break;
                         }
                     }
@@ -476,13 +475,13 @@ impl ControlPlane {
                 match e.kind() {
                     std::io::ErrorKind::UnexpectedEof => {} // clean close
                     std::io::ErrorKind::ConnectionReset => {
-                        eprintln!("Connection reset by peer");
+                        scribbler().debug_with("Socket", "Connection reset by peer");
                     }
                     std::io::ErrorKind::BrokenPipe => {
-                        eprintln!("Broken pipe - peer closed unexpectedly");
+                        scribbler().debug_with("Socket", "Broken pipe - peer closed unexpectedly");
                     }
                     _ => {
-                        eprintln!("Socket read error: {} (kind: {:?})", e, e.kind());
+                        scribbler().error_with("Socket", &format!("Read error: {} (kind: {:?})", e, e.kind()));
                     }
                 }
                 return None;
@@ -495,11 +494,7 @@ impl ControlPlane {
         match stream.read_exact(&mut message_buf).await {
             Ok(_) => {}
             Err(e) => {
-                eprintln!(
-                    "Error reading message body: {} (kind: {:?})",
-                    e,
-                    e.kind()
-                );
+                scribbler().error_with("Socket", &format!("Error reading message body: {} (kind: {:?})", e, e.kind()));
                 return None;
             }
         }
@@ -508,7 +503,7 @@ impl ControlPlane {
             Ok(msg) => Some(msg),
             Err(e) => {
                 let raw = String::from_utf8_lossy(&message_buf);
-                eprintln!("JSON parse error: {} \n  Raw: {}", e, raw);
+                scribbler().error_with("Protocol", &format!("JSON parse error: {}\n  Raw: {}", e, raw));
                 None
             }
         }

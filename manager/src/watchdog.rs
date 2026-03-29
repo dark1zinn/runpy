@@ -5,6 +5,7 @@ use tokio::time::{interval, Duration};
 use serde::Serialize;
 
 use crate::manager::WorkerHandle;
+use crate::scribbler::scribbler;
 
 /// The health state of a monitored process.
 #[derive(Debug, Clone, Serialize)]
@@ -50,11 +51,14 @@ impl WatchdogService {
                 for (id, handle) in workers.iter_mut() {
                     match handle.child.try_wait() {
                         Ok(Some(status)) => {
-                            eprintln!(
-                                "[Watchdog] Worker '{}' (pid {}) exited with status: {}",
-                                handle.identity.name,
-                                handle.child.id(),
-                                status
+                            scribbler().warning_with(
+                                "Watchdog",
+                                &format!(
+                                    "Worker '{}' (pid {}) exited with status: {}",
+                                    handle.identity.name,
+                                    handle.child.id(),
+                                    status
+                                )
                             );
                             dead_ids.push(id.clone());
                         }
@@ -62,9 +66,9 @@ impl WatchdogService {
                             // Still running — healthy as far as OS is concerned
                         }
                         Err(e) => {
-                            eprintln!(
-                                "[Watchdog] Error checking worker '{}': {}",
-                                handle.identity.name, e
+                            scribbler().error_with(
+                                "Watchdog",
+                                &format!("Error checking worker '{}': {}", handle.identity.name, e)
                             );
                             dead_ids.push(id.clone());
                         }
@@ -76,7 +80,7 @@ impl WatchdogService {
                     let handle = workers.remove(&id);
                     if let Some(h) = handle {
                         let _ = std::fs::remove_file(&h.sock_path);
-                        eprintln!("[Watchdog] Removed dead worker '{}'", h.identity.name);
+                        scribbler().info_with("Watchdog", &format!("Removed dead worker '{}'", h.identity.name));
                     }
                 }
             }

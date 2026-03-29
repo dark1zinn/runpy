@@ -1,6 +1,76 @@
+//! # Runpy — Rust-Python Worker Manager
+//!
+//! A lightweight, async-first framework for spawning and managing Python worker
+//! processes from Rust applications. Communication happens over Unix sockets using
+//! a simple HTTP-like JSON protocol.
+//!
+//! ## Features
+//!
+//! - **Worker Management**: Spawn, monitor, and terminate Python workers
+//! - **HTTP-like Protocol**: Clean JSON messages with methods, headers, and body
+//! - **Watchdog Service**: Automatic health monitoring and dead worker cleanup
+//! - **Structured Logging**: Environment-aware logging via [`Scribbler`]
+//! - **Bidirectional Communication**: Send commands and receive responses
+//!
+//! ## Quick Start
+//!
+//! ```ignore
+//! use runpy::{Manager, Message, Method};
+//!
+//! #[tokio::main]
+//! async fn main() {
+//!     // Create manager with paths to Python venv and scripts
+//!     let mut manager = Manager::new("./venv", "./scripts");
+//!
+//!     // Register a global message handler
+//!     manager.on_message(|envelope| {
+//!         println!("Received: {:?}", envelope.message);
+//!     });
+//!
+//!     // Spawn a worker
+//!     let mut worker = manager.worker("my_script");
+//!     worker.env("API_KEY", "secret");
+//!     worker.spawn().await.unwrap();
+//!
+//!     // Send a message
+//!     worker.send_message(Message::execute(
+//!         serde_json::json!({ "task": "process" })
+//!     )).await.unwrap();
+//! }
+//! ```
+//!
+//! ## Environment Variables
+//!
+//! The [`Scribbler`] logger respects these environment variables:
+//!
+//! | Variable      | Values                                         | Description                     |
+//! |---------------|------------------------------------------------|---------------------------------|
+//! | `ENVIRONMENT` | `development`, `dev`                           | Enables maximum log verbosity   |
+//! | `LOG`         | `0`-`5`, `off`, `error`, `warning`, `info`, `debug`, `verbose` | Sets log level |
+//! | `NO_COLOR`    | (any value)                                    | Disables ANSI color output      |
+//!
+//! ## Protocol
+//!
+//! Messages follow an HTTP-like structure:
+//!
+//! ```json
+//! {
+//!   "method": "EXECUTE",
+//!   "headers": {
+//!     "X-Worker-Id": "my_script_29032026_abc1",
+//!     "Content-Type": "application/json"
+//!   },
+//!   "body": { "task": "process", "data": [1, 2, 3] }
+//! }
+//! ```
+//!
+//! Available methods: `GET`, `POST`, `PUT`, `DELETE`, `EXECUTE`, `RETRY`,
+//! `TERMINATE`, `META`, `READY`, `STATUS`, `LOG`, `DONE`, `ERROR`, `ACTION`.
+
 mod integrity;
 mod protocol;
 mod manager;
+pub mod scribbler;
 mod watchdog;
 
 use std::collections::HashMap;
@@ -20,6 +90,7 @@ pub use protocol::{
 };
 pub use manager::{Worker, WorkerIdentity};
 pub use watchdog::{WatchdogService as Watchdog, WorkerReport, ProcessState};
+pub use scribbler::{scribbler, Scribbler, LogLevel};
 
 // ── Manager ────────────────────────────────────────────────────────────
 
@@ -55,7 +126,7 @@ impl Manager {
 
         // Run initial integrity check (non-fatal — logs errors)
         if let Err(e) = integrity.perform_check() {
-            eprintln!("[Manager] Integrity check failed: {}", e);
+            scribbler::scribbler().error_with("Manager", &format!("Integrity check failed: {}", e));
         }
 
         let socket_dir = PathBuf::from("/tmp/runpy");
@@ -130,14 +201,14 @@ impl Manager {
         for (id, mut handle) in workers.drain() {
             let _ = handle.child.kill();
             let _ = std::fs::remove_file(&handle.sock_path);
-            println!("Terminated worker: {} ({})", handle.identity.name, id);
+            scribbler::scribbler().info_with("Manager", &format!("Terminated worker: {} ({})", handle.identity.name, id));
         }
     }
 }
 
 impl Drop for Manager {
     fn drop(&mut self) {
-        println!("Shutting down all workers...");
+        scribbler::scribbler().info_with("Manager", "Shutting down all workers...");
 
         // `try_write()` is non-blocking and safe inside an async runtime
         // (unlike `blocking_write()` which panics on a current-thread runtime).
@@ -146,15 +217,15 @@ impl Drop for Manager {
                 for (id, mut handle) in workers.drain() {
                     let _ = handle.child.kill();
                     let _ = std::fs::remove_file(&handle.sock_path);
-                    println!("Terminated worker: {} ({})", handle.identity.name, id);
+                    scribbler::scribbler().info_with("Manager", &format!("Terminated worker: {} ({})", handle.identity.name, id));
                 }
             }
             Err(_) => {
-                eprintln!("[Manager] Warning: could not acquire worker lock during shutdown");
+                scribbler::scribbler().warning_with("Manager", "Could not acquire worker lock during shutdown");
             }
         }
 
         let _ = std::fs::remove_dir_all(&self.socket_dir);
-        println!("All workers terminated. Socket directory cleaned.");
+        scribbler::scribbler().success("All workers terminated. Socket directory cleaned.");
     }
 }

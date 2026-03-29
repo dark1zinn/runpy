@@ -2,6 +2,8 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+use crate::scribbler::scribbler;
+
 pub struct IntegrityChecker {
     pub venv_path: PathBuf,
     pub scripts_dir: PathBuf,
@@ -51,6 +53,7 @@ impl IntegrityChecker {
     }
 
     /// Check if a specific script exists in the registry. Re-indexes first.
+    #[allow(dead_code)]
     pub fn check_script(&self, script: &str) -> bool {
         self.index_scripts();
         let scripts = self.registry.lock().unwrap();
@@ -75,10 +78,9 @@ impl IntegrityChecker {
 
         self.walk_dir(&self.scripts_dir, &mut scripts);
 
-        println!(
-            "Indexed scripts: {:?} \n  - {:?}",
-            scripts.len(),
-            scripts
+        scribbler().debug_with(
+            "Integrity",
+            &format!("Indexed {} scripts: {:?}", scripts.len(), scripts)
         );
     }
 
