@@ -1,10 +1,35 @@
 [project]
 name = "runpyrs"
-version = "0.1.0"
+version = "0.0.4"
+description = "Python worker SDK for the Runpy manager — build workers that are spawned and orchestrated by Rust."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+authors = [
+    { name = "dark1zinn" },
+]
+dependencies = []
 
-[tool.setuptools.packages.find]
-where = ["src"]
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
 
 [build-system]
-requires = ["setuptools>=61.0"]
-build-backend = "setuptools.build_meta"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build]
+packages = ["src/runpyrs"]
+# This ensures it also ends up in the built distributions.
+include = ["../LICENSE"]
+
+[dependency-groups]
+dev = [
+    "uv>=0.11.2",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[project.urls]
+Homepage = "https://github.com/dark1zinn/runpy"
+Repository = "https://github.com/dark1zinn/runpy"

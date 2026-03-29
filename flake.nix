@@ -62,6 +62,7 @@
               cargo-watch
               rust-analyzer
               python314
+              uv
             ];
 
             env = {

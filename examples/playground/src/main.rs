@@ -1,5 +1,9 @@
 use runpy::{Manager, Message};
 
+
+///! Note that this "example" is actually to thinker and test the Runpy functionality during development !
+/// 
+///! It's not meant to be a polished demo of best practices for using the library — just a quick way to iterate on features and test them out in a real Rust app with Python workers.
 #[tokio::main]
 async fn main() {
     // Resolve paths relative to the Cargo manifest directory
@@ -31,7 +35,12 @@ async fn main() {
     // Per-worker message handler
     worker.on_message(|envelope| {
         match &envelope.message {
-            Message::Ready { message } => println!("READY: {}", message),
+            Message::Ready { message } => {
+                println!("READY: {}", message);
+                envelope.mailer.send(Message::Execute { 
+                    payload: serde_json::json!({ "name": "RunPy" }) 
+                });
+            },
             Message::Info { message, .. } => println!("INFO: {}", message),
             Message::Done { message, data } => {
                 println!("DONE: {} → {}", message, data);

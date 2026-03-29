@@ -308,6 +308,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3b3cff922bd51709b605d9ead9aa71031d81447142d828eb4a6eba76fe619f9b"
 
 [[package]]
+name = "playground"
+version = "0.1.0"
+dependencies = [
+ "runpy",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "ppv-lite86"
 version = "0.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -530,14 +539,6 @@ dependencies = [
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "template"
-version = "0.1.0"
-dependencies = [
- "runpy",
- "tokio",
 ]
 
 [[package]]

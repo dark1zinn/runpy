@@ -1,4 +1,4 @@
-from bridge.worker import Worker, RunScript
+from runpyrs import Worker, RunScript
 
 class MyWorker(Worker):
 

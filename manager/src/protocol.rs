@@ -8,12 +8,53 @@ use std::sync::Arc;
 /// Callback type for handling messages from workers.
 pub type MessageHandler = Arc<dyn Fn(Envelope) + Send + Sync>;
 
+/// A lightweight handle for sending messages back to a specific worker.
+#[derive(Clone)]
+pub struct Mailer {
+    tx: mpsc::Sender<Message>,
+    worker_id: String,
+}
+
+impl Mailer {
+    pub(crate) fn new(tx: mpsc::Sender<Message>, worker_id: String) -> Self {
+        Self { tx, worker_id }
+    }
+
+    /// Create a test mailer for unit tests (does not actually send messages).
+    /// **Warning**: This creates a disconnected channel - messages sent will be dropped.
+    #[doc(hidden)]
+    pub fn for_testing(worker_id: String) -> Self {
+        let (tx, _rx) = mpsc::channel::<Message>(1);
+        Self { tx, worker_id }
+    }
+
+    /// Send a message back to the worker that sent the original message.
+    /// This is a fire-and-forget method that spawns a task to send the message.
+    pub fn send(&self, msg: Message) {
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            if let Err(e) = tx.send(msg).await {
+                eprintln!("Failed to send message: {}", e);
+            }
+        });
+    }
+
+    /// Async version that returns a Result for proper error handling.
+    pub async fn send_async(&self, msg: Message) -> Result<(), String> {
+        self.tx
+            .send(msg)
+            .await
+            .map_err(|e| format!("Failed to send message to worker {}: {}", self.worker_id, e))
+    }
+}
+
 /// An envelope wraps a `Message` with metadata about which worker sent it,
-/// so global handlers can distinguish between workers.
-#[derive(Debug, Clone)]
+/// and provides a way to send responses back to that worker.
+#[derive(Clone)]
 pub struct Envelope {
     pub worker_id: String,
     pub message: Message,
+    pub mailer: Mailer,
 }
 
 /// The protocol message types exchanged between Rust and Python workers
@@ -110,6 +151,9 @@ impl ControlPlane {
             let worker = self.worker_handler.clone();
             let wid = self.worker_id.clone();
 
+            // Create a channel for this connection to send messages back
+            let (response_tx, mut response_rx) = mpsc::channel::<Message>(64);
+
             // Handle a single connection (Python workers connect once and keep the stream open)
             loop {
                 tokio::select! {
@@ -117,9 +161,11 @@ impl ControlPlane {
                     recv_result = Self::recv_message(&mut stream) => {
                         match recv_result {
                             Some(msg) => {
+                                let mailer = Mailer::new(response_tx.clone(), wid.clone());
                                 let envelope = Envelope {
                                     worker_id: wid.clone(),
                                     message: msg,
+                                    mailer,
                                 };
 
                                 // Global handler fires first
@@ -139,10 +185,18 @@ impl ControlPlane {
                         }
                     }
 
-                    // Outbound: send messages from Rust to the Python worker
+                    // Outbound: messages from the main outbound channel
                     Some(msg) = outbound_rx.recv() => {
                         if let Err(e) = Self::send_message(&mut stream, &msg).await {
                             eprintln!("[ControlPlane {}] Send error: {}", wid, e);
+                            break;
+                        }
+                    }
+
+                    // Responses: messages from the envelope mailer
+                    Some(msg) = response_rx.recv() => {
+                        if let Err(e) = Self::send_message(&mut stream, &msg).await {
+                            eprintln!("[ControlPlane {}] Response send error: {}", wid, e);
                             break;
                         }
                     }
