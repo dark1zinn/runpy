@@ -17,7 +17,7 @@ from .utils import (
     ready_message,
     done_message,
     error_message,
-    debug_message,
+    log_message,
 )
 
 
@@ -30,7 +30,6 @@ class Worker:
     Messages follow an HTTP-like schema:
         {
             "method": "EXECUTE",
-            "path": "/execute",
             "headers": {
                 "X-Worker-Id": "worker_name",
                 "X-Socket-Path": "/tmp/runpy/rp_xxx.sock"
@@ -48,12 +47,13 @@ class Worker:
             RunScript(MyWorker)
     """
 
-    def __init__(self, sock: str):
+    def __init__(self, sock: str, name: Optional[str] = None, extra: Optional[Dict[str, str]] = None):
         self.__ok = False
         self.__cycles = 0
         self.__exec_payload: Optional[Dict[str, Any]] = None
         self.__sock_path = sock
-        self.name: Optional[str] = None
+        self.name: str = name or ""  # Worker name passed from Rust (required)
+        self.extra: Dict[str, str] = extra or {}  # Extra args passed from Rust (--key=value)
 
         try:
             self.stream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -63,7 +63,17 @@ class Worker:
             sys.exit(1)
 
         self.__ok = True
-        self.send("READY", "/ready", message="Worker is ready to receive requests")
+        
+        # Rust MUST provide the worker name. If missing, notify Rust immediately
+        # so it can send a META request with the worker name.
+        if not self.name:
+            self.send(
+                "ERROR",
+                message="Worker name not provided. Rust must pass worker name as argument or send META request.",
+                headers={"X-Error-Level": "warning"},
+            )
+        
+        self.send("READY", message="Worker is ready to receive requests")
 
     # ══════════════════════════════════════════════════════════════════════════
     # HEADERS
@@ -124,7 +134,6 @@ class Worker:
     def send(
         self,
         method: Method,
-        path: str = "",
         *,
         message: Optional[str] = None,
         body: Optional[Dict[str, Any]] = None,
@@ -133,8 +142,7 @@ class Worker:
         """Send a typed message back to Rust's Control Plane.
 
         Args:
-            method: The HTTP-like method (READY, DONE, ERROR, DEBUG, INFO, etc.)
-            path: Resource path (e.g., "/ready", "/done", "/error")
+            method: The HTTP-like method (READY, DONE, ERROR, LOG, etc.)
             message: Optional message string (added to body)
             body: Optional body dict (merged with message if provided)
             headers: Optional extra headers (merged with default worker headers)
@@ -154,7 +162,6 @@ class Worker:
             # Create the HTTP-like message
             payload = create_message(
                 method=method.upper(),
-                path=path or f"/{method.lower()}",
                 headers=msg_headers,
                 body=msg_body if msg_body else None,
             )
@@ -205,7 +212,7 @@ class Worker:
             headers = request_data.get("headers", {})
 
             if method is None:
-                self.send("DEBUG", "/debug", message="Received request with no method", body={"request": request_data})
+                self.send("LOG", message="Received request with no method", body={"request": request_data}, headers={"X-Log-Level": "debug"})
                 return
 
             if method == "TERMINATE":
@@ -216,55 +223,53 @@ class Worker:
                 # Extract worker name from body if provided
                 if body.get("name"):
                     self.name = body["name"]
-                self.send("DEBUG", "/debug", message="Received META data", body=body)
+                self.send("LOG", message="Received META data", body=body, headers={"X-Log-Level": "debug"})
                 return
 
             if method == "EXECUTE":
                 self.__exec_payload = body
-                self.send("DEBUG", "/debug", message="Received EXECUTE request", body={"payload": self.__exec_payload})
+                self.send("LOG", message="Received EXECUTE request", body={"payload": self.__exec_payload}, headers={"X-Log-Level": "debug"})
                 try:
                     result = self.execute(self.__exec_payload)
                     if result is not None:
-                        self.send("DONE", "/done", message="Execution completed", body={"data": result})
+                        self.send("DONE", message="Execution completed", body={"data": result})
                     else:
-                        self.send("DONE", "/done", message="Execution completed with no result", body={})
+                        self.send("DONE", message="Execution completed with no result", body={})
                 except Exception as e:
-                    self.send("ERROR", "/error", message=f"Execution error: {e}")
+                    self.send("ERROR", message=f"Execution error: {e}")
                 return
 
             if method == "RETRY":
                 self.__cycles += 1
                 self.send(
-                    "DEBUG",
-                    "/debug",
+                    "LOG",
                     message=f"Received RETRY request, re-executing (cycle: {self.__cycles})",
                     body={},
+                    headers={"X-Log-Level": "debug"},
                 )
                 try:
                     result = self.execute(self.__exec_payload)
                     if result is not None:
                         self.send(
                             "DONE",
-                            "/done",
                             message=f"Execution completed on retry({self.__cycles})",
                             body={"data": result},
                         )
                     else:
                         self.send(
                             "DONE",
-                            "/done",
                             message=f"Execution completed on retry({self.__cycles}) with no result",
                             body={},
                         )
                 except Exception as e:
-                    self.send("ERROR", "/error", message=f"Execution error on retry: {e}")
+                    self.send("ERROR", message=f"Execution error on retry: {e}")
                 return
 
             # Not an internal method — fall through to user handler
-            self.send("DEBUG", "/debug", message="Received unrecognized method", body={"request": request_data})
+            self.send("LOG", message="Received unrecognized method", body={"request": request_data}, headers={"X-Log-Level": "debug"})
 
         except Exception as e:
-            self.send("ERROR", "/error", message=f"Error handling request: {e}")
+            self.send("ERROR", message=f"Error handling request: {e}")
 
     # ══════════════════════════════════════════════════════════════════════════
     # MAIN LOOP
@@ -295,6 +300,6 @@ class Worker:
 
             except Exception as e:
                 print(f"Error handling request: {e}")
-                self.send("ERROR", "/error", message=str(e))
+                self.send("ERROR", message=str(e))
                 self.__ok = False
                 sys.exit(1)

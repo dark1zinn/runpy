@@ -153,8 +153,7 @@ class TestTypingUtils:
         # TypedDict classes have __annotations__ and descend from dict
         assert hasattr(Envelope, "__annotations__")
         assert "method" in Envelope.__annotations__
-        # Optional fields
-        assert "path" in Envelope.__annotations__
+        # Optional fields (path was removed from protocol)
         assert "headers" in Envelope.__annotations__
         assert "body" in Envelope.__annotations__
 
@@ -162,7 +161,6 @@ class TestTypingUtils:
         """OutboundMessage is now an alias for Message."""
         assert hasattr(OutboundMessage, "__annotations__")
         assert "method" in OutboundMessage.__annotations__
-        assert "path" in OutboundMessage.__annotations__
         assert "headers" in OutboundMessage.__annotations__
 
     def test_meta_data_is_typed_dict(self):

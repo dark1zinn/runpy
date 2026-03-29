@@ -12,7 +12,6 @@ use tokio::sync::mpsc;
 //
 // Inspired by HTTP, this protocol uses a JSON structure with:
 //   - method:  The action type (GET, POST, EXECUTE, TERMINATE, etc.)
-//   - path:    A resource path for routing (e.g., "/status", "/execute")
 //   - headers: Key-value metadata (worker identification, content info)
 //   - body:    Optional payload data
 //
@@ -46,10 +45,8 @@ pub enum Method {
     Ready,
     /// Response with status information
     Status,
-    /// Generic informational message
-    Info,
-    /// Debug-level message
-    Debug,
+    /// Log message with level in headers (X-Log-Level)
+    Log,
     /// Signal successful completion
     Done,
     /// Error response
@@ -71,8 +68,7 @@ impl std::fmt::Display for Method {
             Method::Meta => write!(f, "META"),
             Method::Ready => write!(f, "READY"),
             Method::Status => write!(f, "STATUS"),
-            Method::Info => write!(f, "INFO"),
-            Method::Debug => write!(f, "DEBUG"),
+            Method::Log => write!(f, "LOG"),
             Method::Done => write!(f, "DONE"),
             Method::Error => write!(f, "ERROR"),
             Method::Action => write!(f, "ACTION"),
@@ -96,6 +92,10 @@ pub mod headers {
     pub const X_STACK_TRACE: &str = "X-Stack-Trace";
     /// Request key for GET requests
     pub const X_KEY: &str = "X-Key";
+    /// Log level for LOG messages (e.g., "info", "warning", "error")
+    pub const X_LOG_LEVEL: &str = "X-Log-Level";
+    /// Error severity level (e.g., "dismissable", "critical")
+    pub const X_ERROR_LEVEL: &str = "X-Error-Level";
 }
 
 /// Headers container - a map of string key-value pairs.
@@ -108,7 +108,6 @@ pub type Headers = HashMap<String, String>;
 /// ```json
 /// {
 ///   "method": "EXECUTE",
-///   "path": "/task",
 ///   "headers": {
 ///     "X-Worker-Id": "my_worker_01012026-1200_Ax4f",
 ///     "X-Socket-Path": "/tmp/runpy/rp_my_worker.sock",
@@ -122,10 +121,6 @@ pub struct Message {
     /// The request/response method (GET, POST, EXECUTE, etc.)
     pub method: Method,
 
-    /// Resource path for routing (e.g., "/status", "/execute", "/meta")
-    #[serde(default)]
-    pub path: String,
-
     /// Key-value headers for metadata (worker ID, socket path, etc.)
     #[serde(default)]
     pub headers: Headers,
@@ -138,21 +133,19 @@ pub struct Message {
 impl Message {
     // ── Constructors ───────────────────────────────────────────────────
 
-    /// Create a new message with the given method and path.
-    pub fn new(method: Method, path: impl Into<String>) -> Self {
+    /// Create a new message with the given method.
+    pub fn new(method: Method) -> Self {
         Self {
             method,
-            path: path.into(),
             headers: HashMap::new(),
             body: None,
         }
     }
 
-    /// Create a message with method, path, and body.
-    pub fn with_body(method: Method, path: impl Into<String>, body: Value) -> Self {
+    /// Create a message with method and body.
+    pub fn with_body(method: Method, body: Value) -> Self {
         Self {
             method,
-            path: path.into(),
             headers: HashMap::new(),
             body: Some(body),
         }
@@ -195,7 +188,6 @@ impl Message {
     pub fn ready(message: impl Into<String>) -> Self {
         Self::with_body(
             Method::Ready,
-            "/ready",
             serde_json::json!({ "message": message.into() }),
         )
     }
@@ -204,7 +196,6 @@ impl Message {
     pub fn done(message: impl Into<String>, data: Value) -> Self {
         Self::with_body(
             Method::Done,
-            "/done",
             serde_json::json!({
                 "message": message.into(),
                 "data": data
@@ -212,53 +203,48 @@ impl Message {
         )
     }
 
-    /// Create an ERROR message.
-    pub fn error(message: impl Into<String>, stack_trace: Option<String>) -> Self {
+    /// Create an ERROR message with optional stack trace and error level.
+    /// Error levels: "dismissable", "warning", "critical"
+    pub fn error(
+        message: impl Into<String>,
+        stack_trace: Option<String>,
+        error_level: Option<String>,
+    ) -> Self {
         let mut msg = Self::with_body(
             Method::Error,
-            "/error",
             serde_json::json!({ "message": message.into() }),
         );
         if let Some(trace) = stack_trace {
             msg.headers.insert(headers::X_STACK_TRACE.to_string(), trace);
         }
+        if let Some(level) = error_level {
+            msg.headers.insert(headers::X_ERROR_LEVEL.to_string(), level);
+        }
         msg
     }
 
-    /// Create a DEBUG message.
-    pub fn debug(message: impl Into<String>, data: Value) -> Self {
+    /// Create a LOG message with a log level.
+    /// Log levels: "trace", "debug", "info", "warning", "error"
+    pub fn log(message: impl Into<String>, level: impl Into<String>, data: Value) -> Self {
         Self::with_body(
-            Method::Debug,
-            "/debug",
+            Method::Log,
             serde_json::json!({
                 "message": message.into(),
                 "data": data
             }),
         )
-    }
-
-    /// Create an INFO message.
-    pub fn info(message: impl Into<String>, data: Value) -> Self {
-        Self::with_body(
-            Method::Info,
-            "/info",
-            serde_json::json!({
-                "message": message.into(),
-                "data": data
-            }),
-        )
+        .header(headers::X_LOG_LEVEL, level)
     }
 
     /// Create a STATUS request.
     pub fn status_request() -> Self {
-        Self::new(Method::Get, "/status")
+        Self::new(Method::Get)
     }
 
     /// Create a STATUS response.
     pub fn status_response(status: impl Into<String>, uptime: u64) -> Self {
         Self::with_body(
             Method::Status,
-            "/status",
             serde_json::json!({
                 "status": status.into(),
                 "uptime": uptime
@@ -269,32 +255,32 @@ impl Message {
 
     /// Create an EXECUTE message.
     pub fn execute(payload: Value) -> Self {
-        Self::with_body(Method::Execute, "/execute", payload)
+        Self::with_body(Method::Execute, payload)
     }
 
     /// Create a RETRY message.
     pub fn retry() -> Self {
-        Self::new(Method::Retry, "/retry")
+        Self::new(Method::Retry)
     }
 
     /// Create a TERMINATE message.
     pub fn terminate() -> Self {
-        Self::new(Method::Terminate, "/terminate")
+        Self::new(Method::Terminate)
     }
 
     /// Create a META message.
     pub fn meta(data: Value) -> Self {
-        Self::with_body(Method::Meta, "/meta", data)
+        Self::with_body(Method::Meta, data)
     }
 
     /// Create a GET request for a specific key.
     pub fn get(key: impl Into<String>) -> Self {
-        Self::new(Method::Get, "/get").header(headers::X_KEY, key)
+        Self::new(Method::Get).header(headers::X_KEY, key)
     }
 
     /// Create an ACTION message.
     pub fn action(action: impl Into<String>, params: Value) -> Self {
-        Self::with_body(Method::Action, "/action", params).header(headers::X_ACTION, action)
+        Self::with_body(Method::Action, params).header(headers::X_ACTION, action)
     }
 }
 

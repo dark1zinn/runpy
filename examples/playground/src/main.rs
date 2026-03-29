@@ -1,4 +1,4 @@
-use runpy::{Manager, Message};
+use runpy::{Manager, Message, Method};
 
 
 ///! Note that this "example" is actually to thinker and test the Runpy functionality during development !
@@ -32,23 +32,53 @@ async fn main() {
     // Set environment variables for the Python process
     worker.env("MY_ENV_VAR", "some_value");
 
-    // Per-worker message handler
+    // Per-worker message handler using the new HTTP-like protocol
     worker.on_message(|envelope| {
-        match &envelope.message {
-            Message::Ready { message } => {
+        let msg = &envelope.message;
+        let body = msg.body.as_ref();
+        
+        match msg.method {
+            Method::Ready => {
+                let message = body
+                    .and_then(|b| b.get("message"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("(no message)");
                 println!("READY: {}", message);
-                envelope.mailer.send(Message::Execute { 
-                    payload: serde_json::json!({ "name": "RunPy" }) 
-                });
-            },
-            Message::Info { message, .. } => println!("INFO: {}", message),
-            Message::Done { message, data } => {
+                
+                // Send EXECUTE with payload
+                envelope.mailer.send(Message::execute(
+                    serde_json::json!({ "name": "RunPy" })
+                ));
+            }
+            Method::Log => {
+                let message = body
+                    .and_then(|b| b.get("message"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("(no message)");
+                let level = msg.get_header("X-Log-Level").unwrap_or("info");
+                println!("LOG [{}]: {}", level, message);
+            }
+            Method::Done => {
+                let message = body
+                    .and_then(|b| b.get("message"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("(no message)");
+                let data = body
+                    .and_then(|b| b.get("data"))
+                    .cloned()
+                    .unwrap_or(serde_json::json!({}));
                 println!("DONE: {} → {}", message, data);
             }
-            Message::Error { message, stack_trace } => {
-                eprintln!("ERROR: {} ({:?})", message, stack_trace);
+            Method::Error => {
+                let message = body
+                    .and_then(|b| b.get("message"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("(no message)");
+                let stack_trace = msg.get_header("X-Stack-Trace");
+                let error_level = msg.get_header("X-Error-Level").unwrap_or("unknown");
+                eprintln!("ERROR [{}]: {} ({:?})", error_level, message, stack_trace);
             }
-            other => println!("OTHER: {:?}", other),
+            _ => println!("OTHER: {:?}", msg),
         }
     });
 

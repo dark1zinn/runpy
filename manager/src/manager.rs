@@ -60,6 +60,7 @@ pub struct Worker {
     scripts_dir: PathBuf,
     socket_dir: PathBuf,
     env_vars: HashMap<String, String>,
+    extra_args: HashMap<String, String>,
     worker_handler: Option<MessageHandler>,
     global_handler: Option<MessageHandler>,
 
@@ -89,6 +90,7 @@ impl Worker {
             scripts_dir: scripts_dir.clone(),
             socket_dir: socket_dir.clone(),
             env_vars: HashMap::new(),
+            extra_args: HashMap::new(),
             worker_handler: None,
             global_handler,
             worker_id: None,
@@ -103,6 +105,25 @@ impl Worker {
     /// Set an environment variable that will be passed to the Python process.
     pub fn env(&mut self, key: &str, value: &str) -> &mut Self {
         self.env_vars.insert(key.to_string(), value.to_string());
+        self
+    }
+
+    /// Add an extra argument that will be passed to the Python process.
+    /// Arguments are passed as `--key=value` format after the worker name.
+    /// 
+    /// Example:
+    /// ```ignore
+    /// worker.arg("db", "postgres").arg("mode", "lazy");
+    /// // Results in: python script.py <socket> <name> --db=postgres --mode=lazy
+    /// ```
+    pub fn arg(&mut self, key: &str, value: &str) -> &mut Self {
+        self.extra_args.insert(key.to_string(), value.to_string());
+        self
+    }
+
+    /// Add multiple extra arguments at once from a HashMap.
+    pub fn args(&mut self, args: HashMap<String, String>) -> &mut Self {
+        self.extra_args.extend(args);
         self
     }
 
@@ -156,7 +177,14 @@ impl Worker {
         let script_file = self.scripts_dir.join(format!("{}.py", self.script));
 
         let mut cmd = std::process::Command::new(&py_executable);
-        cmd.arg(&script_file).arg(&sock_path);
+        cmd.arg(&script_file)
+            .arg(&sock_path)
+            .arg(&identity.name); // Pass worker name as third argument
+
+        // Pass extra arguments as --key=value format
+        for (key, value) in &self.extra_args {
+            cmd.arg(format!("--{}={}", key, value));
+        }
 
         // Set working directory *and* PYTHONPATH to the parent of the scripts
         // directory so that sibling Python packages (e.g. `bridge`) are

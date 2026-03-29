@@ -29,16 +29,14 @@ fn serialize_ready_message() {
     let msg = Message::ready("hello");
     let json = serde_json::to_string(&msg).unwrap();
     assert!(json.contains("\"method\":\"READY\""));
-    assert!(json.contains("\"path\":\"/ready\""));
     assert!(json.contains("\"message\":\"hello\""));
 }
 
 #[test]
 fn deserialize_ready_message() {
-    let raw = r#"{"method":"READY","path":"/ready","body":{"message":"Worker ready"}}"#;
+    let raw = r#"{"method":"READY","body":{"message":"Worker ready"}}"#;
     let msg: Message = serde_json::from_str(raw).unwrap();
     assert_eq!(msg.method, Method::Ready);
-    assert_eq!(msg.path, "/ready");
     assert!(msg.body.is_some());
     let body = msg.body.unwrap();
     assert_eq!(body["message"], "Worker ready");
@@ -49,12 +47,11 @@ fn serialize_terminate_message() {
     let msg = Message::terminate();
     let json = serde_json::to_string(&msg).unwrap();
     assert!(json.contains("\"method\":\"TERMINATE\""));
-    assert!(json.contains("\"path\":\"/terminate\""));
 }
 
 #[test]
 fn deserialize_terminate_message() {
-    let raw = r#"{"method":"TERMINATE","path":"/terminate"}"#;
+    let raw = r#"{"method":"TERMINATE"}"#;
     let msg: Message = serde_json::from_str(raw).unwrap();
     assert_eq!(msg.method, Method::Terminate);
 }
@@ -69,7 +66,7 @@ fn serialize_execute_message() {
 
 #[test]
 fn deserialize_execute_message() {
-    let raw = r#"{"method":"EXECUTE","path":"/execute","body":{"key":"value"}}"#;
+    let raw = r#"{"method":"EXECUTE","body":{"key":"value"}}"#;
     let msg: Message = serde_json::from_str(raw).unwrap();
     assert_eq!(msg.method, Method::Execute);
     let body = msg.body.unwrap();
@@ -86,7 +83,7 @@ fn serialize_done_message() {
 
 #[test]
 fn deserialize_done_message() {
-    let raw = r#"{"method":"DONE","path":"/done","body":{"message":"finished","data":{"result":true}}}"#;
+    let raw = r#"{"method":"DONE","body":{"message":"finished","data":{"result":true}}}"#;
     let msg: Message = serde_json::from_str(raw).unwrap();
     assert_eq!(msg.method, Method::Done);
     let body = msg.body.unwrap();
@@ -96,33 +93,38 @@ fn deserialize_done_message() {
 
 #[test]
 fn serialize_error_message_with_stack_trace() {
-    let msg = Message::error("boom", Some("line 42".into()));
+    let msg = Message::error("boom", Some("line 42".into()), Some("critical".into()));
     let json = serde_json::to_string(&msg).unwrap();
     assert!(json.contains("\"method\":\"ERROR\""));
     assert!(json.contains("X-Stack-Trace"));
     assert!(json.contains("line 42"));
+    assert!(json.contains("X-Error-Level"));
+    assert!(json.contains("critical"));
 }
 
 #[test]
 fn serialize_error_message_without_stack_trace() {
-    let msg = Message::error("boom", None);
+    let msg = Message::error("boom", None, None);
     let json = serde_json::to_string(&msg).unwrap();
     assert!(json.contains("\"method\":\"ERROR\""));
     assert!(!json.contains("X-Stack-Trace"));
 }
 
 #[test]
-fn serialize_info_message() {
-    let msg = Message::info("log line", json!({}));
+fn serialize_log_message() {
+    let msg = Message::log("log line", "info", json!({}));
     let json = serde_json::to_string(&msg).unwrap();
-    assert!(json.contains("\"method\":\"INFO\""));
+    assert!(json.contains("\"method\":\"LOG\""));
+    assert!(json.contains("X-Log-Level"));
+    assert!(json.contains("info"));
 }
 
 #[test]
-fn serialize_debug_message() {
-    let msg = Message::debug("debug info", json!({"x": 1}));
+fn serialize_log_message_debug_level() {
+    let msg = Message::log("debug info", "debug", json!({"x": 1}));
     let json = serde_json::to_string(&msg).unwrap();
-    assert!(json.contains("\"method\":\"DEBUG\""));
+    assert!(json.contains("\"method\":\"LOG\""));
+    assert!(json.contains("debug"));
 }
 
 #[test]
@@ -145,7 +147,6 @@ fn serialize_status_request() {
     let msg = Message::status_request();
     let json = serde_json::to_string(&msg).unwrap();
     assert!(json.contains("\"method\":\"GET\""));
-    assert!(json.contains("\"/status\""));
 }
 
 #[test]
@@ -177,7 +178,7 @@ fn serialize_action_message() {
 
 #[test]
 fn deserialize_unknown_method_fails() {
-    let raw = r#"{"method":"UNKNOWN_METHOD","path":"/"}"#;
+    let raw = r#"{"method":"UNKNOWN_METHOD"}"#;
     let result = serde_json::from_str::<Message>(raw);
     assert!(result.is_err());
 }
@@ -188,7 +189,7 @@ fn deserialize_unknown_method_fails() {
 
 #[test]
 fn message_builder_with_headers() {
-    let msg = Message::new(Method::Get, "/health")
+    let msg = Message::new(Method::Get)
         .header(headers::X_WORKER_ID, "worker-123")
         .header(headers::X_SOCKET_PATH, "/tmp/test.sock");
     
@@ -198,7 +199,7 @@ fn message_builder_with_headers() {
 
 #[test]
 fn message_builder_with_body() {
-    let msg = Message::new(Method::Post, "/data")
+    let msg = Message::new(Method::Post)
         .body(json!({"key": "value"}));
     
     assert!(msg.body.is_some());
@@ -207,9 +208,8 @@ fn message_builder_with_body() {
 
 #[test]
 fn message_with_body_constructor() {
-    let msg = Message::with_body(Method::Execute, "/execute", json!({"task": "run"}));
+    let msg = Message::with_body(Method::Execute, json!({"task": "run"}));
     assert_eq!(msg.method, Method::Execute);
-    assert_eq!(msg.path, "/execute");
     assert_eq!(msg.body.unwrap()["task"], "run");
 }
 
@@ -219,7 +219,7 @@ fn message_with_body_constructor() {
 
 #[test]
 fn message_clone_is_independent() {
-    let original = Message::info("original", json!({"a": 1}));
+    let original = Message::log("original", "info", json!({"a": 1}));
     let cloned = original.clone();
 
     // Both should be equal in content

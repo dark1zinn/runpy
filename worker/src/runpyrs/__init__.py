@@ -13,8 +13,7 @@ from .utils import (
     ready_message,
     done_message,
     error_message,
-    debug_message,
-    info_message,
+    log_message,
     status_response,
     # User-facing type aliases
     ExecutePayload,
@@ -47,8 +46,7 @@ __all__ = [
     "ready_message",
     "done_message",
     "error_message",
-    "debug_message",
-    "info_message",
+    "log_message",
     "status_response",
     # User-facing type aliases
     "ExecutePayload",

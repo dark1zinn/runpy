@@ -101,6 +101,38 @@ impl Manager {
     pub fn check_integrity(&self) -> Result<(), String> {
         self.integrity.perform_check()
     }
+
+    /// Broadcast a message to all active workers.
+    /// Returns a map of worker_id -> Result indicating success or failure for each.
+    pub async fn broadcast(&self, msg: Message) -> HashMap<String, Result<(), String>> {
+        let workers = self.workers.read().await;
+        let mut results = HashMap::new();
+
+        for (worker_id, handle) in workers.iter() {
+            let result = handle.sender.send(msg.clone()).await;
+            results.insert(worker_id.clone(), result);
+        }
+
+        results
+    }
+
+    /// Terminate all active workers gracefully.
+    /// Sends TERMINATE to all workers, waits briefly, then force-kills any remaining.
+    pub async fn terminate_all(&mut self) {
+        // First, send TERMINATE to all
+        let _ = self.broadcast(Message::terminate()).await;
+
+        // Give workers time to shut down cleanly
+        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+        // Force-kill any remaining
+        let mut workers = self.workers.write().await;
+        for (id, mut handle) in workers.drain() {
+            let _ = handle.child.kill();
+            let _ = std::fs::remove_file(&handle.sock_path);
+            println!("Terminated worker: {} ({})", handle.identity.name, id);
+        }
+    }
 }
 
 impl Drop for Manager {

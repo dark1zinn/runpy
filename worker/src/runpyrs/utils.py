@@ -14,7 +14,6 @@ The protocol uses a JSON structure inspired by HTTP:
 
     {
         "method": "EXECUTE",
-        "path": "/task",
         "headers": {
             "X-Worker-Id": "my_worker_01012026-1200_Ax4f",
             "X-Socket-Path": "/tmp/runpy/rp_my_worker.sock",
@@ -34,10 +33,9 @@ Methods:
     - META:      Send/receive metadata about the worker
     - READY:     Signal the worker is ready
     - STATUS:    Response with status information
-    - INFO:      Generic informational message
-    - DEBUG:     Debug-level message
+    - LOG:       Log message with level (X-Log-Level header: trace, debug, info, warning, error)
     - DONE:      Signal successful completion
-    - ERROR:     Error response
+    - ERROR:     Error response with optional level (X-Error-Level header)
     - ACTION:    Perform a named action with parameters
 """
 
@@ -56,7 +54,7 @@ HttpMethod = Literal["GET", "POST", "PUT", "DELETE"]
 
 # Custom Runpy methods
 RunpyMethod = Literal[
-    "EXECUTE", "RETRY", "TERMINATE", "META", "READY", "STATUS", "INFO", "DEBUG", "DONE", "ERROR", "ACTION"
+    "EXECUTE", "RETRY", "TERMINATE", "META", "READY", "STATUS", "LOG", "DONE", "ERROR", "ACTION"
 ]
 """Custom Runpy protocol methods."""
 
@@ -95,6 +93,12 @@ class Headers:
     X_ACTION = "X-Action"
     X_KEY = "X-Key"
     X_STACK_TRACE = "X-Stack-Trace"
+    
+    # Log level for LOG messages (e.g., "trace", "debug", "info", "warning", "error")
+    X_LOG_LEVEL = "X-Log-Level"
+    
+    # Error severity level (e.g., "dismissable", "warning", "critical")
+    X_ERROR_LEVEL = "X-Error-Level"
 
 
 HeadersDict = Dict[str, str]
@@ -116,7 +120,6 @@ class Message(_MessageRequired, total=False):
     Follows an HTTP-like schema:
         {
             "method": "EXECUTE",
-            "path": "/execute",
             "headers": {
                 "X-Worker-Id": "worker_name",
                 "X-Socket-Path": "/tmp/runpy/rp_xxx.sock"
@@ -124,7 +127,6 @@ class Message(_MessageRequired, total=False):
             "body": { ... }
         }
     """
-    path: str
     headers: Dict[str, str]
     body: Dict[str, Any]
 
@@ -145,7 +147,6 @@ class MetaData(TypedDict, total=False):
 
 def create_message(
     method: Method,
-    path: str = "",
     headers: Optional[HeadersDict] = None,
     body: Optional[Dict[str, Any]] = None,
 ) -> Message:
@@ -153,7 +154,6 @@ def create_message(
 
     Args:
         method: The HTTP-like method (GET, POST, EXECUTE, etc.)
-        path: Resource path for routing (e.g., "/status", "/execute")
         headers: Optional headers dict for metadata
         body: Optional payload body
 
@@ -161,8 +161,6 @@ def create_message(
         A Message dict ready to be serialized to JSON
     """
     msg: Message = {"method": method}
-    if path:
-        msg["path"] = path
     if headers:
         msg["headers"] = headers
     if body is not None:
@@ -172,7 +170,7 @@ def create_message(
 
 def ready_message(message: str, headers: Optional[HeadersDict] = None) -> Message:
     """Create a READY message."""
-    msg = create_message("READY", "/ready", headers, {"message": message})
+    msg = create_message("READY", headers, {"message": message})
     return msg
 
 
@@ -180,31 +178,51 @@ def done_message(
     message: str, data: Dict[str, Any], headers: Optional[HeadersDict] = None
 ) -> Message:
     """Create a DONE message with result data."""
-    return create_message("DONE", "/done", headers, {"message": message, "data": data})
+    return create_message("DONE", headers, {"message": message, "data": data})
 
 
 def error_message(
-    message: str, stack_trace: Optional[str] = None, headers: Optional[HeadersDict] = None
+    message: str,
+    stack_trace: Optional[str] = None,
+    error_level: Optional[str] = None,
+    headers: Optional[HeadersDict] = None,
 ) -> Message:
-    """Create an ERROR message."""
+    """Create an ERROR message.
+    
+    Args:
+        message: The error message
+        stack_trace: Optional stack trace string
+        error_level: Optional error level ("dismissable", "warning", "critical")
+        headers: Optional additional headers
+    """
     hdrs = dict(headers) if headers else {}
     if stack_trace:
         hdrs[Headers.X_STACK_TRACE] = stack_trace
-    return create_message("ERROR", "/error", hdrs, {"message": message})
+    if error_level:
+        hdrs[Headers.X_ERROR_LEVEL] = error_level
+    return create_message("ERROR", hdrs, {"message": message})
 
 
-def debug_message(
-    message: str, data: Dict[str, Any], headers: Optional[HeadersDict] = None
+def log_message(
+    message: str,
+    level: str,
+    data: Optional[Dict[str, Any]] = None,
+    headers: Optional[HeadersDict] = None,
 ) -> Message:
-    """Create a DEBUG message."""
-    return create_message("DEBUG", "/debug", headers, {"message": message, "data": data})
-
-
-def info_message(
-    message: str, data: Dict[str, Any], headers: Optional[HeadersDict] = None
-) -> Message:
-    """Create an INFO message."""
-    return create_message("INFO", "/info", headers, {"message": message, "data": data})
+    """Create a LOG message with a log level.
+    
+    Args:
+        message: The log message
+        level: Log level ("trace", "debug", "info", "warning", "error")
+        data: Optional additional data
+        headers: Optional additional headers
+    """
+    hdrs = dict(headers) if headers else {}
+    hdrs[Headers.X_LOG_LEVEL] = level
+    body = {"message": message}
+    if data:
+        body["data"] = data
+    return create_message("LOG", hdrs, body)
 
 
 def status_response(
@@ -213,7 +231,7 @@ def status_response(
     """Create a STATUS response."""
     hdrs = dict(headers) if headers else {}
     hdrs[Headers.X_UPTIME] = str(uptime)
-    return create_message("STATUS", "/status", hdrs, {"status": status, "uptime": uptime})
+    return create_message("STATUS", hdrs, {"status": status, "uptime": uptime})
 
 
 # ══════════════════════════════════════════════════════════════════════════════
