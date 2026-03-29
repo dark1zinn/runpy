@@ -8,7 +8,7 @@ use runpy::{Manager, Message, Method};
 async fn main() {
     // Resolve paths relative to the Cargo manifest directory
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let venv_path = format!("{}/worker/.venv", manifest_dir);
+    let venv_path = format!("{}/../../.venv", manifest_dir);
     let scripts_path = format!("{}/worker/src/scripts", manifest_dir);
 
     // ── 1. Create the Manager ─────────────────────────────────────
