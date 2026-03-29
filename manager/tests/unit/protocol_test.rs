@@ -2,7 +2,9 @@
 ///
 /// Tests Message serialization/deserialization, Envelope construction,
 /// ControlPlane socket communication, and MessageSender channel behaviour.
-use runpy::{Message, MessageEnvelope, MessageSender, Mailer};
+///
+/// Uses the new HTTP-like message schema with method, path, headers, and body.
+use runpy::{headers, Message, MessageEnvelope, MessageSender, Mailer, Method};
 use serde_json::json;
 use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -18,201 +20,206 @@ fn test_envelope(worker_id: &str, message: Message) -> MessageEnvelope {
     }
 }
 
-// ─── Message serde round-trips ─────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+// MESSAGE SERDE ROUND-TRIPS
+// ═══════════════════════════════════════════════════════════════════════════
 
 #[test]
 fn serialize_ready_message() {
-    let msg = Message::Ready {
-        message: "hello".into(),
-    };
+    let msg = Message::ready("hello");
     let json = serde_json::to_string(&msg).unwrap();
-    assert!(json.contains("\"type\":\"READY\""));
+    assert!(json.contains("\"method\":\"READY\""));
     assert!(json.contains("\"message\":\"hello\""));
 }
 
 #[test]
 fn deserialize_ready_message() {
-    let raw = r#"{"type":"READY","message":"Worker ready"}"#;
+    let raw = r#"{"method":"READY","body":{"message":"Worker ready"}}"#;
     let msg: Message = serde_json::from_str(raw).unwrap();
-    match msg {
-        Message::Ready { message } => assert_eq!(message, "Worker ready"),
-        _ => panic!("Expected Ready variant"),
-    }
+    assert_eq!(msg.method, Method::Ready);
+    assert!(msg.body.is_some());
+    let body = msg.body.unwrap();
+    assert_eq!(body["message"], "Worker ready");
 }
 
 #[test]
 fn serialize_terminate_message() {
-    let msg = Message::Terminate;
+    let msg = Message::terminate();
     let json = serde_json::to_string(&msg).unwrap();
-    assert!(json.contains("\"type\":\"TERMINATE\""));
+    assert!(json.contains("\"method\":\"TERMINATE\""));
 }
 
 #[test]
 fn deserialize_terminate_message() {
-    let raw = r#"{"type":"TERMINATE"}"#;
+    let raw = r#"{"method":"TERMINATE"}"#;
     let msg: Message = serde_json::from_str(raw).unwrap();
-    assert!(matches!(msg, Message::Terminate));
+    assert_eq!(msg.method, Method::Terminate);
 }
 
 #[test]
 fn serialize_execute_message() {
-    let msg = Message::Execute {
-        payload: json!({"url": "https://example.com"}),
-    };
+    let msg = Message::execute(json!({"url": "https://example.com"}));
     let json = serde_json::to_string(&msg).unwrap();
-    assert!(json.contains("\"type\":\"EXECUTE\""));
+    assert!(json.contains("\"method\":\"EXECUTE\""));
     assert!(json.contains("https://example.com"));
 }
 
 #[test]
 fn deserialize_execute_message() {
-    let raw = r#"{"type":"EXECUTE","payload":{"key":"value"}}"#;
+    let raw = r#"{"method":"EXECUTE","body":{"key":"value"}}"#;
     let msg: Message = serde_json::from_str(raw).unwrap();
-    match msg {
-        Message::Execute { payload } => {
-            assert_eq!(payload["key"], "value");
-        }
-        _ => panic!("Expected Execute variant"),
-    }
+    assert_eq!(msg.method, Method::Execute);
+    let body = msg.body.unwrap();
+    assert_eq!(body["key"], "value");
 }
 
 #[test]
 fn serialize_done_message() {
-    let msg = Message::Done {
-        message: "ok".into(),
-        data: json!({"count": 42}),
-    };
+    let msg = Message::done("ok", json!({"count": 42}));
     let json = serde_json::to_string(&msg).unwrap();
-    assert!(json.contains("\"type\":\"DONE\""));
+    assert!(json.contains("\"method\":\"DONE\""));
     assert!(json.contains("\"count\":42"));
 }
 
 #[test]
 fn deserialize_done_message() {
-    let raw = r#"{"type":"DONE","message":"finished","data":{"result":true}}"#;
+    let raw = r#"{"method":"DONE","body":{"message":"finished","data":{"result":true}}}"#;
     let msg: Message = serde_json::from_str(raw).unwrap();
-    match msg {
-        Message::Done { message, data } => {
-            assert_eq!(message, "finished");
-            assert_eq!(data["result"], true);
-        }
-        _ => panic!("Expected Done variant"),
-    }
+    assert_eq!(msg.method, Method::Done);
+    let body = msg.body.unwrap();
+    assert_eq!(body["message"], "finished");
+    assert_eq!(body["data"]["result"], true);
 }
 
 #[test]
 fn serialize_error_message_with_stack_trace() {
-    let msg = Message::Error {
-        message: "boom".into(),
-        stack_trace: Some("line 42".into()),
-    };
+    let msg = Message::error("boom", Some("line 42".into()), Some("critical".into()));
     let json = serde_json::to_string(&msg).unwrap();
-    assert!(json.contains("\"type\":\"ERROR\""));
+    assert!(json.contains("\"method\":\"ERROR\""));
+    assert!(json.contains("X-Stack-Trace"));
     assert!(json.contains("line 42"));
+    assert!(json.contains("X-Error-Level"));
+    assert!(json.contains("critical"));
 }
 
 #[test]
 fn serialize_error_message_without_stack_trace() {
-    let msg = Message::Error {
-        message: "boom".into(),
-        stack_trace: None,
-    };
+    let msg = Message::error("boom", None, None);
     let json = serde_json::to_string(&msg).unwrap();
-    assert!(json.contains("\"type\":\"ERROR\""));
-    assert!(json.contains("null"));
+    assert!(json.contains("\"method\":\"ERROR\""));
+    assert!(!json.contains("X-Stack-Trace"));
 }
 
 #[test]
-fn serialize_info_message() {
-    let msg = Message::Info {
-        message: "log line".into(),
-        data: json!({}),
-    };
+fn serialize_log_message() {
+    let msg = Message::log("log line", "info", json!({}));
     let json = serde_json::to_string(&msg).unwrap();
-    assert!(json.contains("\"type\":\"INFO\""));
+    assert!(json.contains("\"method\":\"LOG\""));
+    assert!(json.contains("X-Log-Level"));
+    assert!(json.contains("info"));
 }
 
 #[test]
-fn serialize_debug_message() {
-    let msg = Message::Debug {
-        message: "debug info".into(),
-        data: json!({"x": 1}),
-    };
+fn serialize_log_message_debug_level() {
+    let msg = Message::log("debug info", "debug", json!({"x": 1}));
     let json = serde_json::to_string(&msg).unwrap();
-    assert!(json.contains("\"type\":\"DEBUG\""));
+    assert!(json.contains("\"method\":\"LOG\""));
+    assert!(json.contains("debug"));
 }
 
 #[test]
 fn serialize_retry_message() {
-    let msg = Message::Retry;
+    let msg = Message::retry();
     let json = serde_json::to_string(&msg).unwrap();
-    assert!(json.contains("\"type\":\"RETRY\""));
+    assert!(json.contains("\"method\":\"RETRY\""));
 }
 
 #[test]
 fn serialize_meta_message() {
-    let msg = Message::Meta {
-        data: json!({"name": "worker-1"}),
-    };
+    let msg = Message::meta(json!({"name": "worker-1"}));
     let json = serde_json::to_string(&msg).unwrap();
-    assert!(json.contains("\"type\":\"META\""));
+    assert!(json.contains("\"method\":\"META\""));
     assert!(json.contains("worker-1"));
 }
 
 #[test]
-fn serialize_status_message() {
-    let msg = Message::Status { uptime: Some(120) };
+fn serialize_status_request() {
+    let msg = Message::status_request();
     let json = serde_json::to_string(&msg).unwrap();
-    assert!(json.contains("\"type\":\"STATUS\""));
-    assert!(json.contains("120"));
+    assert!(json.contains("\"method\":\"GET\""));
 }
 
 #[test]
-fn serialize_status_res_message() {
-    let msg = Message::StatusRes {
-        status: "ok".into(),
-        uptime: 300,
-    };
+fn serialize_status_response() {
+    let msg = Message::status_response("ok", 300);
     let json = serde_json::to_string(&msg).unwrap();
-    assert!(json.contains("\"type\":\"STATUS_RES\""));
+    assert!(json.contains("\"method\":\"STATUS\""));
+    assert!(json.contains("X-Uptime"));
+    assert!(json.contains("300"));
 }
 
 #[test]
 fn serialize_get_message() {
-    let msg = Message::Get {
-        key: "config_key".into(),
-    };
+    let msg = Message::get("config_key");
     let json = serde_json::to_string(&msg).unwrap();
-    assert!(json.contains("\"type\":\"GET\""));
+    assert!(json.contains("\"method\":\"GET\""));
+    assert!(json.contains("X-Key"));
     assert!(json.contains("config_key"));
 }
 
 #[test]
 fn serialize_action_message() {
-    let msg = Message::Action {
-        action: "restart".into(),
-        params: json!({"force": true}),
-    };
+    let msg = Message::action("restart", json!({"force": true}));
     let json = serde_json::to_string(&msg).unwrap();
-    assert!(json.contains("\"type\":\"ACTION\""));
+    assert!(json.contains("\"method\":\"ACTION\""));
+    assert!(json.contains("X-Action"));
     assert!(json.contains("restart"));
 }
 
 #[test]
-fn deserialize_unknown_type_fails() {
-    let raw = r#"{"type":"UNKNOWN_TYPE","data":{}}"#;
+fn deserialize_unknown_method_fails() {
+    let raw = r#"{"method":"UNKNOWN_METHOD"}"#;
     let result = serde_json::from_str::<Message>(raw);
     assert!(result.is_err());
 }
 
-// ─── Message clone ─────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+// MESSAGE BUILDER API
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn message_builder_with_headers() {
+    let msg = Message::new(Method::Get)
+        .header(headers::X_WORKER_ID, "worker-123")
+        .header(headers::X_SOCKET_PATH, "/tmp/test.sock");
+    
+    assert_eq!(msg.worker_id(), Some("worker-123"));
+    assert_eq!(msg.socket_path(), Some("/tmp/test.sock"));
+}
+
+#[test]
+fn message_builder_with_body() {
+    let msg = Message::new(Method::Post)
+        .body(json!({"key": "value"}));
+    
+    assert!(msg.body.is_some());
+    assert_eq!(msg.body.unwrap()["key"], "value");
+}
+
+#[test]
+fn message_with_body_constructor() {
+    let msg = Message::with_body(Method::Execute, json!({"task": "run"}));
+    assert_eq!(msg.method, Method::Execute);
+    assert_eq!(msg.body.unwrap()["task"], "run");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MESSAGE CLONE
+// ═══════════════════════════════════════════════════════════════════════════
 
 #[test]
 fn message_clone_is_independent() {
-    let original = Message::Info {
-        message: "original".into(),
-        data: json!({"a": 1}),
-    };
+    let original = Message::log("original", "info", json!({"a": 1}));
     let cloned = original.clone();
 
     // Both should be equal in content
@@ -221,26 +228,28 @@ fn message_clone_is_independent() {
     assert_eq!(orig_json, clone_json);
 }
 
-// ─── Envelope construction ─────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+// ENVELOPE CONSTRUCTION
+// ═══════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
 async fn envelope_carries_worker_id() {
-    let env = test_envelope("worker_abc", Message::Ready {
-        message: "up".into(),
-    });
+    let env = test_envelope("worker_abc", Message::ready("up"));
     assert_eq!(env.worker_id, "worker_abc");
-    assert!(matches!(env.message, Message::Ready { .. }));
+    assert_eq!(env.message.method, Method::Ready);
 }
 
 #[tokio::test]
 async fn envelope_clone_is_independent() {
-    let env = test_envelope("w1", Message::Terminate);
+    let env = test_envelope("w1", Message::terminate());
     let cloned = env.clone();
     assert_eq!(cloned.worker_id, "w1");
-    assert!(matches!(cloned.message, Message::Terminate));
+    assert_eq!(cloned.message.method, Method::Terminate);
 }
 
-// ─── Length-prefixed wire protocol ─────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+// LENGTH-PREFIXED WIRE PROTOCOL
+// ═══════════════════════════════════════════════════════════════════════════
 //
 // These tests simulate the Rust ↔ Python wire format: 8-byte LE length
 // prefix followed by a JSON payload.
@@ -308,17 +317,10 @@ async fn control_plane_receives_messages_and_dispatches_to_handlers() {
     // Connect as a "Python worker" and send two messages
     let mut client = UnixStream::connect(&sock_path).await.unwrap();
 
-    let msg1 = serde_json::to_vec(&Message::Ready {
-        message: "hi".into(),
-    })
-    .unwrap();
+    let msg1 = serde_json::to_vec(&Message::ready("hi")).unwrap();
     write_length_prefixed(&mut client, &msg1).await;
 
-    let msg2 = serde_json::to_vec(&Message::Done {
-        message: "done".into(),
-        data: json!({}),
-    })
-    .unwrap();
+    let msg2 = serde_json::to_vec(&Message::done("done", json!({}))).unwrap();
     write_length_prefixed(&mut client, &msg2).await;
 
     recv_task.await.unwrap();
@@ -339,33 +341,23 @@ async fn wire_protocol_round_trip_sends_and_receives() {
         // Read what the client sends
         let data = read_length_prefixed(&mut stream).await;
         let msg: Message = serde_json::from_slice(&data).unwrap();
-        assert!(matches!(msg, Message::Ready { .. }));
+        assert_eq!(msg.method, Method::Ready);
 
         // Send back a response
-        let response = serde_json::to_vec(&Message::Execute {
-            payload: json!({"task": "scrape"}),
-        })
-        .unwrap();
+        let response = serde_json::to_vec(&Message::execute(json!({"task": "scrape"}))).unwrap();
         write_length_prefixed(&mut stream, &response).await;
     });
 
     // Client: connect, send a message, read the response
     let mut client = UnixStream::connect(&sock_path).await.unwrap();
 
-    let outgoing = serde_json::to_vec(&Message::Ready {
-        message: "ready".into(),
-    })
-    .unwrap();
+    let outgoing = serde_json::to_vec(&Message::ready("ready")).unwrap();
     write_length_prefixed(&mut client, &outgoing).await;
 
     let response_data = read_length_prefixed(&mut client).await;
     let response: Message = serde_json::from_slice(&response_data).unwrap();
-    match response {
-        Message::Execute { payload } => {
-            assert_eq!(payload["task"], "scrape");
-        }
-        _ => panic!("Expected Execute message"),
-    }
+    assert_eq!(response.method, Method::Execute);
+    assert_eq!(response.body.unwrap()["task"], "scrape");
 
     server.await.unwrap();
 }
@@ -393,7 +385,9 @@ async fn connection_close_returns_none_on_recv() {
     server.await.unwrap();
 }
 
-// ─── MessageSender via channel ─────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+// MESSAGE SENDER VIA CHANNEL
+// ═══════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
 async fn message_sender_delivers_through_channel() {
@@ -407,12 +401,12 @@ async fn message_sender_delivers_through_channel() {
     };
 
     sender
-        .send(Message::Terminate)
+        .send(Message::terminate())
         .await
         .expect("send should succeed");
 
     let received = rx.recv().await.expect("should receive a message");
-    assert!(matches!(received, Message::Terminate));
+    assert_eq!(received.method, Method::Terminate);
 }
 
 #[tokio::test]
@@ -423,22 +417,18 @@ async fn message_sender_clone_works() {
     let sender2 = sender.clone();
 
     sender
-        .send(Message::Ready {
-            message: "one".into(),
-        })
+        .send(Message::ready("one"))
         .await
         .unwrap();
     sender2
-        .send(Message::Ready {
-            message: "two".into(),
-        })
+        .send(Message::ready("two"))
         .await
         .unwrap();
 
     let m1 = rx.recv().await.unwrap();
     let m2 = rx.recv().await.unwrap();
-    assert!(matches!(m1, Message::Ready { .. }));
-    assert!(matches!(m2, Message::Ready { .. }));
+    assert_eq!(m1.method, Method::Ready);
+    assert_eq!(m2.method, Method::Ready);
 }
 
 #[tokio::test]
@@ -447,7 +437,7 @@ async fn message_sender_fails_when_receiver_dropped() {
     let sender: MessageSender = unsafe { std::mem::transmute(tx) };
     drop(rx);
 
-    let result = sender.send(Message::Terminate).await;
+    let result = sender.send(Message::terminate()).await;
     assert!(result.is_err());
     assert!(result.unwrap_err().contains("Failed to send message"));
 }

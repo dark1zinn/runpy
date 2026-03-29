@@ -101,9 +101,10 @@ class TestWorkerClass:
     def test_run_method_exists(self):
         assert callable(getattr(Worker, "run", None))
 
-    def test_internal_types_defined(self):
+    def test_internal_methods_defined(self):
+        """Worker class defines internal methods that should not be passed to user handler."""
         expected = {"TERMINATE", "META", "EXECUTE", "RETRY"}
-        assert Worker._INTERNAL_TYPES == expected
+        assert Worker._INTERNAL_METHODS == expected
 
 
 # ── RunScript ───────────────────────────────────────────────────────────
@@ -147,17 +148,20 @@ class TestTypingUtils:
         assert Envelope is EnvelopeDirect
         assert ExecuteResult is ExecuteResultDirect
 
-    def test_envelope_is_typed_dict(self):
+    def test_message_is_typed_dict(self):
+        """Message (Envelope alias) is a TypedDict with HTTP-like fields."""
         # TypedDict classes have __annotations__ and descend from dict
         assert hasattr(Envelope, "__annotations__")
-        assert "type" in Envelope.__annotations__
-        assert "data" in Envelope.__annotations__
+        assert "method" in Envelope.__annotations__
+        # Optional fields (path was removed from protocol)
+        assert "headers" in Envelope.__annotations__
+        assert "body" in Envelope.__annotations__
 
-    def test_outbound_message_is_typed_dict(self):
+    def test_outbound_message_is_message_alias(self):
+        """OutboundMessage is now an alias for Message."""
         assert hasattr(OutboundMessage, "__annotations__")
-        assert "type" in OutboundMessage.__annotations__
-        assert "message" in OutboundMessage.__annotations__
-        assert "data" in OutboundMessage.__annotations__
+        assert "method" in OutboundMessage.__annotations__
+        assert "headers" in OutboundMessage.__annotations__
 
     def test_meta_data_is_typed_dict(self):
         assert hasattr(MetaData, "__annotations__")

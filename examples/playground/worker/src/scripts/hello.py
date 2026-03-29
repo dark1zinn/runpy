@@ -1,4 +1,4 @@
-from ..base.hello import HelloWorker
+from bases.HelloWorker import HelloWorker
 
 class Hello(HelloWorker):
     """A simple worker that extends the HelloWorker base class and implements the execute method."""

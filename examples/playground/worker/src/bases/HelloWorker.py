@@ -3,16 +3,20 @@
 from runpyrs import Worker
 
 class HelloWorker(Worker):
-    """A Base worker containing a sayHello method that can be used by subsequent workers"""
+    """A Base worker containing a sayHello method that can be used by subsequent workers.
+    
+    Uses the new HTTP-like protocol with method, headers, and body.
+    """
 
     # Since this is yet a less abstract class of the Worker base, we dont override execute here.
     def execute(self, payload: dict) -> dict:
         raise NotImplementedError("HelloWorker is a base class. Please implement the execute() method.")
     
-    # Thus we can now acces this sayHello method from subsequent subclasses.
+    # Thus we can now access this sayHello method from subsequent subclasses.
     def sayHello(self, name: str) -> dict:
         """Example of a custom method that can be called from execute or handle_request."""
         greeting = f"Hello, {name}!"
         print(greeting)
-        self.send("INFO", "Generated greeting", {"greeting": greeting})
+        # New HTTP-like protocol: send(method, message=..., body=..., headers=...)
+        self.send("LOG", message="Generated greeting", body={"greeting": greeting}, headers={"X-Log-Level": "info"})
         return {"greeting": greeting}
