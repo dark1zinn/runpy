@@ -33,13 +33,11 @@ async fn test_spawn_worker() {
     // Give the worker time to start and send READY
     tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
-    // Send an EXECUTE message
-    let exec_msg = Message::Execute {
-        payload: serde_json::json!({
-            "html": "<html><title>Test</title></html>"
-        }),
-    };
-    worker.send_message(&exec_msg).await.expect("Failed to send message");
+    // Send an EXECUTE message with the new HTTP-like schema
+    let exec_msg = Message::execute(serde_json::json!({
+        "html": "<html><title>Test</title></html>"
+    }));
+    worker.send_message(exec_msg).await.expect("Failed to send message");
 
     // Wait for response
     tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;

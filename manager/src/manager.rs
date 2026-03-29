@@ -197,9 +197,9 @@ impl Worker {
     }
 
     /// Send a `Message` to the running worker via its control-plane channel.
-    pub async fn send_message(&self, msg: &Message) -> Result<(), String> {
+    pub async fn send_message(&self, msg: Message) -> Result<(), String> {
         match &self.sender {
-            Some(sender) => sender.send(msg.clone()).await,
+            Some(sender) => sender.send(msg).await,
             None => Err("Worker has not been spawned yet".to_string()),
         }
     }
@@ -207,7 +207,7 @@ impl Worker {
     /// Request graceful termination: send a TERMINATE message, then wait briefly
     /// before force-killing the process.
     pub async fn terminate(&self) -> Result<(), String> {
-        self.send_message(&Message::Terminate).await?;
+        self.send_message(Message::terminate()).await?;
 
         // Give the worker a moment to shut down cleanly
         tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;

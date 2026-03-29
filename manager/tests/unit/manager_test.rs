@@ -150,7 +150,7 @@ async fn send_message_before_spawn_returns_error() {
     let worker = manager.worker("test");
 
     let result = worker
-        .send_message(&Message::Terminate)
+        .send_message(Message::terminate())
         .await;
     assert!(result.is_err());
     assert!(result.unwrap_err().contains("not been spawned"));
