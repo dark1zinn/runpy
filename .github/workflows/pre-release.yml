@@ -1,0 +1,63 @@
+name: Pre-Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+-dev'
+      - 'v[0-9]+.[0-9]+.[0-9]+-dev.[0-9]+'
+
+jobs:
+  build-and-prerelease:
+    name: Build and Pre-Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate tag format (must be vX.X.X-dev or vX.X.X-dev.X)
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-dev(\.[0-9]+)?$ ]]; then
+            echo "::error::Tag '$TAG' does not match pre-release format vX.X.X-dev or vX.X.X-dev.X"
+            exit 1
+          fi
+          echo "TAG=$TAG" >> $GITHUB_ENV
+          echo "✓ Valid pre-release tag: $TAG"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Build Rust crate
+        run: cargo package -p runpy
+
+      - name: Build Python package
+        working-directory: ./worker
+        run: uv build
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p release-artifacts
+          cp ./target/package/runpy-*.crate release-artifacts/
+          cp ./worker/dist/*.tar.gz release-artifacts/
+          cp ./worker/dist/*.whl release-artifacts/
+          echo "📦 Pre-release artifacts:"
+          ls -la release-artifacts/
+
+      - name: Create GitHub Pre-Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Pre-Release ${{ env.TAG }}
+          prerelease: true
+          generate_release_notes: true
+          files: release-artifacts/*
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
