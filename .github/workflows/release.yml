@@ -39,15 +39,22 @@ jobs:
 
       - name: Build Python package
         working-directory: ./worker
-        run: uv build
+        run: uv build worker --sdist --wheel
 
       - name: Collect artifacts
         run: |
           mkdir -p release-artifacts
+          
+          echo "📦 Rust crate artifacts:"
+          ls -la ./target/package/ || echo "No Rust artifacts found"
+          
+          echo "📦 Python package artifacts:"
+          ls -la ./dist/ || echo "No Python artifacts found"
+          
           cp ./target/package/runpy-*.crate release-artifacts/
-          cp ./dist/*.tar.gz release-artifacts/
-          cp ./dist/*.whl release-artifacts/
-          echo "📦 Release artifacts:"
+          cp ./dist/runpyrs-* release-artifacts/
+          
+          echo "📦 Final release artifacts:"
           ls -la release-artifacts/
 
       - name: Create GitHub Release
