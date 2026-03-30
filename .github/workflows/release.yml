@@ -45,8 +45,8 @@ jobs:
         run: |
           mkdir -p release-artifacts
           cp ./target/package/runpy-*.crate release-artifacts/
-          cp ./worker/dist/*.tar.gz release-artifacts/
-          cp ./worker/dist/*.whl release-artifacts/
+          cp ./dist/*.tar.gz release-artifacts/
+          cp ./dist/*.whl release-artifacts/
           echo "📦 Release artifacts:"
           ls -la release-artifacts/
 
