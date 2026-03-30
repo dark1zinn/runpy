@@ -1,6 +1,6 @@
 [project]
 name = "runpyrs"
-version = "0.0.4"
+version = "0.1.0"
 description = "Python worker SDK for the Runpy manager — build workers that are spawned and orchestrated by Rust."
 readme = "README.md"
 license = { text = "Apache-2.0" }
