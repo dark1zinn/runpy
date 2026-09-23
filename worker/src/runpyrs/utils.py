@@ -1,262 +1,51 @@
-"""Typing utilities for the runpyrs package.
-
-Re-exported from the top-level package so users can write::
-
-    from runpyrs import Worker, ExecuteResult, Message
-
-These types improve editor auto-complete, static analysis, and serve as
-living documentation for the Runpy wire protocol.
-
-HTTP-like Protocol Schema
-=========================
-
-The protocol uses a JSON structure inspired by HTTP:
-
-    {
-        "method": "EXECUTE",
-        "headers": {
-            "X-Worker-Id": "my_worker_01012026-1200_Ax4f",
-            "X-Socket-Path": "/tmp/runpy/rp_my_worker.sock",
-            "Content-Type": "application/json"
-        },
-        "body": { "task": "process_data", "input": [...] }
-    }
-
-Methods:
-    - GET:       Request information (status, health, etc.)
-    - POST:      Send data or trigger an action
-    - PUT:       Update existing data/state
-    - DELETE:    Remove/clear data
-    - EXECUTE:   Execute the worker's main business logic
-    - RETRY:     Re-execute the last payload
-    - TERMINATE: Request graceful termination
-    - META:      Send/receive metadata about the worker
-    - READY:     Signal the worker is ready
-    - STATUS:    Response with status information
-    - LOG:       Log message with level (X-Log-Level header: trace, debug, info, warning, error)
-    - DONE:      Signal successful completion
-    - ERROR:     Error response with optional level (X-Error-Level header)
-    - ACTION:    Perform a named action with parameters
-"""
+"""Types and builders for Runpy's bare JSON envelope."""
 
 from __future__ import annotations
 
-from typing import Any, Dict, Literal, Optional, TypedDict, Union
+from typing import Any, Dict, Literal, Optional, TypedDict
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# METHODS
-# ══════════════════════════════════════════════════════════════════════════════
+Meta = Dict[str, Any]
+"""Developer metadata. Keys beginning with ``x_`` are reserved by Runpy."""
 
-# Standard HTTP-like methods
-HttpMethod = Literal["GET", "POST", "PUT", "DELETE"]
-"""Standard HTTP-like methods."""
+Data = Dict[str, Any]
+"""Developer-owned message data."""
 
-# Custom Runpy methods
-RunpyMethod = Literal[
-    "EXECUTE", "RETRY", "TERMINATE", "META", "READY", "STATUS", "LOG", "DONE", "ERROR", "ACTION"
+
+class Envelope(TypedDict):
+    """The complete value exchanged between a manager and worker."""
+
+    meta: Meta
+    data: Data
+
+
+RunpyOperation = Literal[
+    "ready", "execute", "retry", "terminate", "done", "error", "log"
 ]
-"""Custom Runpy protocol methods."""
+"""Operations reserved for Runpy in ``meta["x_op"]``."""
 
-Method = Union[HttpMethod, RunpyMethod]
-"""Any valid method in the Runpy protocol."""
+ExecutePayload = Data
+"""The direct ``data`` object passed to ``Worker.execute``."""
 
-# Legacy aliases for backward compatibility
-InternalMessageType = Literal["EXECUTE", "TERMINATE", "META", "RETRY"]
-"""Message types handled internally by the Worker base class."""
-
-BuiltinResponseType = Literal["READY", "DONE", "ERROR", "DEBUG"]
-"""Response types the Worker emits back to the Rust manager."""
-
-MessageType = Method
-"""Alias for Method - any message type that can appear on the wire."""
+ExecuteResult = Optional[Data]
+"""A direct result object, or ``None`` for an empty completion result."""
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# HEADERS
-# ══════════════════════════════════════════════════════════════════════════════
+def create_envelope(data: Data, meta: Optional[Meta] = None) -> Envelope:
+    """Build an application-defined envelope.
 
-class Headers:
-    """Standard header keys used in the protocol."""
-    
-    # Worker identification
-    X_WORKER_ID = "X-Worker-Id"
-    X_SOCKET_PATH = "X-Socket-Path"
-    
-    # Content info
-    CONTENT_TYPE = "Content-Type"
-    
-    # Status/timing
-    X_UPTIME = "X-Uptime"
-    
-    # Action/request metadata
-    X_ACTION = "X-Action"
-    X_KEY = "X-Key"
-    X_STACK_TRACE = "X-Stack-Trace"
-    
-    # Log level for LOG messages (e.g., "trace", "debug", "info", "warning", "error")
-    X_LOG_LEVEL = "X-Log-Level"
-    
-    # Error severity level (e.g., "dismissable", "warning", "critical")
-    X_ERROR_LEVEL = "X-Error-Level"
-
-
-HeadersDict = Dict[str, str]
-"""Type alias for headers dictionary."""
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# MESSAGE STRUCTURE
-# ══════════════════════════════════════════════════════════════════════════════
-
-class _MessageRequired(TypedDict):
-    """Required fields in every Message."""
-    method: str
-
-
-class Message(_MessageRequired, total=False):
-    """The unified message structure for all communication.
-
-    Follows an HTTP-like schema:
-        {
-            "method": "EXECUTE",
-            "headers": {
-                "X-Worker-Id": "worker_name",
-                "X-Socket-Path": "/tmp/runpy/rp_xxx.sock"
-            },
-            "body": { ... }
-        }
+    Application metadata cannot use Runpy's reserved ``x_`` namespace.
+    Inputs are copied so later caller mutations do not alter the envelope.
     """
-    headers: Dict[str, str]
-    body: Dict[str, Any]
 
+    if not isinstance(data, dict):
+        raise TypeError("data must be a dictionary")
+    if meta is not None and not isinstance(meta, dict):
+        raise TypeError("meta must be a dictionary")
 
-# Legacy alias
-Envelope = Message
-"""Legacy alias for Message - the dict received from Rust manager."""
+    envelope_meta = dict(meta or {})
+    reserved = next((key for key in envelope_meta if key.startswith("x_")), None)
+    if reserved is not None:
+        raise ValueError(f"metadata key '{reserved}' is reserved by Runpy")
 
-
-class MetaData(TypedDict, total=False):
-    """Contents of ``body`` in a META message."""
-    name: str
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# MESSAGE BUILDERS
-# ══════════════════════════════════════════════════════════════════════════════
-
-def create_message(
-    method: Method,
-    headers: Optional[HeadersDict] = None,
-    body: Optional[Dict[str, Any]] = None,
-) -> Message:
-    """Create a new protocol message.
-
-    Args:
-        method: The HTTP-like method (GET, POST, EXECUTE, etc.)
-        headers: Optional headers dict for metadata
-        body: Optional payload body
-
-    Returns:
-        A Message dict ready to be serialized to JSON
-    """
-    msg: Message = {"method": method}
-    if headers:
-        msg["headers"] = headers
-    if body is not None:
-        msg["body"] = body
-    return msg
-
-
-def ready_message(message: str, headers: Optional[HeadersDict] = None) -> Message:
-    """Create a READY message."""
-    msg = create_message("READY", headers, {"message": message})
-    return msg
-
-
-def done_message(
-    message: str, data: Dict[str, Any], headers: Optional[HeadersDict] = None
-) -> Message:
-    """Create a DONE message with result data."""
-    return create_message("DONE", headers, {"message": message, "data": data})
-
-
-def error_message(
-    message: str,
-    stack_trace: Optional[str] = None,
-    error_level: Optional[str] = None,
-    headers: Optional[HeadersDict] = None,
-) -> Message:
-    """Create an ERROR message.
-    
-    Args:
-        message: The error message
-        stack_trace: Optional stack trace string
-        error_level: Optional error level ("dismissable", "warning", "critical")
-        headers: Optional additional headers
-    """
-    hdrs = dict(headers) if headers else {}
-    if stack_trace:
-        hdrs[Headers.X_STACK_TRACE] = stack_trace
-    if error_level:
-        hdrs[Headers.X_ERROR_LEVEL] = error_level
-    return create_message("ERROR", hdrs, {"message": message})
-
-
-def log_message(
-    message: str,
-    level: str,
-    data: Optional[Dict[str, Any]] = None,
-    headers: Optional[HeadersDict] = None,
-) -> Message:
-    """Create a LOG message with a log level.
-    
-    Args:
-        message: The log message
-        level: Log level ("trace", "debug", "info", "warning", "error")
-        data: Optional additional data
-        headers: Optional additional headers
-    """
-    hdrs = dict(headers) if headers else {}
-    hdrs[Headers.X_LOG_LEVEL] = level
-    body = {"message": message}
-    if data:
-        body["data"] = data
-    return create_message("LOG", hdrs, body)
-
-
-def status_response(
-    status: str, uptime: int, headers: Optional[HeadersDict] = None
-) -> Message:
-    """Create a STATUS response."""
-    hdrs = dict(headers) if headers else {}
-    hdrs[Headers.X_UPTIME] = str(uptime)
-    return create_message("STATUS", hdrs, {"status": status, "uptime": uptime})
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# USER-FACING TYPE ALIASES
-# ══════════════════════════════════════════════════════════════════════════════
-
-ExecutePayload = Dict[str, Any]
-"""Type of the *body* dict passed to ``Worker.execute()``."""
-
-ExecuteResult = Optional[Dict[str, Any]]
-"""Return type of ``Worker.execute()``.
-
-Return a dict to have it sent back as a ``DONE`` message, or ``None``
-for a result-less acknowledgement.
-"""
-
-RequestData = Message
-"""Alias — the dict handed to ``Worker.handle_request()``."""
-
-HandleRequestResult = None
-"""Return type of ``Worker.handle_request()`` (always None)."""
-
-SendData = Optional[Dict[str, Any]]
-"""Type accepted for the *body* parameter of ``Worker.send()``."""
-
-# Legacy alias
-OutboundMessage = Message
-"""Legacy alias for Message - shape of outbound messages."""
+    return {"meta": envelope_meta, "data": dict(data)}

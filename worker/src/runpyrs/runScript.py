@@ -1,9 +1,10 @@
 import sys
 
-from typing import Dict, Optional, Type
+from typing import Dict, Type
 from .worker import Worker
 
 # ── Helper ──────────────────────────────────────────────────────────────
+
 
 def _parse_extra_args(args: list[str]) -> Dict[str, str]:
     """Parse --key=value arguments into a dict."""
@@ -18,17 +19,17 @@ def _parse_extra_args(args: list[str]) -> Dict[str, str]:
 def RunScript(worker_class: Type[Worker]):
     """Instantiate and run a Worker subclass.
 
-    Reads the socket path from ``sys.argv[1]``, optionally the worker
-    name from ``sys.argv[2]``, and extra --key=value arguments from
-    ``sys.argv[3:]`` (all passed by Rust manager at spawn time).
+    Reads the socket path from ``sys.argv[1]`` and the required worker ID from
+    ``sys.argv[2]``. Remaining ``--key=value`` arguments are exposed as
+    ``Worker.extra``.
     """
     try:
-        if len(sys.argv) < 2:
-            print("Error: Socket path argument required")
+        if len(sys.argv) < 3:
+            print("Error: Socket path and worker ID arguments required")
             sys.exit(1)
 
         socket_path = sys.argv[1]
-        worker_name: Optional[str] = sys.argv[2] if len(sys.argv) > 2 else None
+        worker_name = sys.argv[2]
         extra_args = _parse_extra_args(sys.argv[3:]) if len(sys.argv) > 3 else {}
 
         if not issubclass(worker_class, Worker):

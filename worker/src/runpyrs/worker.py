@@ -1,305 +1,232 @@
-import socket
 import json
-import sys
+import socket
 import struct
-from typing import Optional, Dict, Any
+from typing import Dict, Optional
 
 from .utils import (
+    Data,
+    Envelope,
     ExecutePayload,
     ExecuteResult,
-    HandleRequestResult,
-    Headers,
-    HeadersDict,
-    Message,
-    Method,
-    RequestData,
-    create_message,
-    ready_message,
-    done_message,
-    error_message,
-    log_message,
+    Meta,
+    create_envelope,
 )
+
+
+_RUNPY_OPERATIONS = frozenset(
+    {"ready", "execute", "retry", "terminate", "done", "error", "log"}
+)
+_MANAGER_OPERATIONS = frozenset({"execute", "retry", "terminate"})
+_RESERVED_KEYS = frozenset({"x_wid", "x_spath", "x_op"})
 
 
 class Worker:
     """Base class for Python workers managed by Runpy.
 
-    Subclass this and override `execute()` (required) and optionally
-    `handle_request()` for custom message routing.
-
-    Messages follow an HTTP-like schema:
-        {
-            "method": "EXECUTE",
-            "headers": {
-                "X-Worker-Id": "worker_name",
-                "X-Socket-Path": "/tmp/runpy/rp_xxx.sock"
-            },
-            "body": { ... }
-        }
-
-    Usage::
-
-        class MyWorker(Worker):
-            def execute(self, payload: dict) -> dict:
-                return {"result": "ok"}
-
-        if __name__ == "__main__":
-            RunScript(MyWorker)
+    Applications own the schema of both ``data`` and non-``x_`` metadata.
+    Override ``execute`` for managed execution and ``handle_envelope`` for
+    application-defined envelopes that do not contain ``meta.x_op``.
     """
 
-    def __init__(self, sock: str, name: Optional[str] = None, extra: Optional[Dict[str, str]] = None):
+    _INTERNAL_OPS = _MANAGER_OPERATIONS
+
+    def __init__(
+        self,
+        sock: str,
+        name: str,
+        extra: Optional[Dict[str, str]] = None,
+    ):
+        if not name:
+            raise ValueError("Worker ID is required")
+
         self.__ok = False
         self.__cycles = 0
-        self.__exec_payload: Optional[Dict[str, Any]] = None
+        self.__exec_payload: Optional[Data] = None
         self.__sock_path = sock
-        self.name: str = name or ""  # Worker name passed from Rust (required)
-        self.extra: Dict[str, str] = extra or {}  # Extra args passed from Rust (--key=value)
+        self.name = name
+        self.extra: Dict[str, str] = extra or {}
 
+        self.stream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
-            self.stream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             self.stream.connect(self.__sock_path)
-        except Exception as e:
-            print(f"Failed to set up socket: {e}")
-            sys.exit(1)
+        except Exception:
+            self.stream.close()
+            raise
 
         self.__ok = True
-        
-        # Rust MUST provide the worker name. If missing, notify Rust immediately
-        # so it can send a META request with the worker name.
-        if not self.name:
-            self.send(
-                "ERROR",
-                message="Worker name not provided. Rust must pass worker name as argument or send META request.",
-                headers={"X-Error-Level": "warning"},
-            )
-        
-        self.send("READY", message="Worker is ready to receive requests")
+        self._send_operation("ready", {})
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # HEADERS
-    # ══════════════════════════════════════════════════════════════════════════
-
-    def _build_headers(self, extra: Optional[HeadersDict] = None) -> HeadersDict:
-        """Build headers dict with worker identification.
-
-        All outbound messages include:
-            - X-Worker-Id: Worker's name/identifier
-            - X-Socket-Path: Path to the Unix socket
-            - Content-Type: application/json
-        """
-        headers: HeadersDict = {
-            Headers.CONTENT_TYPE: "application/json",
-            Headers.X_SOCKET_PATH: self.__sock_path,
-        }
-        if self.name:
-            headers[Headers.X_WORKER_ID] = self.name
-        if extra:
-            headers.update(extra)
-        return headers
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # MESSAGING
-    # ══════════════════════════════════════════════════════════════════════════
-
-    def __send_message(self, data: bytes):
-        """Send a length-prefixed message."""
+    def _send_bytes(self, payload: bytes) -> None:
         try:
-            size = struct.pack("<Q", len(data))
-            self.stream.sendall(size + data)
-        except Exception as e:
-            print(f"Failed to send message: {e}")
+            self.stream.sendall(struct.pack("<Q", len(payload)) + payload)
+        except Exception:
             self.__ok = False
+            raise
 
-    def __recv_message(self) -> Optional[Message]:
-        """Receive a length-prefixed message."""
-        try:
-            size_data = self.stream.recv(8)
-            if not size_data:
-                return None
+    def _send_envelope(self, envelope: Envelope) -> None:
+        meta = dict(envelope["meta"])
+        meta["x_wid"] = self.name
+        meta["x_spath"] = self.__sock_path
+        stamped: Envelope = {"meta": meta, "data": dict(envelope["data"])}
+        self._send_bytes(json.dumps(stamped, separators=(",", ":")).encode("utf-8"))
 
-            size = struct.unpack("<Q", size_data)[0]
-
-            data = b""
-            while len(data) < size:
-                chunk = self.stream.recv(size - len(data))
-                if not chunk:
-                    raise ConnectionError("Connection closed unexpectedly")
-                data += chunk
-
-            return json.loads(data.decode())
-        except Exception as e:
-            print(f"Error receiving message: {e}")
-            return None
-
-    def send(
+    def _send_operation(
         self,
-        method: Method,
+        operation: str,
+        data: Data,
         *,
-        message: Optional[str] = None,
-        body: Optional[Dict[str, Any]] = None,
-        headers: Optional[HeadersDict] = None,
-    ):
-        """Send a typed message back to Rust's Control Plane.
+        meta: Optional[Meta] = None,
+    ) -> None:
+        envelope = create_envelope(data, meta)
+        envelope["meta"]["x_op"] = operation
+        self._send_envelope(envelope)
 
-        Args:
-            method: The HTTP-like method (READY, DONE, ERROR, LOG, etc.)
-            message: Optional message string (added to body)
-            body: Optional body dict (merged with message if provided)
-            headers: Optional extra headers (merged with default worker headers)
-        """
-        try:
-            if not method:
-                raise ValueError("Method is required")
+    def send(self, data: Data, *, meta: Optional[Meta] = None) -> None:
+        """Send an application-defined envelope to the Rust manager."""
 
-            # Build the body
-            msg_body: Dict[str, Any] = body.copy() if body else {}
-            if message is not None:
-                msg_body["message"] = message
+        self._send_envelope(create_envelope(data, meta))
 
-            # Build headers with worker identification
-            msg_headers = self._build_headers(headers)
+    def log(
+        self,
+        data: Data,
+        *,
+        level: str = "info",
+        meta: Optional[Meta] = None,
+    ) -> None:
+        """Send a structured Runpy log envelope."""
 
-            # Create the HTTP-like message
-            payload = create_message(
-                method=method.upper(),
-                headers=msg_headers,
-                body=msg_body if msg_body else None,
-            )
+        log_meta = dict(meta or {})
+        log_meta["level"] = level
+        self._send_operation("log", data, meta=log_meta)
 
-            self.__send_message(json.dumps(payload).encode())
-        except Exception as e:
-            print(f"Failed to notify Rust: {e}")
-            self.__ok = False
-            sys.exit(1)
+    def handle_envelope(self, envelope: Envelope) -> None:
+        """Handle an application-defined envelope."""
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # OVERRIDABLE HOOKS
-    # ══════════════════════════════════════════════════════════════════════════
+    def execute(self, data: ExecutePayload) -> ExecuteResult:
+        """Run the worker's managed business logic."""
 
-    def handle_request(self, request_data: RequestData) -> HandleRequestResult:
-        """Handle incoming requests from Rust.
-
-        Override this method in your worker subclass to implement custom
-        message routing for types that are **not** handled internally
-        (EXECUTE, TERMINATE, META, RETRY).
-
-        The default implementation is a no-op so that subclasses are not
-        forced to override it.
-        """
-        pass
-
-    def execute(self, payload: ExecutePayload) -> ExecuteResult:
-        """Main business logic.
-
-        Called when an EXECUTE message is received. Override this in your
-        subclass and return a dict with the result. The result is sent
-        back to Rust as a DONE message.
-        """
         return None
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # INTERNAL REQUEST HANDLING
-    # ══════════════════════════════════════════════════════════════════════════
+    @staticmethod
+    def _recv_exact(
+        stream: socket.socket,
+        size: int,
+        *,
+        allow_clean_close: bool = False,
+    ) -> Optional[bytes]:
+        chunks = bytearray()
+        while len(chunks) < size:
+            chunk = stream.recv(size - len(chunks))
+            if not chunk:
+                if allow_clean_close and not chunks:
+                    return None
+                raise ConnectionError("Connection closed during a frame")
+            chunks.extend(chunk)
+        return bytes(chunks)
 
-    # Methods handled internally — custom `handle_request` will NOT be called for these.
-    _INTERNAL_METHODS = frozenset({"TERMINATE", "META", "EXECUTE", "RETRY"})
+    def _recv_envelope(self) -> Optional[Envelope]:
+        size_data = self._recv_exact(self.stream, 8, allow_clean_close=True)
+        if size_data is None:
+            return None
 
-    def __handle_request(self, request_data: Message):
-        """Internal dispatcher for protocol-level messages."""
+        size = struct.unpack("<Q", size_data)[0]
+        payload = self._recv_exact(self.stream, size)
+        if payload is None:
+            raise ConnectionError("Connection closed before envelope payload")
+
         try:
-            method = request_data.get("method")
-            body = request_data.get("body", {})
-            headers = request_data.get("headers", {})
+            decoded = json.loads(payload.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ValueError(f"Invalid JSON envelope: {error}") from error
 
-            if method is None:
-                self.send("LOG", message="Received request with no method", body={"request": request_data}, headers={"X-Log-Level": "debug"})
-                return
+        return self._validate_inbound(decoded)
 
-            if method == "TERMINATE":
-                self.stream.close()
-                sys.exit(0)
+    @staticmethod
+    def _validate_inbound(value: object) -> Envelope:
+        if not isinstance(value, dict) or set(value) != {"meta", "data"}:
+            raise ValueError("Envelope must contain exactly 'meta' and 'data'")
 
-            if method == "META":
-                # Extract worker name from body if provided
-                if body.get("name"):
-                    self.name = body["name"]
-                self.send("LOG", message="Received META data", body=body, headers={"X-Log-Level": "debug"})
-                return
+        meta = value["meta"]
+        data = value["data"]
+        if not isinstance(meta, dict) or not isinstance(data, dict):
+            raise ValueError("Envelope 'meta' and 'data' must be objects")
 
-            if method == "EXECUTE":
-                self.__exec_payload = body
-                self.send("LOG", message="Received EXECUTE request", body={"payload": self.__exec_payload}, headers={"X-Log-Level": "debug"})
-                try:
-                    result = self.execute(self.__exec_payload)
-                    if result is not None:
-                        self.send("DONE", message="Execution completed", body={"data": result})
-                    else:
-                        self.send("DONE", message="Execution completed with no result", body={})
-                except Exception as e:
-                    self.send("ERROR", message=f"Execution error: {e}")
-                return
+        for key, item in meta.items():
+            if not key.startswith("x_"):
+                continue
+            if key not in _RESERVED_KEYS:
+                raise ValueError(f"Unknown Runpy metadata key '{key}'")
+            if not isinstance(item, str):
+                raise ValueError(f"Runpy metadata '{key}' must be a string")
 
-            if method == "RETRY":
-                self.__cycles += 1
-                self.send(
-                    "LOG",
-                    message=f"Received RETRY request, re-executing (cycle: {self.__cycles})",
-                    body={},
-                    headers={"X-Log-Level": "debug"},
+        operation = meta.get("x_op")
+        if operation is not None:
+            if operation not in _RUNPY_OPERATIONS:
+                raise ValueError(f"Unknown Runpy operation '{operation}'")
+            if operation not in _MANAGER_OPERATIONS:
+                raise ValueError(
+                    f"Runpy operation '{operation}' is invalid for manager-to-worker envelopes"
                 )
-                try:
-                    result = self.execute(self.__exec_payload)
-                    if result is not None:
-                        self.send(
-                            "DONE",
-                            message=f"Execution completed on retry({self.__cycles})",
-                            body={"data": result},
-                        )
-                    else:
-                        self.send(
-                            "DONE",
-                            message=f"Execution completed on retry({self.__cycles}) with no result",
-                            body={},
-                        )
-                except Exception as e:
-                    self.send("ERROR", message=f"Execution error on retry: {e}")
-                return
 
-            # Not an internal method — fall through to user handler
-            self.send("LOG", message="Received unrecognized method", body={"request": request_data}, headers={"X-Log-Level": "debug"})
+        return {"meta": dict(meta), "data": dict(data)}
 
-        except Exception as e:
-            self.send("ERROR", message=f"Error handling request: {e}")
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # MAIN LOOP
-    # ══════════════════════════════════════════════════════════════════════════
-
-    def run(self):
-        """Public entry point — call this to start the worker loop."""
-        if not self.__ok:
-            print("Worker initialization failed, cannot start")
+    def _complete_execution(self, *, retry: bool = False) -> None:
+        if self.__exec_payload is None:
+            self._send_operation(
+                "error", {"message": "Retry requested before an execute operation"}
+            )
             return
-        self.__run()
 
-    def __run(self):
-        print(f"Worker listening on {self.__sock_path}")
+        try:
+            result = self.execute(self.__exec_payload)
+            if result is not None and not isinstance(result, dict):
+                self._send_operation(
+                    "error",
+                    {"message": "Worker.execute must return a dictionary or None"},
+                )
+                return
+            self._send_operation("done", result or {})
+        except Exception as error:
+            prefix = "Retry execution error" if retry else "Execution error"
+            self._send_operation("error", {"message": f"{prefix}: {error}"})
+
+    def _dispatch(self, envelope: Envelope) -> None:
+        operation = envelope["meta"].get("x_op")
+        if operation == "terminate":
+            self.__ok = False
+            self.stream.close()
+            return
+
+        if operation == "execute":
+            self.__exec_payload = envelope["data"]
+            self._complete_execution()
+            return
+
+        if operation == "retry":
+            self.__cycles += 1
+            self._complete_execution(retry=True)
+            return
+
+        try:
+            self.handle_envelope(envelope)
+        except Exception as error:
+            self._send_operation(
+                "error", {"message": f"Envelope handler error: {error}"}
+            )
+
+    def run(self) -> None:
+        """Receive and dispatch envelopes until the connection closes."""
 
         while self.__ok:
             try:
-                request = self.__recv_message()
-                if not request:
-                    continue
-
-                # Internal dispatch (EXECUTE, TERMINATE, META, RETRY)
-                self.__handle_request(request)
-
-                # User-defined handler — only for non-internal methods
-                if request.get("method") not in self._INTERNAL_METHODS:
-                    self.handle_request(request)
-
-            except Exception as e:
-                print(f"Error handling request: {e}")
-                self.send("ERROR", message=str(e))
+                envelope = self._recv_envelope()
+                if envelope is None:
+                    self.__ok = False
+                    self.stream.close()
+                    break
+                self._dispatch(envelope)
+            except Exception as error:
+                print(f"Protocol violation: {error}")
                 self.__ok = False
-                sys.exit(1)
+                self.stream.close()
+                break
