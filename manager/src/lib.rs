@@ -40,7 +40,8 @@
 //! `uv` selects or downloads a compatible Python and maintains an isolated,
 //! cached environment. Runpy does not create a project `.venv` or run
 //! `uv sync`. An adjacent `<script>.py.lock`, created explicitly with
-//! `uv lock --script <script>.py`, is optional and reused when present.
+//! `uv lock --script <script>.py`, is optional. When present, Runpy passes
+//! `--locked`, so stale locks fail instead of being modified at launch.
 //!
 //! ## Quick start
 //!

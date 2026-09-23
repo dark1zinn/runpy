@@ -197,9 +197,11 @@ An adjacent lockfile is optional:
 uv lock --script worker/my_script.py
 ```
 
-Commit `<worker>.py.lock` for reproducible deployments. For dependency
-resolution bounded by publication time, add an RFC 3339 cutoff to the inline
-metadata:
+Commit `<worker>.py.lock` for reproducible deployments. When it exists,
+Runpy passes `--locked`, so a stale lock fails the worker launch instead of
+being modified. Scripts without a lock continue to resolve normally. For
+dependency resolution bounded by publication time, add an RFC 3339 cutoff to
+the inline metadata:
 
 ```python
 # [tool.uv]

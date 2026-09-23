@@ -51,8 +51,10 @@ connects the worker and stamps both values into Runpy-reserved metadata.
 The Rust manager starts this file with `uv run --no-project --script`.
 `uv` selects or downloads a Python satisfying `requires-python`, resolves the
 inline dependencies into an isolated cached environment, and reuses
-`my_worker.py.lock` when present. Runpy does not create a project `.venv`, run
-`uv sync`, mutate locks, or inject the SDK.
+`my_worker.py.lock` when present. Runpy passes `--locked` for an adjacent lock,
+so stale locks fail instead of changing during launch; scripts without locks
+still resolve normally. Runpy does not create a project `.venv`, run `uv sync`,
+mutate locks, or inject the SDK.
 
 Use `Manager::new("path/to/scripts")` when `uv` is on `PATH`, or
 `Manager::with_uv_path("path/to/scripts", "/packaged/path/to/uv")` for an

@@ -167,16 +167,35 @@ impl Worker {
     pub async fn spawn(&mut self) -> Result<String, String> {
         self.integrity.perform_check()?;
 
-        let script_file = self
-            .integrity
-            .scripts_dir
-            .join(format!("{}.py", self.script));
+        let scripts_dir = self.integrity.scripts_dir.canonicalize().map_err(|error| {
+            format!(
+                "Failed to resolve scripts directory '{}': {}",
+                self.integrity.scripts_dir.display(),
+                error
+            )
+        })?;
+        let script_file = scripts_dir.join(format!("{}.py", self.script));
         if !script_file.is_file() {
             return Err(format!(
                 "Worker script does not exist: '{}'",
                 script_file.display()
             ));
         }
+
+        let uv_path = if self.integrity.uv_path.is_absolute()
+            || self.integrity.uv_path.components().count() == 1
+        {
+            self.integrity.uv_path.clone()
+        } else {
+            self.integrity.uv_path.canonicalize().map_err(|error| {
+                format!(
+                    "Failed to resolve uv executable '{}': {}",
+                    self.integrity.uv_path.display(),
+                    error
+                )
+            })?
+        };
+        let lock_file = script_file.with_extension("py.lock");
 
         let identity = WorkerIdentity::new(&self.script);
         let sock_path = self.socket_dir.join(&identity.sock_file);
@@ -217,10 +236,12 @@ impl Worker {
         );
         let sender = plane.start();
 
-        let mut cmd = std::process::Command::new(&self.integrity.uv_path);
-        cmd.arg("run")
-            .arg("--no-project")
-            .arg("--script")
+        let mut cmd = std::process::Command::new(&uv_path);
+        cmd.arg("run").arg("--no-project");
+        if lock_file.is_file() {
+            cmd.arg("--locked");
+        }
+        cmd.arg("--script")
             .arg(&script_file)
             .arg(&sock_path)
             .arg(&identity.name);
@@ -235,7 +256,7 @@ impl Worker {
         // importable via `from bridge.worker import ...`.
         // Python sets sys.path[0] to the script's own directory, so we must
         // also inject the parent into PYTHONPATH.
-        if let Some(parent) = self.integrity.scripts_dir.parent() {
+        if let Some(parent) = scripts_dir.parent() {
             cmd.current_dir(parent);
             cmd.env("PYTHONPATH", parent);
         }

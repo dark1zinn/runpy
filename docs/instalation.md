@@ -81,8 +81,9 @@ uv lock --script worker/my_worker.py
 ```
 
 This creates `worker/my_worker.py.lock`. Commit it for reproducible
-deployments. Runpy does not require or modify this file; `uv run --script`
-reuses it when present and resolves from inline metadata when absent.
+deployments. When the adjacent lock exists, Runpy passes `--locked`; stale
+locks fail the launch instead of being modified. Without a lock, uv resolves
+from inline metadata normally. Runpy never creates or updates the lock.
 
 To exclude packages published after a chosen deployment cutoff, add uv's
 RFC 3339 `exclude-newer` setting to the inline metadata:

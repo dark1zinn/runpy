@@ -180,6 +180,7 @@ wait "$descendant"
         .map(str::to_owned)
         .collect();
     assert_eq!(&arguments[0..3], ["run", "--no-project", "--script"]);
+    assert!(!arguments.iter().any(|argument| argument == "--locked"));
     assert_eq!(arguments[3], scripts.join("managed.py").to_str().unwrap());
     assert!(arguments[4].starts_with("/tmp/runpy/rp_managed_"));
     assert_eq!(arguments[5], worker_id);
@@ -196,6 +197,60 @@ wait "$descendant"
     worker.terminate().await.unwrap();
     wait_for_process_exit(uv_pid).await;
     wait_for_process_exit(descendant_pid).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn relative_runtime_paths_are_absolutized_and_adjacent_lock_is_enforced() {
+    let current_dir = std::env::current_dir().unwrap();
+    let tmp = tempfile::Builder::new()
+        .prefix(".runpy-relative-")
+        .tempdir_in(&current_dir)
+        .unwrap();
+    let args_file = tmp.path().join("args");
+    let uv = write_executable(
+        &tmp,
+        "uv",
+        r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+    echo "uv 0.11.2"
+    exit 0
+fi
+printf '%s\n' "$@" > "$RUNPY_TEST_ARGS"
+"#,
+    );
+    let scripts = scripts_dir(&tmp, &["managed"]);
+    fs::write(scripts.join("managed.py.lock"), "locked").unwrap();
+
+    let relative_uv = uv.strip_prefix(&current_dir).unwrap();
+    let relative_scripts = scripts.strip_prefix(&current_dir).unwrap();
+    let manager = manager_with_uv(relative_scripts, relative_uv);
+    let mut worker = manager.worker("managed");
+    worker.env("RUNPY_TEST_ARGS", args_file.to_str().unwrap());
+
+    let worker_id = worker.spawn().await.unwrap();
+    wait_for_file(&args_file).await;
+
+    let arguments: Vec<_> = fs::read_to_string(&args_file)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(
+        &arguments[0..4],
+        ["run", "--no-project", "--locked", "--script"]
+    );
+    assert_eq!(
+        arguments[4],
+        scripts
+            .canonicalize()
+            .unwrap()
+            .join("managed.py")
+            .to_str()
+            .unwrap()
+    );
+    assert!(arguments[5].starts_with("/tmp/runpy/rp_managed_"));
+    assert_eq!(arguments[6], worker_id);
 }
 
 #[tokio::test]
