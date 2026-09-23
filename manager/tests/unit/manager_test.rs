@@ -253,6 +253,56 @@ printf '%s\n' "$@" > "$RUNPY_TEST_ARGS"
     assert_eq!(arguments[6], worker_id);
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn watchdog_cleanup_kills_descendants_after_uv_exits() {
+    let tmp = TempDir::new().unwrap();
+    let descendant_file = tmp.path().join("descendant-pid");
+    let uv = write_executable(
+        &tmp,
+        "uv",
+        r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+    echo "uv 0.11.2"
+    exit 0
+fi
+sleep 300 &
+printf '%s' "$!" > "$RUNPY_TEST_DESCENDANT"
+exit 0
+"#,
+    );
+    let scripts = scripts_dir(&tmp, &["managed"]);
+    let manager = manager_with_uv(&scripts, &uv);
+    let mut worker = manager.worker("managed");
+    worker.env("RUNPY_TEST_DESCENDANT", descendant_file.to_str().unwrap());
+
+    let worker_id = worker.spawn().await.unwrap();
+    let socket_path = PathBuf::from(format!("/tmp/runpy/rp_{worker_id}.sock"));
+    wait_for_file(&descendant_file).await;
+    let descendant_pid: u32 = fs::read_to_string(&descendant_file)
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(process_exists(descendant_pid));
+    assert!(socket_path.exists());
+
+    worker.dog.start_monitoring(1);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let worker_removed = manager.dog.report_worker(&worker_id).await.is_none();
+        if worker_removed && !process_exists(descendant_pid) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "watchdog did not remove worker and stop descendant process"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    assert!(!socket_path.exists());
+}
+
 #[tokio::test]
 async fn manager_drop_does_not_panic_without_workers() {
     let tmp = TempDir::new().unwrap();
