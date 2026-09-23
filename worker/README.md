@@ -2,18 +2,31 @@
 
 Python worker SDK for [Runpy](https://github.com/dark1zinn/runpy) — write Python workers that are spawned and managed by the Rust-side `Manager`.
 
-## Installation
+## Managed script setup
 
-`uv` is required. Until `runpyrs` is published, install it from the repository
-subdirectory:
+`uv` is required by the Rust manager in development and production. Initialize
+each worker as a PEP 723 script and declare `runpyrs` in that script:
 
 ```bash
-uv add "git+https://github.com/dark1zinn/runpy#subdirectory=worker"
+uv init --script my_worker.py --python 3.10
+uv add --script my_worker.py \
+  "runpyrs @ git+https://github.com/dark1zinn/runpy#subdirectory=worker"
+uv lock --script my_worker.py
 ```
+
+The lockfile is optional at runtime but should be committed for reproducible
+deployments.
 
 ## Quick Start
 
 ```python
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#   "runpyrs @ git+https://github.com/dark1zinn/runpy#subdirectory=worker",
+# ]
+# ///
+
 from runpyrs import Envelope, Worker, RunScript
 
 
@@ -34,6 +47,24 @@ if __name__ == "__main__":
 
 The Rust manager supplies the Unix socket path and worker ID. `RunScript`
 connects the worker and stamps both values into Runpy-reserved metadata.
+
+The Rust manager starts this file with `uv run --no-project --script`.
+`uv` selects or downloads a Python satisfying `requires-python`, resolves the
+inline dependencies into an isolated cached environment, and reuses
+`my_worker.py.lock` when present. Runpy does not create a project `.venv`, run
+`uv sync`, mutate locks, or inject the SDK.
+
+Use `Manager::new("path/to/scripts")` when `uv` is on `PATH`, or
+`Manager::with_uv_path("path/to/scripts", "/packaged/path/to/uv")` for an
+explicit executable.
+
+For an additional reproducibility boundary, PEP 723 metadata accepts uv's
+RFC 3339 upload cutoff:
+
+```python
+# [tool.uv]
+# exclude-newer = "2025-01-01T00:00:00Z"
+```
 
 ## Envelope
 
