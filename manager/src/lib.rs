@@ -1,75 +1,56 @@
 //! # Runpy — Rust-Python Worker Manager
 //!
-//! A lightweight, async-first framework for spawning and managing Python worker
-//! processes from Rust applications. Communication happens over Unix sockets using
-//! a simple HTTP-like JSON protocol.
+//! Runpy spawns and manages Python worker processes and exchanges bare JSON
+//! envelopes over length-prefixed Unix socket connections.
 //!
-//! ## Features
+//! ## Envelope
 //!
-//! - **Worker Management**: Spawn, monitor, and terminate Python workers
-//! - **HTTP-like Protocol**: Clean JSON messages with methods, headers, and body
-//! - **Watchdog Service**: Automatic health monitoring and dead worker cleanup
-//! - **Structured Logging**: Environment-aware logging via [`Scribbler`]
-//! - **Bidirectional Communication**: Send commands and receive responses
-//!
-//! ## Quick Start
-//!
-//! ```ignore
-//! use runpy::{Manager, Message, Method};
-//!
-//! #[tokio::main]
-//! async fn main() {
-//!     // Create manager with paths to Python venv and scripts
-//!     let mut manager = Manager::new("./venv", "./scripts");
-//!
-//!     // Register a global message handler
-//!     manager.on_message(|envelope| {
-//!         println!("Received: {:?}", envelope.message);
-//!     });
-//!
-//!     // Spawn a worker
-//!     let mut worker = manager.worker("my_script");
-//!     worker.env("API_KEY", "secret");
-//!     worker.spawn().await.unwrap();
-//!
-//!     // Send a message
-//!     worker.send_message(Message::execute(
-//!         serde_json::json!({ "task": "process" })
-//!     )).await.unwrap();
-//! }
-//! ```
-//!
-//! ## Environment Variables
-//!
-//! The [`Scribbler`] logger respects these environment variables:
-//!
-//! | Variable      | Values                                         | Description                     |
-//! |---------------|------------------------------------------------|---------------------------------|
-//! | `ENVIRONMENT` | `development`, `dev`                           | Enables maximum log verbosity   |
-//! | `LOG`         | `0`-`5`, `off`, `error`, `warning`, `info`, `debug`, `verbose` | Sets log level |
-//! | `NO_COLOR`    | (any value)                                    | Disables ANSI color output      |
-//!
-//! ## Protocol
-//!
-//! Messages follow an HTTP-like structure:
+//! Every payload contains exactly two JSON objects:
 //!
 //! ```json
 //! {
-//!   "method": "EXECUTE",
-//!   "headers": {
-//!     "X-Worker-Id": "my_script_29032026_abc1",
-//!     "Content-Type": "application/json"
+//!   "meta": {
+//!     "x_wid": "worker-id",
+//!     "x_spath": "/tmp/runpy/rp_worker.sock",
+//!     "correlation_id": 42
 //!   },
-//!   "body": { "task": "process", "data": [1, 2, 3] }
+//!   "data": { "task": "process" }
 //! }
 //! ```
 //!
-//! Available methods: `GET`, `POST`, `PUT`, `DELETE`, `EXECUTE`, `RETRY`,
-//! `TERMINATE`, `META`, `READY`, `STATUS`, `LOG`, `DONE`, `ERROR`, `ACTION`.
+//! Applications own the schema and type safety of `data` and non-`x_`
+//! metadata. Runpy reserves every `x_` key for worker identity, socket
+//! identity, and lifecycle routing.
+//!
+//! ## Quick start
+//!
+//! ```ignore
+//! use runpy::{Data, Envelope, Manager};
+//! use serde_json::json;
+//!
+//! fn object(value: serde_json::Value) -> Data {
+//!     value.as_object().cloned().expect("JSON object")
+//! }
+//!
+//! #[tokio::main]
+//! async fn main() {
+//!     let mut manager = Manager::new("./venv", "./scripts");
+//!     manager.on_message(|inbound| {
+//!         println!("Received: {:?}", inbound.envelope);
+//!     });
+//!
+//!     let mut worker = manager.worker("my_script");
+//!     worker.spawn().await.unwrap();
+//!     worker
+//!         .send_message(Envelope::execute(object(json!({"task": "process"}))))
+//!         .await
+//!         .unwrap();
+//! }
+//! ```
 
 mod integrity;
-mod protocol;
 mod manager;
+mod protocol;
 pub mod scribbler;
 mod watchdog;
 
@@ -80,17 +61,16 @@ use tokio::sync::RwLock;
 
 use crate::integrity::IntegrityChecker;
 use crate::manager::WorkerHandle;
-use crate::protocol::{Envelope, MessageHandler};
 use crate::watchdog::WatchdogService;
 
 // ── Public re-exports ──────────────────────────────────────────────────
-pub use protocol::{
-    headers, ControlPlane, Envelope as MessageEnvelope, Headers, Mailer, Message, MessageSender,
-    Method,
-};
 pub use manager::{Worker, WorkerIdentity};
-pub use watchdog::{WatchdogService as Watchdog, WorkerReport, ProcessState};
-pub use scribbler::{scribbler, Scribbler, LogLevel};
+pub use protocol::{
+    ControlPlane, Data, Envelope, EnvelopeError, InboundEnvelope, Mailer, MessageHandler,
+    MessageSender, Meta,
+};
+pub use scribbler::{LogLevel, Scribbler, scribbler};
+pub use watchdog::{ProcessState, WatchdogService as Watchdog, WorkerReport};
 
 // ── Manager ────────────────────────────────────────────────────────────
 
@@ -163,7 +143,7 @@ impl Manager {
     /// every worker, *before* worker-specific handlers.
     pub fn on_message<F>(&mut self, handler: F)
     where
-        F: Fn(Envelope) + Send + Sync + 'static,
+        F: Fn(InboundEnvelope) + Send + Sync + 'static,
     {
         self.global_handler = Some(Arc::new(handler));
     }
@@ -173,14 +153,14 @@ impl Manager {
         self.integrity.perform_check()
     }
 
-    /// Broadcast a message to all active workers.
+    /// Broadcast an envelope to all active workers.
     /// Returns a map of worker_id -> Result indicating success or failure for each.
-    pub async fn broadcast(&self, msg: Message) -> HashMap<String, Result<(), String>> {
+    pub async fn broadcast(&self, envelope: Envelope) -> HashMap<String, Result<(), String>> {
         let workers = self.workers.read().await;
         let mut results = HashMap::new();
 
         for (worker_id, handle) in workers.iter() {
-            let result = handle.sender.send(msg.clone()).await;
+            let result = handle.sender.send(envelope.clone()).await;
             results.insert(worker_id.clone(), result);
         }
 
@@ -188,10 +168,9 @@ impl Manager {
     }
 
     /// Terminate all active workers gracefully.
-    /// Sends TERMINATE to all workers, waits briefly, then force-kills any remaining.
+    /// Sends a reserved termination envelope, waits briefly, then force-kills survivors.
     pub async fn terminate_all(&mut self) {
-        // First, send TERMINATE to all
-        let _ = self.broadcast(Message::terminate()).await;
+        let _ = self.broadcast(Envelope::terminate()).await;
 
         // Give workers time to shut down cleanly
         tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
@@ -201,7 +180,10 @@ impl Manager {
         for (id, mut handle) in workers.drain() {
             let _ = handle.child.kill();
             let _ = std::fs::remove_file(&handle.sock_path);
-            scribbler::scribbler().info_with("Manager", &format!("Terminated worker: {} ({})", handle.identity.name, id));
+            scribbler::scribbler().info_with(
+                "Manager",
+                &format!("Terminated worker: {} ({})", handle.identity.name, id),
+            );
         }
     }
 }
@@ -217,11 +199,15 @@ impl Drop for Manager {
                 for (id, mut handle) in workers.drain() {
                     let _ = handle.child.kill();
                     let _ = std::fs::remove_file(&handle.sock_path);
-                    scribbler::scribbler().info_with("Manager", &format!("Terminated worker: {} ({})", handle.identity.name, id));
+                    scribbler::scribbler().info_with(
+                        "Manager",
+                        &format!("Terminated worker: {} ({})", handle.identity.name, id),
+                    );
                 }
             }
             Err(_) => {
-                scribbler::scribbler().warning_with("Manager", "Could not acquire worker lock during shutdown");
+                scribbler::scribbler()
+                    .warning_with("Manager", "Could not acquire worker lock during shutdown");
             }
         }
 

@@ -1,120 +1,109 @@
-use runpy::{scribbler, Manager, Message, Method};
+use runpy::{scribbler, Data, Envelope, Manager, Meta};
+use serde_json::{json, Value};
 
-/// Scribbler instance for structured logging
 fn log() -> &'static runpy::Scribbler {
     scribbler()
 }
 
+fn object(value: Value) -> Data {
+    value
+        .as_object()
+        .cloned()
+        .expect("example payloads must be JSON objects")
+}
 
-///! Note that this "example" is actually to thinker and test the Runpy functionality during development !
-/// 
-///! It's not meant to be a polished demo of best practices for using the library — just a quick way to iterate on features and test them out in a real Rust app with Python workers.
 #[tokio::main]
 async fn main() {
-    // Resolve paths relative to the Cargo manifest directory
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let venv_path = format!("{}/../../.venv", manifest_dir);
     let scripts_path = format!("{}/worker/src/scripts", manifest_dir);
 
-    // ── 1. Create the Manager ─────────────────────────────────────
-
     let mut manager = Manager::new(&venv_path, &scripts_path);
     log().success("Manager initialized");
 
-    // ── 2. (Optional) Global message handler ──────────────────────
-
-    manager.on_message(|envelope| {
+    manager.on_message(|inbound| {
+        let worker_id = inbound
+            .envelope
+            .meta()
+            .get("x_wid")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
         log().verbose_with(
             "Global",
-            &format!("Worker '{}' → {:?}", envelope.worker_id, envelope.message),
+            &format!("Worker '{worker_id}' -> {:?}", inbound.envelope),
         );
     });
 
-    // ── 3. Create, configure, and spawn a worker ──────────────────
-
     let mut worker = manager.worker("my_script");
-
-    // Set environment variables for the Python process
     worker.env("MY_ENV_VAR", "some_value");
 
-    // Per-worker message handler using the new HTTP-like protocol
-    worker.on_message(|envelope| {
-        let msg = &envelope.message;
-        let body = msg.body.as_ref();
-        
-        match msg.method {
-            Method::Ready => {
-                let message = body
-                    .and_then(|b| b.get("message"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("(no message)");
-                log().info_with("Ready", message);
-                
-                // Send EXECUTE with payload
-                envelope.mailer.send(Message::execute(
-                    serde_json::json!({ "name": "RunPy" })
-                ));
-            }
-            Method::Log => {
-                let message = body
-                    .and_then(|b| b.get("message"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("(no message)");
-                let level = msg.get_header("X-Log-Level").unwrap_or("info");
-                match level {
-                    "debug" => log().debug_with("Worker", message),
-                    "warning" | "warn" => log().warning_with("Worker", message),
-                    "error" => log().error_with("Worker", message),
-                    _ => log().info_with("Worker", message),
-                }
-            }
-            Method::Done => {
-                let message = body
-                    .and_then(|b| b.get("message"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("(no message)");
-                let data = body
-                    .and_then(|b| b.get("data"))
-                    .cloned()
-                    .unwrap_or(serde_json::json!({}));
-                log().success(&format!("{} → {}", message, data));
-            }
-            Method::Error => {
-                let message = body
-                    .and_then(|b| b.get("message"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("(no message)");
-                let stack_trace = msg.get_header("X-Stack-Trace");
-                let error_level = msg.get_header("X-Error-Level").unwrap_or("unknown");
-                log().error_with(
-                    "Worker",
-                    &format!("[{}] {} ({:?})", error_level, message, stack_trace),
+    worker.on_message(|inbound| {
+        let operation = inbound.envelope.meta().get("x_op").and_then(Value::as_str);
+
+        match operation {
+            Some("ready") => {
+                log().info_with("Worker", "ready");
+                inbound
+                    .mailer
+                    .send(Envelope::execute(object(json!({"name": "RunPy"}))));
+
+                let mut meta = Meta::new();
+                meta.insert("some_custom_meta".into(), json!(42));
+                inbound.mailer.send(
+                    Envelope::new(meta, object(json!({"event": "custom manager message"})))
+                        .expect("custom metadata must not use x_ keys"),
                 );
             }
-            _ => log().debug_with("Worker", &format!("{:?}", msg)),
+            Some("log") => {
+                let level = inbound
+                    .envelope
+                    .meta()
+                    .get("level")
+                    .and_then(Value::as_str)
+                    .unwrap_or("info");
+                log().info_with(level, &format!("{:?}", inbound.envelope.data()));
+            }
+            Some("done") => {
+                log().success(&format!("Done: {:?}", inbound.envelope.data()));
+            }
+            Some("error") => {
+                log().error_with("Worker", &format!("{:?}", inbound.envelope.data()));
+            }
+            None => {
+                log().info_with(
+                    "Custom",
+                    &format!(
+                        "meta={:?} data={:?}",
+                        inbound.envelope.meta(),
+                        inbound.envelope.data()
+                    ),
+                );
+            }
+            Some(other) => {
+                log().warning_with("Worker", &format!("Unexpected operation: {other}"));
+            }
         }
     });
 
     match worker.spawn().await {
-        Ok(id) => log().success(&format!("Worker spawned: {}", id)),
-        Err(e) => {
-            log().error(&format!("Failed to spawn worker: {}", e));
+        Ok(id) => log().success(&format!("Worker spawned: {id}")),
+        Err(error) => {
+            log().error(&format!("Failed to spawn worker: {error}"));
             return;
         }
     }
 
-    // ── 4. Let it run, then shut down ────────────────────────────
-    // TODO: make so main process only exits when all workers are done or explicitly signaled/terminated, instead of just sleeping for a bit
     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
 
-    // Check health via watchdog
-    let reports = manager.dog.report().await;
-    log().separator();
-    log().info("Watchdog Report:");
-    for r in &reports {
-        log().info_with("Health", &format!("[{:?}] {} (pid {})", r.state, r.worker_name, r.pid));
+    for report in manager.dog.report().await {
+        log().info_with(
+            "Health",
+            &format!(
+                "[{:?}] {} (pid {})",
+                report.state, report.worker_name, report.pid
+            ),
+        );
     }
 
     log().info("Shutting down...");
-    // Manager's Drop automatically kills workers and cleans sockets.
 }
