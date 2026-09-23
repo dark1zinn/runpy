@@ -4,7 +4,7 @@ version = "0.1.0"
 
 [tool.uv.workspace]
 # This tells uv to look into these folders for sub-projects
-members = ["worker", "examples/*/worker"]
+members = ["worker"]
 
 [dependency-groups]
 dev = [
