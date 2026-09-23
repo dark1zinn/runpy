@@ -1,12 +1,15 @@
 use chrono::Local;
 use rand::{Rng, distributions::Alphanumeric};
 use std::collections::HashMap;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Child;
 use std::sync::Arc;
 use tokio::net::UnixListener;
 use tokio::sync::RwLock;
 
+use crate::integrity::IntegrityChecker;
 use crate::protocol::{ControlPlane, Envelope, MessageHandler, MessageSender};
 use crate::scribbler::scribbler;
 use crate::watchdog::WatchdogService;
@@ -47,6 +50,28 @@ pub struct WorkerHandle {
     pub identity: WorkerIdentity,
     pub sock_path: PathBuf,
     pub sender: MessageSender,
+    pub process_group_id: u32,
+}
+
+pub(crate) fn force_stop_worker(handle: &mut WorkerHandle) {
+    #[cfg(unix)]
+    {
+        let result =
+            unsafe { libc::kill(-(handle.process_group_id as libc::pid_t), libc::SIGKILL) };
+        if result != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                let _ = handle.child.kill();
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = handle.child.kill();
+    }
+
+    let _ = handle.child.wait();
 }
 
 // ── Worker (user-facing) ───────────────────────────────────────────────
@@ -57,8 +82,7 @@ pub struct WorkerHandle {
 pub struct Worker {
     // ── Builder fields (set before spawn) ───────────────────────────
     script: String,
-    venv_path: PathBuf,
-    scripts_dir: PathBuf,
+    integrity: Arc<IntegrityChecker>,
     socket_dir: PathBuf,
     env_vars: HashMap<String, String>,
     extra_args: HashMap<String, String>,
@@ -79,16 +103,14 @@ pub struct Worker {
 impl Worker {
     pub(crate) fn new(
         script: &str,
-        venv_path: &PathBuf,
-        scripts_dir: &PathBuf,
+        integrity: Arc<IntegrityChecker>,
         socket_dir: &PathBuf,
         global_handler: Option<MessageHandler>,
         workers: Arc<RwLock<HashMap<String, WorkerHandle>>>,
     ) -> Self {
         Self {
             script: script.to_string(),
-            venv_path: venv_path.clone(),
-            scripts_dir: scripts_dir.clone(),
+            integrity,
             socket_dir: socket_dir.clone(),
             env_vars: HashMap::new(),
             extra_args: HashMap::new(),
@@ -143,6 +165,19 @@ impl Worker {
     /// Spawn the Python worker process and start its control-plane listener.
     /// Returns the unique worker ID on success.
     pub async fn spawn(&mut self) -> Result<String, String> {
+        self.integrity.perform_check()?;
+
+        let script_file = self
+            .integrity
+            .scripts_dir
+            .join(format!("{}.py", self.script));
+        if !script_file.is_file() {
+            return Err(format!(
+                "Worker script does not exist: '{}'",
+                script_file.display()
+            ));
+        }
+
         let identity = WorkerIdentity::new(&self.script);
         let sock_path = self.socket_dir.join(&identity.sock_file);
 
@@ -182,18 +217,13 @@ impl Worker {
         );
         let sender = plane.start();
 
-        // Resolve the Python executable
-        let py_executable = if cfg!(windows) {
-            self.venv_path.join("Scripts/python.exe")
-        } else {
-            self.venv_path.join("bin/python")
-        };
-
-        // Resolve the script path
-        let script_file = self.scripts_dir.join(format!("{}.py", self.script));
-
-        let mut cmd = std::process::Command::new(&py_executable);
-        cmd.arg(&script_file).arg(&sock_path).arg(&identity.name); // Pass worker name as third argument
+        let mut cmd = std::process::Command::new(&self.integrity.uv_path);
+        cmd.arg("run")
+            .arg("--no-project")
+            .arg("--script")
+            .arg(&script_file)
+            .arg(&sock_path)
+            .arg(&identity.name);
 
         // Pass extra arguments as --key=value format
         for (key, value) in &self.extra_args {
@@ -205,7 +235,7 @@ impl Worker {
         // importable via `from bridge.worker import ...`.
         // Python sets sys.path[0] to the script's own directory, so we must
         // also inject the parent into PYTHONPATH.
-        if let Some(parent) = self.scripts_dir.parent() {
+        if let Some(parent) = self.integrity.scripts_dir.parent() {
             cmd.current_dir(parent);
             cmd.env("PYTHONPATH", parent);
         }
@@ -214,9 +244,18 @@ impl Worker {
             cmd.env(k, v);
         }
 
-        let child = cmd
-            .spawn()
-            .map_err(|e| format!("Failed to start worker process: {}", e))?;
+        #[cfg(unix)]
+        cmd.process_group(0);
+
+        let child = cmd.spawn().map_err(|error| {
+            let _ = std::fs::remove_file(&sock_path);
+            format!(
+                "Failed to start worker with uv '{}': {}",
+                self.integrity.uv_path.display(),
+                error
+            )
+        })?;
+        let process_group_id = child.id();
 
         let name = identity.name.clone();
 
@@ -225,6 +264,7 @@ impl Worker {
             identity,
             sock_path: sock_path.clone(),
             sender: sender.clone(),
+            process_group_id,
         };
 
         // Store in the shared map
@@ -257,7 +297,7 @@ impl Worker {
         if let Some(ref wid) = self.worker_id {
             let mut workers = self.workers.write().await;
             if let Some(mut handle) = workers.remove(wid) {
-                let _ = handle.child.kill();
+                force_stop_worker(&mut handle);
                 let _ = std::fs::remove_file(&handle.sock_path);
             }
         }

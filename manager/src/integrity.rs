@@ -1,35 +1,30 @@
 use std::collections::HashSet;
+use std::io::ErrorKind;
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::Mutex;
 
 use crate::scribbler::scribbler;
 
 pub struct IntegrityChecker {
-    pub venv_path: PathBuf,
+    pub uv_path: PathBuf,
     pub scripts_dir: PathBuf,
     pub registry: Mutex<HashSet<String>>,
 }
 
 impl IntegrityChecker {
-    pub fn new(venv: &str, scripts: &str) -> Self {
+    pub fn new(scripts: &str, uv_path: &str) -> Self {
         Self {
-            venv_path: PathBuf::from(venv),
+            uv_path: PathBuf::from(uv_path),
             scripts_dir: PathBuf::from(scripts),
             registry: Mutex::new(HashSet::new()),
         }
     }
 
-    /// Run all integrity checks: validate the venv, ensure the socket directory
-    /// exists, and index available scripts. Returns `Err` on any failure instead
-    /// of panicking.
+    /// Run all integrity checks: validate uv, ensure the socket and scripts
+    /// directories exist, and index available scripts.
     pub fn perform_check(&self) -> Result<(), String> {
-        // Validate Venv
-        if !self.validate_venv() {
-            return Err(format!(
-                "Python executable missing in venv at '{}'",
-                self.venv_path.display()
-            ));
-        }
+        self.validate_uv()?;
 
         // Ensure socket directory exists
         let sock_dir = PathBuf::from("/tmp/runpy");
@@ -60,14 +55,24 @@ impl IntegrityChecker {
         scripts.contains(script)
     }
 
-    /// Validate that the Python venv has a valid python executable.
-    fn validate_venv(&self) -> bool {
-        let py_bin = if cfg!(windows) {
-            "Scripts/python.exe"
-        } else {
-            "bin/python"
-        };
-        self.venv_path.join(py_bin).exists()
+    fn validate_uv(&self) -> Result<(), String> {
+        match Command::new(&self.uv_path).arg("--version").status() {
+            Ok(status) if status.success() => Ok(()),
+            Ok(status) => Err(format!(
+                "uv executable at '{}' returned non-zero status: {}",
+                self.uv_path.display(),
+                status
+            )),
+            Err(error) if error.kind() == ErrorKind::NotFound => Err(format!(
+                "uv executable not found at '{}'",
+                self.uv_path.display()
+            )),
+            Err(error) => Err(format!(
+                "Failed to execute uv at '{}': {}",
+                self.uv_path.display(),
+                error
+            )),
+        }
     }
 
     /// Walk the scripts directory (recursively) and index all `.py` files by

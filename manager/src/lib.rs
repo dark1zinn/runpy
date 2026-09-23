@@ -22,6 +22,26 @@
 //! metadata. Runpy reserves every `x_` key for worker identity, socket
 //! identity, and lifecycle routing.
 //!
+//! ## uv-managed worker scripts
+//!
+//! [`Manager`] launches each worker with `uv run --no-project --script`.
+//! The worker's [PEP 723](https://packaging.python.org/en/latest/specifications/inline-script-metadata/)
+//! metadata declares its Python requirement and complete dependency set:
+//!
+//! ```python
+//! # /// script
+//! # requires-python = ">=3.10"
+//! # dependencies = [
+//! #   "runpyrs @ git+https://github.com/dark1zinn/runpy#subdirectory=worker",
+//! # ]
+//! # ///
+//! ```
+//!
+//! `uv` selects or downloads a compatible Python and maintains an isolated,
+//! cached environment. Runpy does not create a project `.venv` or run
+//! `uv sync`. An adjacent `<script>.py.lock`, created explicitly with
+//! `uv lock --script <script>.py`, is optional and reused when present.
+//!
 //! ## Quick start
 //!
 //! ```ignore
@@ -34,7 +54,7 @@
 //!
 //! #[tokio::main]
 //! async fn main() {
-//!     let mut manager = Manager::new("./venv", "./scripts");
+//!     let mut manager = Manager::new("./scripts");
 //!     manager.on_message(|inbound| {
 //!         println!("Received: {:?}", inbound.envelope);
 //!     });
@@ -60,7 +80,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::integrity::IntegrityChecker;
-use crate::manager::WorkerHandle;
+use crate::manager::{WorkerHandle, force_stop_worker};
 use crate::watchdog::WatchdogService;
 
 // ── Public re-exports ──────────────────────────────────────────────────
@@ -74,11 +94,13 @@ pub use watchdog::{ProcessState, WatchdogService as Watchdog, WorkerReport};
 
 // ── Manager ────────────────────────────────────────────────────────────
 
-/// Top-level orchestrator. Create one per application to manage all Python
-/// worker processes.
+/// Top-level orchestrator for uv-managed Python worker scripts.
+///
+/// `uv` must be available on `PATH` unless [`Manager::with_uv_path`] selects
+/// an explicit executable.
 ///
 /// ```ignore
-/// let mut manager = Manager::new("path/to/.venv", "path/to/scripts");
+/// let mut manager = Manager::new("path/to/scripts");
 /// manager.on_message(|env| { /* global handler */ });
 ///
 /// let mut worker = manager.worker("my_script");
@@ -87,7 +109,7 @@ pub use watchdog::{ProcessState, WatchdogService as Watchdog, WorkerReport};
 /// worker.spawn().await.unwrap();
 /// ```
 pub struct Manager {
-    integrity: IntegrityChecker,
+    integrity: Arc<IntegrityChecker>,
     workers: Arc<RwLock<HashMap<String, WorkerHandle>>>,
     socket_dir: PathBuf,
     global_handler: Option<MessageHandler>,
@@ -97,12 +119,21 @@ pub struct Manager {
 }
 
 impl Manager {
-    /// Create a new Manager, performing an initial integrity check.
+    /// Create a manager using `uv` from `PATH`.
     ///
-    /// * `venv_path` — path to the Python virtual environment (must contain `bin/python`).
-    /// * `scripts_path` — path to the directory holding `.py` scripts.
-    pub fn new(venv_path: &str, scripts_path: &str) -> Self {
-        let integrity = IntegrityChecker::new(venv_path, scripts_path);
+    /// `scripts_path` is the directory containing PEP 723 `.py` worker
+    /// scripts. Construction performs a non-fatal integrity check; spawning a
+    /// worker repeats it and returns any uv or scripts-directory error.
+    pub fn new(scripts_path: &str) -> Self {
+        Self::with_uv_path(scripts_path, "uv")
+    }
+
+    /// Create a manager using an explicit `uv` executable path.
+    ///
+    /// Use this when uv is packaged outside `PATH`. Runtime behavior is
+    /// otherwise identical to [`Manager::new`].
+    pub fn with_uv_path(scripts_path: &str, uv_path: &str) -> Self {
+        let integrity = Arc::new(IntegrityChecker::new(scripts_path, uv_path));
 
         // Run initial integrity check (non-fatal — logs errors)
         if let Err(e) = integrity.perform_check() {
@@ -131,8 +162,7 @@ impl Manager {
     pub fn worker(&self, script: &str) -> Worker {
         Worker::new(
             script,
-            &self.integrity.venv_path,
-            &self.integrity.scripts_dir,
+            self.integrity.clone(),
             &self.socket_dir,
             self.global_handler.clone(),
             self.workers.clone(),
@@ -148,7 +178,7 @@ impl Manager {
         self.global_handler = Some(Arc::new(handler));
     }
 
-    /// Re-run the full integrity check (venv, scripts dir, script index).
+    /// Re-run the full integrity check (uv, scripts dir, script index).
     pub fn check_integrity(&self) -> Result<(), String> {
         self.integrity.perform_check()
     }
@@ -178,7 +208,7 @@ impl Manager {
         // Force-kill any remaining
         let mut workers = self.workers.write().await;
         for (id, mut handle) in workers.drain() {
-            let _ = handle.child.kill();
+            force_stop_worker(&mut handle);
             let _ = std::fs::remove_file(&handle.sock_path);
             scribbler::scribbler().info_with(
                 "Manager",
@@ -197,7 +227,7 @@ impl Drop for Manager {
         match self.workers.try_write() {
             Ok(mut workers) => {
                 for (id, mut handle) in workers.drain() {
-                    let _ = handle.child.kill();
+                    force_stop_worker(&mut handle);
                     let _ = std::fs::remove_file(&handle.sock_path);
                     scribbler::scribbler().info_with(
                         "Manager",
@@ -211,7 +241,6 @@ impl Drop for Manager {
             }
         }
 
-        let _ = std::fs::remove_dir_all(&self.socket_dir);
-        scribbler::scribbler().success("All workers terminated. Socket directory cleaned.");
+        scribbler::scribbler().success("All workers terminated.");
     }
 }

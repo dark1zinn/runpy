@@ -28,7 +28,7 @@ fn spawn_sleeper() -> Child {
 async fn watchdog_new_creates_empty_service() {
     let _workers: Arc<RwLock<HashMap<String, ()>>> = Arc::new(RwLock::new(HashMap::new()));
     // WatchdogService is Clone — just verify we can create one via Manager
-    let manager = runpy::Manager::new("/fake/venv", "/fake/scripts");
+    let manager = runpy::Manager::with_uv_path("/fake/scripts", "/bin/true");
     // dog is exposed publicly
     let _dog = &manager.dog;
 }
@@ -37,7 +37,7 @@ async fn watchdog_new_creates_empty_service() {
 
 #[tokio::test]
 async fn report_returns_empty_vec_with_no_workers() {
-    let manager = runpy::Manager::new("/fake/venv", "/fake/scripts");
+    let manager = runpy::Manager::with_uv_path("/fake/scripts", "/bin/true");
     let reports = manager.dog.report().await;
     assert!(
         reports.is_empty(),
@@ -50,7 +50,7 @@ async fn report_returns_empty_vec_with_no_workers() {
 
 #[tokio::test]
 async fn report_worker_returns_none_for_unknown_id() {
-    let manager = runpy::Manager::new("/fake/venv", "/fake/scripts");
+    let manager = runpy::Manager::with_uv_path("/fake/scripts", "/bin/true");
     let report = manager.dog.report_worker("nonexistent_id").await;
     assert!(report.is_none());
 }
@@ -154,7 +154,7 @@ fn worker_report_serializes_with_all_none() {
 
 #[tokio::test]
 async fn watchdog_clone_shares_underlying_state() {
-    let manager = runpy::Manager::new("/fake/venv", "/fake/scripts");
+    let manager = runpy::Manager::with_uv_path("/fake/scripts", "/bin/true");
     let dog1 = manager.dog.clone();
     let dog2 = manager.dog.clone();
 
@@ -169,7 +169,7 @@ async fn watchdog_clone_shares_underlying_state() {
 
 #[tokio::test]
 async fn start_monitoring_does_not_panic_on_empty_map() {
-    let manager = runpy::Manager::new("/fake/venv", "/fake/scripts");
+    let manager = runpy::Manager::with_uv_path("/fake/scripts", "/bin/true");
     // start_monitoring is called automatically in Manager::new with 5s interval.
     // Calling it again with a different interval should not panic.
     manager.dog.start_monitoring(60);
