@@ -3,10 +3,10 @@
 /// These tests exercise the public API: Manager creation, Worker builder
 /// pattern, message sending before/after spawn, env vars, handlers, and
 /// the Manager Drop behaviour.
-use runpy::{Manager, Message, Worker, WorkerIdentity};
+use runpy::{Envelope, Manager, Worker, WorkerIdentity};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc,
+    atomic::{AtomicBool, Ordering},
 };
 
 // ─── WorkerIdentity ────────────────────────────────────────────────────
@@ -149,9 +149,7 @@ async fn send_message_before_spawn_returns_error() {
     let manager = Manager::new("/fake/venv", "/fake/scripts");
     let worker = manager.worker("test");
 
-    let result = worker
-        .send_message(Message::terminate())
-        .await;
+    let result = worker.send_message(Envelope::terminate()).await;
     assert!(result.is_err());
     assert!(result.unwrap_err().contains("not been spawned"));
 }

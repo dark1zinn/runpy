@@ -247,7 +247,10 @@ impl Scribbler {
         if self.should_log(LogLevel::Info) {
             let timestamp = Local::now().format("%H:%M:%S%.3f");
             if self.use_colors {
-                eprintln!("{DIM}{}{RESET} {BOLD}{GREEN}  ✓  {RESET} {}", timestamp, message);
+                eprintln!(
+                    "{DIM}{}{RESET} {BOLD}{GREEN}  ✓  {RESET} {}",
+                    timestamp, message
+                );
             } else {
                 eprintln!("{} [OK] {}", timestamp, message);
             }
@@ -296,7 +299,7 @@ impl Scribbler {
 // ── Convenience macros ─────────────────────────────────────────────────
 
 /// Quick access to the global scribbler for logging.
-/// 
+///
 /// Usage:
 /// ```ignore
 /// use runpy::log;

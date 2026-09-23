@@ -1,191 +1,361 @@
-"""Basic sanity checks for the runpyrs package."""
-
+import json
+import socket
+import struct
 import sys
+import tempfile
+import threading
+from typing import get_args, get_origin, get_type_hints, Union
+
 import pytest
 
-from runpyrs import Worker, RunScript
-from runpyrs.worker import Worker as WorkerDirect
-from runpyrs.runScript import RunScript as RunScriptDirect
-
-# Typing utilities
+import runpyrs
 from runpyrs import (
+    Data,
     Envelope,
     ExecutePayload,
     ExecuteResult,
-    HandleRequestResult,
-    InternalMessageType,
-    BuiltinResponseType,
-    MessageType,
-    MetaData,
-    OutboundMessage,
-    RequestData,
-    SendData,
-)
-from runpyrs.utils import (
-    Envelope as EnvelopeDirect,
-    ExecuteResult as ExecuteResultDirect,
+    Meta,
+    RunScript,
+    RunpyOperation,
+    Worker,
+    create_envelope,
 )
 
 
-# ── Package imports ─────────────────────────────────────────────────────
+def _read_exact(stream: socket.socket, size: int) -> bytes:
+    payload = bytearray()
+    while len(payload) < size:
+        chunk = stream.recv(size - len(payload))
+        if not chunk:
+            raise ConnectionError("connection closed")
+        payload.extend(chunk)
+    return bytes(payload)
 
 
-class TestPackageImports:
-    """Verify that public symbols are importable and consistent."""
-
-    def test_worker_importable(self):
-        assert Worker is not None
-
-    def test_runscript_importable(self):
-        assert RunScript is not None
-
-    def test_top_level_reexports_match_modules(self):
-        assert Worker is WorkerDirect
-        assert RunScript is RunScriptDirect
-
-    def test_all_exports(self):
-        import runpyrs
-
-        assert hasattr(runpyrs, "__all__")
-        assert "Worker" in runpyrs.__all__
-        assert "RunScript" in runpyrs.__all__
-        # Typing utilities must also be exported
-        for name in (
-            "Envelope",
-            "ExecutePayload",
-            "ExecuteResult",
-            "HandleRequestResult",
-            "InternalMessageType",
-            "BuiltinResponseType",
-            "MessageType",
-            "MetaData",
-            "OutboundMessage",
-            "RequestData",
-            "SendData",
-        ):
-            assert name in runpyrs.__all__, f"{name} missing from __all__"
+def read_envelope(stream: socket.socket) -> dict:
+    size = struct.unpack("<Q", _read_exact(stream, 8))[0]
+    return json.loads(_read_exact(stream, size).decode("utf-8"))
 
 
-# ── Worker class ────────────────────────────────────────────────────────
+def send_envelope(stream: socket.socket, envelope: object) -> None:
+    payload = json.dumps(envelope, separators=(",", ":")).encode("utf-8")
+    stream.sendall(struct.pack("<Q", len(payload)) + payload)
 
 
-class TestWorkerClass:
-    """Check Worker interface without needing a live socket."""
-
-    def test_worker_is_a_class(self):
-        assert isinstance(Worker, type)
-
-    def test_execute_is_overridable(self):
-        class Custom(Worker):
-            def __init__(self):
-                # Skip real socket setup
-                pass
-
-            def execute(self, payload: dict) -> dict:
-                return {"echo": payload}
-
-        w = Custom()
-        assert w.execute({"x": 1}) == {"echo": {"x": 1}}
-
-    def test_handle_request_default_is_noop(self):
-        class Noop(Worker):
-            def __init__(self):
-                pass
-
-        w = Noop()
-        assert w.handle_request({}) is None
-
-    def test_send_method_exists(self):
-        assert callable(getattr(Worker, "send", None))
-
-    def test_run_method_exists(self):
-        assert callable(getattr(Worker, "run", None))
-
-    def test_internal_methods_defined(self):
-        """Worker class defines internal methods that should not be passed to user handler."""
-        expected = {"TERMINATE", "META", "EXECUTE", "RETRY"}
-        assert Worker._INTERNAL_METHODS == expected
+class EchoWorker(Worker):
+    def execute(self, data: dict) -> dict:
+        return {"echo": data}
 
 
-# ── RunScript ───────────────────────────────────────────────────────────
+def open_worker(worker_type: type[Worker] = EchoWorker):
+    temp = tempfile.TemporaryDirectory()
+    socket_path = f"{temp.name}/worker.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(socket_path)
+    listener.listen(1)
+    worker = worker_type(socket_path, "worker-123")
+    connection, _ = listener.accept()
+    connection.settimeout(1)
+    ready = read_envelope(connection)
+    return temp, listener, connection, worker, ready, socket_path
 
 
-class TestRunScript:
-    """RunScript helper checks (no live socket)."""
-
-    def test_runscript_is_callable(self):
-        assert callable(RunScript)
-
-    def test_runscript_rejects_non_worker(self):
-        """RunScript should fail when given a class that is not a Worker subclass."""
-        with pytest.raises(SystemExit):
-            # Provide a fake argv so it doesn't fail on missing arg first
-            original_argv = sys.argv
-            sys.argv = ["test", "/tmp/fake.sock"]
-            try:
-                RunScript(object)
-            finally:
-                sys.argv = original_argv
-
-    def test_runscript_requires_socket_arg(self):
-        """RunScript should exit when sys.argv has no socket path."""
-        original_argv = sys.argv
-        sys.argv = ["test"]
-        try:
-            with pytest.raises(SystemExit):
-                RunScript(Worker)
-        finally:
-            sys.argv = original_argv
+def close_worker(resources) -> None:
+    temp, listener, connection, worker, _, _ = resources
+    try:
+        connection.close()
+    finally:
+        listener.close()
+        worker.stream.close()
+        temp.cleanup()
 
 
-# ── Typing utilities ────────────────────────────────────────────────────
+def test_public_exports_are_the_bare_envelope_api():
+    assert runpyrs.__all__ == [
+        "Worker",
+        "RunScript",
+        "Envelope",
+        "Meta",
+        "Data",
+        "RunpyOperation",
+        "create_envelope",
+        "ExecutePayload",
+        "ExecuteResult",
+    ]
+    assert get_type_hints(Envelope) == {"meta": Meta, "data": Data}
+    assert ExecutePayload is Data
+    assert get_origin(ExecuteResult) is Union
+    assert type(None) in get_args(ExecuteResult)
+    assert RunpyOperation is not None
+
+    for removed in (
+        "Message",
+        "Method",
+        "Headers",
+        "OutboundMessage",
+        "InternalMessageType",
+        "BuiltinResponseType",
+        "MessageType",
+    ):
+        assert not hasattr(runpyrs, removed)
 
 
-class TestTypingUtils:
-    """Verify that type aliases and TypedDicts are usable at runtime."""
+def test_create_envelope_preserves_json_metadata_and_copies_inputs():
+    meta = {"some_custom_meta": 42}
+    data = {"some": "data"}
+    envelope = create_envelope(data, meta)
+    meta["some_custom_meta"] = 0
+    data["some"] = "changed"
 
-    def test_reexports_match_module(self):
-        assert Envelope is EnvelopeDirect
-        assert ExecuteResult is ExecuteResultDirect
+    assert envelope == {
+        "meta": {"some_custom_meta": 42},
+        "data": {"some": "data"},
+    }
 
-    def test_message_is_typed_dict(self):
-        """Message (Envelope alias) is a TypedDict with HTTP-like fields."""
-        # TypedDict classes have __annotations__ and descend from dict
-        assert hasattr(Envelope, "__annotations__")
-        assert "method" in Envelope.__annotations__
-        # Optional fields (path was removed from protocol)
-        assert "headers" in Envelope.__annotations__
-        assert "body" in Envelope.__annotations__
 
-    def test_outbound_message_is_message_alias(self):
-        """OutboundMessage is now an alias for Message."""
-        assert hasattr(OutboundMessage, "__annotations__")
-        assert "method" in OutboundMessage.__annotations__
-        assert "headers" in OutboundMessage.__annotations__
+@pytest.mark.parametrize("key", ["x_wid", "x_spath", "x_op", "x_custom"])
+def test_create_envelope_rejects_reserved_metadata(key):
+    with pytest.raises(ValueError, match="reserved by Runpy"):
+        create_envelope({}, {key: "spoofed"})
 
-    def test_meta_data_is_typed_dict(self):
-        assert hasattr(MetaData, "__annotations__")
-        assert "name" in MetaData.__annotations__
 
-    def test_execute_payload_is_dict_alias(self):
-        # ExecutePayload is Dict[str, Any] — at runtime it's a generic alias
-        assert ExecutePayload is not None
+@pytest.mark.parametrize("field", ["meta", "data"])
+def test_create_envelope_requires_objects(field):
+    kwargs = {"data": {}}
+    if field == "data":
+        kwargs["data"] = []
+    else:
+        kwargs["meta"] = []
 
-    def test_execute_result_allows_none(self):
-        """ExecuteResult should accept both dict and None."""
-        from typing import get_args, get_origin, Union
+    with pytest.raises(TypeError, match=f"{field} must be a dictionary"):
+        create_envelope(**kwargs)
 
-        # Optional[X] is Union[X, None]
-        origin = get_origin(ExecuteResult)
-        assert origin is Union
-        args = get_args(ExecuteResult)
-        assert type(None) in args
 
-    def test_request_data_is_envelope_alias(self):
-        assert RequestData is Envelope
+def test_worker_ready_envelope_uses_exact_argv_identity_and_socket():
+    resources = open_worker()
+    try:
+        _, _, _, _, ready, socket_path = resources
+        assert ready == {
+            "meta": {
+                "x_op": "ready",
+                "x_wid": "worker-123",
+                "x_spath": socket_path,
+            },
+            "data": {},
+        }
+    finally:
+        close_worker(resources)
 
-    def test_worker_execute_uses_typed_aliases(self):
-        """Worker.execute annotations should reference the new type aliases."""
-        hints = Worker.execute.__annotations__
-        assert "payload" in hints
-        assert "return" in hints
+
+def test_custom_send_preserves_numeric_metadata():
+    resources = open_worker()
+    try:
+        _, _, connection, worker, _, socket_path = resources
+        worker.send({"some": "data"}, meta={"some_custom_meta": 42})
+        assert read_envelope(connection) == {
+            "meta": {
+                "some_custom_meta": 42,
+                "x_wid": "worker-123",
+                "x_spath": socket_path,
+            },
+            "data": {"some": "data"},
+        }
+    finally:
+        close_worker(resources)
+
+
+def test_log_level_argument_overrides_metadata_value():
+    resources = open_worker()
+    try:
+        _, _, connection, worker, _, _ = resources
+        worker.log(
+            {"message": "hello"},
+            level="warning",
+            meta={"level": "debug", "correlation_id": 7},
+        )
+        envelope = read_envelope(connection)
+        assert envelope["meta"]["x_op"] == "log"
+        assert envelope["meta"]["level"] == "warning"
+        assert envelope["meta"]["correlation_id"] == 7
+        assert envelope["data"] == {"message": "hello"}
+    finally:
+        close_worker(resources)
+
+
+def test_execute_returns_direct_done_data():
+    resources = open_worker()
+    try:
+        _, _, connection, worker, _, socket_path = resources
+        thread = threading.Thread(target=worker.run)
+        thread.start()
+
+        send_envelope(
+            connection,
+            {
+                "meta": {
+                    "x_op": "execute",
+                    "x_wid": "worker-123",
+                    "x_spath": socket_path,
+                },
+                "data": {"value": 9},
+            },
+        )
+        done = read_envelope(connection)
+        assert done["meta"]["x_op"] == "done"
+        assert done["data"] == {"echo": {"value": 9}}
+
+        send_envelope(
+            connection,
+            {"meta": {"x_op": "terminate"}, "data": {}},
+        )
+        thread.join(timeout=1)
+        assert not thread.is_alive()
+    finally:
+        close_worker(resources)
+
+
+def test_custom_inbound_envelope_reaches_developer_hook_once():
+    received = []
+    called = threading.Event()
+
+    class CustomWorker(Worker):
+        def handle_envelope(self, envelope: Envelope) -> None:
+            received.append(envelope)
+            called.set()
+
+    resources = open_worker(CustomWorker)
+    try:
+        _, _, connection, worker, _, _ = resources
+        thread = threading.Thread(target=worker.run)
+        thread.start()
+        custom = {
+            "meta": {
+                "x_wid": "worker-123",
+                "x_spath": "/tmp/manager.sock",
+                "some_custom_meta": 42,
+            },
+            "data": {"some": "data"},
+        }
+        send_envelope(connection, custom)
+        assert called.wait(timeout=1)
+        assert received == [custom]
+
+        send_envelope(
+            connection,
+            {"meta": {"x_op": "terminate"}, "data": {}},
+        )
+        thread.join(timeout=1)
+    finally:
+        close_worker(resources)
+
+
+def test_retry_before_execute_returns_error():
+    resources = open_worker()
+    try:
+        _, _, connection, worker, _, _ = resources
+        thread = threading.Thread(target=worker.run)
+        thread.start()
+        send_envelope(connection, {"meta": {"x_op": "retry"}, "data": {}})
+        error = read_envelope(connection)
+        assert error["meta"]["x_op"] == "error"
+        assert error["data"] == {
+            "message": "Retry requested before an execute operation"
+        }
+        send_envelope(
+            connection,
+            {"meta": {"x_op": "terminate"}, "data": {}},
+        )
+        thread.join(timeout=1)
+    finally:
+        close_worker(resources)
+
+
+def test_invalid_execute_result_returns_error():
+    class InvalidResultWorker(Worker):
+        def execute(self, data):
+            return ["not", "an", "object"]
+
+    resources = open_worker(InvalidResultWorker)
+    try:
+        _, _, connection, worker, _, _ = resources
+        thread = threading.Thread(target=worker.run)
+        thread.start()
+        send_envelope(
+            connection,
+            {"meta": {"x_op": "execute"}, "data": {}},
+        )
+        error = read_envelope(connection)
+        assert error["meta"]["x_op"] == "error"
+        assert error["data"] == {
+            "message": "Worker.execute must return a dictionary or None"
+        }
+        send_envelope(
+            connection,
+            {"meta": {"x_op": "terminate"}, "data": {}},
+        )
+        thread.join(timeout=1)
+    finally:
+        close_worker(resources)
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        {"meta": {}, "data": []},
+        {"meta": {"x_custom": "no"}, "data": {}},
+        {"meta": {"x_op": 42}, "data": {}},
+        {"meta": {"x_op": "ready"}, "data": {}},
+    ],
+)
+def test_protocol_violation_closes_without_response(invalid):
+    resources = open_worker()
+    try:
+        _, _, connection, worker, _, _ = resources
+        thread = threading.Thread(target=worker.run)
+        thread.start()
+        send_envelope(connection, invalid)
+        thread.join(timeout=1)
+        assert not thread.is_alive()
+        assert connection.recv(1) == b""
+    finally:
+        close_worker(resources)
+
+
+def test_runscript_requires_socket_and_worker_id(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["test"])
+    with pytest.raises(SystemExit):
+        RunScript(Worker)
+
+    monkeypatch.setattr(sys, "argv", ["test", "/tmp/fake.sock"])
+    with pytest.raises(SystemExit):
+        RunScript(Worker)
+
+
+def test_runscript_checks_subclass_with_complete_arguments(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["test", "/tmp/fake.sock", "worker-123"])
+    with pytest.raises(SystemExit):
+        RunScript(object)
+
+
+def test_runscript_passes_exact_worker_id(monkeypatch):
+    captured = {}
+
+    class CapturingWorker(Worker):
+        def __init__(self, sock, name, extra):
+            captured.update(sock=sock, name=name, extra=extra)
+
+        def run(self):
+            captured["ran"] = True
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["test", "/tmp/worker.sock", "worker-123", "--mode=fast"],
+    )
+    RunScript(CapturingWorker)
+    assert captured == {
+        "sock": "/tmp/worker.sock",
+        "name": "worker-123",
+        "extra": {"mode": "fast"},
+        "ran": True,
+    }

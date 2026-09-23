@@ -1,366 +1,280 @@
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use std::collections::HashMap;
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::{Map, Value};
+use std::fmt;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixListener;
+use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
 
 use crate::scribbler::scribbler;
 
-// ══════════════════════════════════════════════════════════════════════════
-// HTTP-LIKE MESSAGE PROTOCOL
-// ══════════════════════════════════════════════════════════════════════════
-//
-// Inspired by HTTP, this protocol uses a JSON structure with:
-//   - method:  The action type (GET, POST, EXECUTE, TERMINATE, etc.)
-//   - headers: Key-value metadata (worker identification, content info)
-//   - body:    Optional payload data
-//
-// ══════════════════════════════════════════════════════════════════════════
+pub type Meta = Map<String, Value>;
+pub type Data = Map<String, Value>;
 
-/// HTTP-like methods for the runpy protocol.
-/// Includes standard HTTP methods and custom ones for worker management.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum Method {
-    // ── Standard HTTP-like methods ─────────────────────────────────────
-    /// Request information (status, health, etc.)
-    Get,
-    /// Send data or trigger an action
-    Post,
-    /// Update existing data/state
-    Put,
-    /// Remove/clear data
-    Delete,
+const X_WORKER_ID: &str = "x_wid";
+const X_SOCKET_PATH: &str = "x_spath";
+const X_OPERATION: &str = "x_op";
+const OPERATIONS: &[&str] = &[
+    "ready",
+    "execute",
+    "retry",
+    "terminate",
+    "done",
+    "error",
+    "log",
+];
+const MANAGER_OPERATIONS: &[&str] = &["execute", "retry", "terminate"];
+const WORKER_OPERATIONS: &[&str] = &["ready", "done", "error", "log"];
 
-    // ── Custom Runpy methods ───────────────────────────────────────────
-    /// Execute the worker's main business logic
-    Execute,
-    /// Re-execute the last payload
-    Retry,
-    /// Request graceful termination
-    Terminate,
-    /// Send/receive metadata about the worker
-    Meta,
-    /// Signal the worker is ready
-    Ready,
-    /// Response with status information
-    Status,
-    /// Log message with level in headers (X-Log-Level)
-    Log,
-    /// Signal successful completion
-    Done,
-    /// Error response
-    Error,
-    /// Perform a named action with parameters
-    Action,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnvelopeError {
+    ReservedMetadata(String),
+    UnknownReservedMetadata(String),
+    InvalidReservedMetadata(String),
+    InvalidOperation(String),
+    WrongDirection {
+        operation: String,
+        direction: &'static str,
+    },
 }
 
-impl std::fmt::Display for Method {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for EnvelopeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Method::Get => write!(f, "GET"),
-            Method::Post => write!(f, "POST"),
-            Method::Put => write!(f, "PUT"),
-            Method::Delete => write!(f, "DELETE"),
-            Method::Execute => write!(f, "EXECUTE"),
-            Method::Retry => write!(f, "RETRY"),
-            Method::Terminate => write!(f, "TERMINATE"),
-            Method::Meta => write!(f, "META"),
-            Method::Ready => write!(f, "READY"),
-            Method::Status => write!(f, "STATUS"),
-            Method::Log => write!(f, "LOG"),
-            Method::Done => write!(f, "DONE"),
-            Method::Error => write!(f, "ERROR"),
-            Method::Action => write!(f, "ACTION"),
+            Self::ReservedMetadata(key) => {
+                write!(f, "metadata key '{key}' is reserved by Runpy")
+            }
+            Self::UnknownReservedMetadata(key) => {
+                write!(f, "unknown Runpy metadata key '{key}'")
+            }
+            Self::InvalidReservedMetadata(key) => {
+                write!(f, "Runpy metadata '{key}' must be a string")
+            }
+            Self::InvalidOperation(operation) => {
+                write!(f, "unknown Runpy operation '{operation}'")
+            }
+            Self::WrongDirection {
+                operation,
+                direction,
+            } => write!(
+                f,
+                "Runpy operation '{operation}' is invalid for {direction} envelopes"
+            ),
         }
     }
 }
 
-/// Standard header keys used in the protocol.
-pub mod headers {
-    /// Worker's unique identifier name
-    pub const X_WORKER_ID: &str = "X-Worker-Id";
-    /// Path to the worker's Unix socket
-    pub const X_SOCKET_PATH: &str = "X-Socket-Path";
-    /// Content type (typically "application/json")
-    pub const CONTENT_TYPE: &str = "Content-Type";
-    /// Uptime in seconds
-    pub const X_UPTIME: &str = "X-Uptime";
-    /// Action name for ACTION method
-    pub const X_ACTION: &str = "X-Action";
-    /// Optional stack trace for errors
-    pub const X_STACK_TRACE: &str = "X-Stack-Trace";
-    /// Request key for GET requests
-    pub const X_KEY: &str = "X-Key";
-    /// Log level for LOG messages (e.g., "info", "warning", "error")
-    pub const X_LOG_LEVEL: &str = "X-Log-Level";
-    /// Error severity level (e.g., "dismissable", "critical")
-    pub const X_ERROR_LEVEL: &str = "X-Error-Level";
-}
+impl std::error::Error for EnvelopeError {}
 
-/// Headers container - a map of string key-value pairs.
-pub type Headers = HashMap<String, String>;
-
-/// The unified message structure for all communication between
-/// the Rust manager and Python workers.
+/// The complete value exchanged between the Rust manager and Python workers.
 ///
-/// Follows an HTTP-like schema:
-/// ```json
-/// {
-///   "method": "EXECUTE",
-///   "headers": {
-///     "X-Worker-Id": "my_worker_01012026-1200_Ax4f",
-///     "X-Socket-Path": "/tmp/runpy/rp_my_worker.sock",
-///     "Content-Type": "application/json"
-///   },
-///   "body": { "task": "process_data", "input": [...] }
-/// }
-/// ```
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct Message {
-    /// The request/response method (GET, POST, EXECUTE, etc.)
-    pub method: Method,
-
-    /// Key-value headers for metadata (worker ID, socket path, etc.)
-    #[serde(default)]
-    pub headers: Headers,
-
-    /// Optional message body containing the payload data
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub body: Option<Value>,
+/// Both `meta` and `data` are always JSON objects. Keys beginning with `x_`
+/// are reserved for Runpy and cannot be supplied through [`Envelope::new`].
+#[derive(Serialize, Debug, Clone, PartialEq)]
+pub struct Envelope {
+    meta: Meta,
+    data: Data,
 }
 
-impl Message {
-    // ── Constructors ───────────────────────────────────────────────────
-
-    /// Create a new message with the given method.
-    pub fn new(method: Method) -> Self {
-        Self {
-            method,
-            headers: HashMap::new(),
-            body: None,
+impl<'de> Deserialize<'de> for Envelope {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct WireEnvelope {
+            meta: Meta,
+            data: Data,
         }
-    }
 
-    /// Create a message with method and body.
-    pub fn with_body(method: Method, body: Value) -> Self {
-        Self {
-            method,
-            headers: HashMap::new(),
-            body: Some(body),
+        let wire = WireEnvelope::deserialize(deserializer)?;
+        validate_wire_meta(&wire.meta).map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            meta: wire.meta,
+            data: wire.data,
+        })
+    }
+}
+
+impl Envelope {
+    /// Build an application-defined envelope.
+    pub fn new(meta: Meta, data: Data) -> Result<Self, EnvelopeError> {
+        if let Some(key) = meta.keys().find(|key| key.starts_with("x_")) {
+            return Err(EnvelopeError::ReservedMetadata(key.clone()));
         }
+        Ok(Self { meta, data })
     }
 
-    // ── Builder methods ────────────────────────────────────────────────
-
-    /// Add a header to the message.
-    pub fn header(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
-        self.headers.insert(key.into(), value.into());
-        self
+    /// Build a manager request that executes a worker payload.
+    pub fn execute(data: Data) -> Self {
+        Self::with_operation("execute", data)
     }
 
-    /// Set the body of the message.
-    pub fn body(mut self, body: Value) -> Self {
-        self.body = Some(body);
-        self
-    }
-
-    // ── Header accessors ───────────────────────────────────────────────
-
-    /// Get the worker ID from headers.
-    pub fn worker_id(&self) -> Option<&str> {
-        self.headers.get(headers::X_WORKER_ID).map(|s| s.as_str())
-    }
-
-    /// Get the socket path from headers.
-    pub fn socket_path(&self) -> Option<&str> {
-        self.headers.get(headers::X_SOCKET_PATH).map(|s| s.as_str())
-    }
-
-    /// Get a specific header value.
-    pub fn get_header(&self, key: &str) -> Option<&str> {
-        self.headers.get(key).map(|s| s.as_str())
-    }
-
-    // ── Convenience constructors for common message types ──────────────
-
-    /// Create a READY message.
-    pub fn ready(message: impl Into<String>) -> Self {
-        Self::with_body(
-            Method::Ready,
-            serde_json::json!({ "message": message.into() }),
-        )
-    }
-
-    /// Create a DONE message with result data.
-    pub fn done(message: impl Into<String>, data: Value) -> Self {
-        Self::with_body(
-            Method::Done,
-            serde_json::json!({
-                "message": message.into(),
-                "data": data
-            }),
-        )
-    }
-
-    /// Create an ERROR message with optional stack trace and error level.
-    /// Error levels: "dismissable", "warning", "critical"
-    pub fn error(
-        message: impl Into<String>,
-        stack_trace: Option<String>,
-        error_level: Option<String>,
-    ) -> Self {
-        let mut msg = Self::with_body(
-            Method::Error,
-            serde_json::json!({ "message": message.into() }),
-        );
-        if let Some(trace) = stack_trace {
-            msg.headers.insert(headers::X_STACK_TRACE.to_string(), trace);
-        }
-        if let Some(level) = error_level {
-            msg.headers.insert(headers::X_ERROR_LEVEL.to_string(), level);
-        }
-        msg
-    }
-
-    /// Create a LOG message with a log level.
-    /// Log levels: "trace", "debug", "info", "warning", "error"
-    pub fn log(message: impl Into<String>, level: impl Into<String>, data: Value) -> Self {
-        Self::with_body(
-            Method::Log,
-            serde_json::json!({
-                "message": message.into(),
-                "data": data
-            }),
-        )
-        .header(headers::X_LOG_LEVEL, level)
-    }
-
-    /// Create a STATUS request.
-    pub fn status_request() -> Self {
-        Self::new(Method::Get)
-    }
-
-    /// Create a STATUS response.
-    pub fn status_response(status: impl Into<String>, uptime: u64) -> Self {
-        Self::with_body(
-            Method::Status,
-            serde_json::json!({
-                "status": status.into(),
-                "uptime": uptime
-            }),
-        )
-        .header(headers::X_UPTIME, uptime.to_string())
-    }
-
-    /// Create an EXECUTE message.
-    pub fn execute(payload: Value) -> Self {
-        Self::with_body(Method::Execute, payload)
-    }
-
-    /// Create a RETRY message.
+    /// Build a manager request that repeats the most recent execution.
     pub fn retry() -> Self {
-        Self::new(Method::Retry)
+        Self::with_operation("retry", Data::new())
     }
 
-    /// Create a TERMINATE message.
+    /// Build a manager request that gracefully terminates a worker.
     pub fn terminate() -> Self {
-        Self::new(Method::Terminate)
+        Self::with_operation("terminate", Data::new())
     }
 
-    /// Create a META message.
-    pub fn meta(data: Value) -> Self {
-        Self::with_body(Method::Meta, data)
+    pub fn meta(&self) -> &Meta {
+        &self.meta
     }
 
-    /// Create a GET request for a specific key.
-    pub fn get(key: impl Into<String>) -> Self {
-        Self::new(Method::Get).header(headers::X_KEY, key)
+    pub fn data(&self) -> &Data {
+        &self.data
     }
 
-    /// Create an ACTION message.
-    pub fn action(action: impl Into<String>, params: Value) -> Self {
-        Self::with_body(Method::Action, params).header(headers::X_ACTION, action)
+    fn with_operation(operation: &'static str, data: Data) -> Self {
+        let mut meta = Meta::new();
+        meta.insert(
+            X_OPERATION.to_string(),
+            Value::String(operation.to_string()),
+        );
+        Self { meta, data }
+    }
+
+    fn operation(&self) -> Option<&str> {
+        self.meta.get(X_OPERATION).and_then(Value::as_str)
+    }
+
+    fn stamp_trusted(&mut self, worker_id: &str, socket_path: &str) {
+        self.meta.insert(
+            X_WORKER_ID.to_string(),
+            Value::String(worker_id.to_string()),
+        );
+        self.meta.insert(
+            X_SOCKET_PATH.to_string(),
+            Value::String(socket_path.to_string()),
+        );
+    }
+
+    fn validate_manager_to_worker(&self) -> Result<(), EnvelopeError> {
+        validate_direction(self.operation(), MANAGER_OPERATIONS, "manager-to-worker")
+    }
+
+    fn validate_worker_to_manager(&self) -> Result<(), EnvelopeError> {
+        validate_direction(self.operation(), WORKER_OPERATIONS, "worker-to-manager")
     }
 }
 
-/// Callback type for handling messages from workers.
-pub type MessageHandler = Arc<dyn Fn(Envelope) + Send + Sync>;
+fn validate_wire_meta(meta: &Meta) -> Result<(), EnvelopeError> {
+    for (key, value) in meta {
+        if !key.starts_with("x_") {
+            continue;
+        }
 
-/// A lightweight handle for sending messages back to a specific worker.
+        match key.as_str() {
+            X_WORKER_ID | X_SOCKET_PATH => {
+                if !value.is_string() {
+                    return Err(EnvelopeError::InvalidReservedMetadata(key.clone()));
+                }
+            }
+            X_OPERATION => {
+                let operation = value
+                    .as_str()
+                    .ok_or_else(|| EnvelopeError::InvalidReservedMetadata(key.clone()))?;
+                if !OPERATIONS.contains(&operation) {
+                    return Err(EnvelopeError::InvalidOperation(operation.to_string()));
+                }
+            }
+            _ => return Err(EnvelopeError::UnknownReservedMetadata(key.clone())),
+        }
+    }
+    Ok(())
+}
+
+fn validate_direction(
+    operation: Option<&str>,
+    allowed: &[&str],
+    direction: &'static str,
+) -> Result<(), EnvelopeError> {
+    if let Some(operation) = operation {
+        if !allowed.contains(&operation) {
+            return Err(EnvelopeError::WrongDirection {
+                operation: operation.to_string(),
+                direction,
+            });
+        }
+    }
+    Ok(())
+}
+
+pub type MessageHandler = Arc<dyn Fn(InboundEnvelope) + Send + Sync>;
+
+/// A received wire envelope plus a responder bound to its worker connection.
+#[derive(Clone)]
+pub struct InboundEnvelope {
+    pub envelope: Envelope,
+    pub mailer: Mailer,
+}
+
+/// A lightweight responder for the worker that sent an inbound envelope.
 #[derive(Clone)]
 pub struct Mailer {
-    tx: mpsc::Sender<Message>,
+    tx: mpsc::Sender<Envelope>,
     worker_id: String,
 }
 
 impl Mailer {
-    pub(crate) fn new(tx: mpsc::Sender<Message>, worker_id: String) -> Self {
+    fn new(tx: mpsc::Sender<Envelope>, worker_id: String) -> Self {
         Self { tx, worker_id }
     }
 
-    /// Create a test mailer for unit tests (does not actually send messages).
-    /// **Warning**: This creates a disconnected channel - messages sent will be dropped.
     #[doc(hidden)]
     pub fn for_testing(worker_id: String) -> Self {
-        let (tx, _rx) = mpsc::channel::<Message>(1);
+        let (tx, _rx) = mpsc::channel::<Envelope>(1);
         Self { tx, worker_id }
     }
 
-    /// Send a message back to the worker that sent the original message.
-    /// This is a fire-and-forget method that spawns a task to send the message.
-    pub fn send(&self, msg: Message) {
+    pub fn send(&self, envelope: Envelope) {
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            if let Err(e) = tx.send(msg).await {
-                scribbler().error_with("Mailer", &format!("Failed to send message: {}", e));
+            if let Err(error) = tx.send(envelope).await {
+                scribbler().error_with("Mailer", &format!("Failed to send envelope: {error}"));
             }
         });
     }
 
-    /// Async version that returns a Result for proper error handling.
-    pub async fn send_async(&self, msg: Message) -> Result<(), String> {
-        self.tx
-            .send(msg)
-            .await
-            .map_err(|e| format!("Failed to send message to worker {}: {}", self.worker_id, e))
+    pub async fn send_async(&self, envelope: Envelope) -> Result<(), String> {
+        self.tx.send(envelope).await.map_err(|error| {
+            format!(
+                "Failed to send envelope to worker {}: {error}",
+                self.worker_id
+            )
+        })
     }
 }
 
-/// An envelope wraps a `Message` with metadata about which worker sent it,
-/// and provides a way to send responses back to that worker.
-#[derive(Clone)]
-pub struct Envelope {
-    pub worker_id: String,
-    pub message: Message,
-    pub mailer: Mailer,
-}
-
-/// A channel-based sender that lets user code send messages to a connected worker stream.
+/// A channel-based sender for a connected worker stream.
 #[derive(Clone)]
 pub struct MessageSender {
-    tx: mpsc::Sender<Message>,
+    tx: mpsc::Sender<Envelope>,
 }
 
 impl MessageSender {
-    /// Send a message to the worker through the control plane's stream.
-    pub async fn send(&self, msg: Message) -> Result<(), String> {
+    #[doc(hidden)]
+    pub fn for_testing(tx: mpsc::Sender<Envelope>) -> Self {
+        Self { tx }
+    }
+
+    pub async fn send(&self, envelope: Envelope) -> Result<(), String> {
         self.tx
-            .send(msg)
+            .send(envelope)
             .await
-            .map_err(|e| format!("Failed to send message to worker: {}", e))
+            .map_err(|error| format!("Failed to send envelope to worker: {error}"))
     }
 }
 
-/// The control plane manages the Unix socket listener for a single worker.
-/// It receives messages from the Python worker, wraps them in an `Envelope`,
-/// and dispatches them to the registered handlers. It also supports sending
-/// messages back to the worker via a channel-based `MessageSender`.
+/// Manages the Unix socket connection for one worker.
 pub struct ControlPlane {
     listener: UnixListener,
     worker_id: String,
+    socket_path: String,
     global_handler: Option<MessageHandler>,
     worker_handler: Option<MessageHandler>,
 }
@@ -369,152 +283,144 @@ impl ControlPlane {
     pub fn new(
         listener: UnixListener,
         worker_id: String,
+        socket_path: String,
         global_handler: Option<MessageHandler>,
         worker_handler: Option<MessageHandler>,
     ) -> Self {
         Self {
             listener,
             worker_id,
+            socket_path,
             global_handler,
             worker_handler,
         }
     }
 
-    /// Start accepting connections. Returns a `MessageSender` that can be used
-    /// to send messages to the connected worker. The control plane runs in the
-    /// background via `tokio::spawn`.
     pub fn start(self) -> MessageSender {
-        let (tx, rx) = mpsc::channel::<Message>(64);
+        let (tx, rx) = mpsc::channel::<Envelope>(64);
         let sender = MessageSender { tx };
-
         tokio::spawn(async move {
             self.run(rx).await;
         });
-
         sender
     }
 
-    async fn run(self, mut outbound_rx: mpsc::Receiver<Message>) {
+    async fn run(self, mut outbound_rx: mpsc::Receiver<Envelope>) {
         loop {
-            let accept_result = self.listener.accept().await;
-            let (mut stream, _) = match accept_result {
-                Ok(conn) => conn,
-                Err(e) => {
-                    scribbler().error_with("ControlPlane", &format!("{} Accept error: {}", self.worker_id, e));
+            let (mut stream, _) = match self.listener.accept().await {
+                Ok(connection) => connection,
+                Err(error) => {
+                    scribbler().error_with(
+                        "ControlPlane",
+                        &format!("{} Accept error: {error}", self.worker_id),
+                    );
                     break;
                 }
             };
 
-            let global = self.global_handler.clone();
-            let worker = self.worker_handler.clone();
-            let wid = self.worker_id.clone();
+            let (response_tx, mut response_rx) = mpsc::channel::<Envelope>(64);
 
-            // Create a channel for this connection to send messages back
-            let (response_tx, mut response_rx) = mpsc::channel::<Message>(64);
-
-            // Handle a single connection (Python workers connect once and keep the stream open)
             loop {
                 tokio::select! {
-                    // Inbound: read messages from the Python worker
-                    recv_result = Self::recv_message(&mut stream) => {
-                        match recv_result {
-                            Some(msg) => {
-                                let mailer = Mailer::new(response_tx.clone(), wid.clone());
-                                let envelope = Envelope {
-                                    worker_id: wid.clone(),
-                                    message: msg,
-                                    mailer,
-                                };
+                    received = Self::recv_envelope(&mut stream) => {
+                        let Some(mut envelope) = received else {
+                            break;
+                        };
+                        if let Err(error) = envelope.validate_worker_to_manager() {
+                            scribbler().error_with("Protocol", &error.to_string());
+                            break;
+                        }
+                        envelope.stamp_trusted(&self.worker_id, &self.socket_path);
 
-                                // Global handler fires first
-                                if let Some(ref handler) = global {
-                                    handler(envelope.clone());
-                                }
+                        let inbound = InboundEnvelope {
+                            envelope,
+                            mailer: Mailer::new(response_tx.clone(), self.worker_id.clone()),
+                        };
 
-                                // Then worker-specific handler
-                                if let Some(ref handler) = worker {
-                                    handler(envelope);
-                                }
-                            }
-                            None => {
-                                // Connection closed by the Python side
-                                break;
-                            }
+                        if let Some(handler) = &self.global_handler {
+                            handler(inbound.clone());
+                        }
+                        if let Some(handler) = &self.worker_handler {
+                            handler(inbound);
                         }
                     }
-
-                    // Outbound: messages from the main outbound channel
-                    Some(msg) = outbound_rx.recv() => {
-                        if let Err(e) = Self::send_message(&mut stream, &msg).await {
-                            scribbler().error_with("ControlPlane", &format!("{} Send error: {}", wid, e));
+                    Some(envelope) = outbound_rx.recv() => {
+                        if let Err(error) = self.write_stamped_envelope(&mut stream, envelope).await {
+                            scribbler().error_with(
+                                "ControlPlane",
+                                &format!("{} Send error: {error}", self.worker_id),
+                            );
                             break;
                         }
                     }
-
-                    // Responses: messages from the envelope mailer
-                    Some(msg) = response_rx.recv() => {
-                        if let Err(e) = Self::send_message(&mut stream, &msg).await {
-                            scribbler().error_with("ControlPlane", &format!("{} Response send error: {}", wid, e));
+                    Some(envelope) = response_rx.recv() => {
+                        if let Err(error) = self.write_stamped_envelope(&mut stream, envelope).await {
+                            scribbler().error_with(
+                                "ControlPlane",
+                                &format!("{} Response send error: {error}", self.worker_id),
+                            );
                             break;
                         }
                     }
                 }
             }
-
-            // If the inner loop breaks the connection is gone; wait for a new one
-            // or break if the listener itself failed.
         }
     }
 
-    /// Read a single length-prefixed JSON message from the stream.
-    async fn recv_message(stream: &mut tokio::net::UnixStream) -> Option<Message> {
-        let mut size_buf = [0u8; 8];
-        match stream.read_exact(&mut size_buf).await {
-            Ok(_) => {}
-            Err(e) => {
-                match e.kind() {
-                    std::io::ErrorKind::UnexpectedEof => {} // clean close
-                    std::io::ErrorKind::ConnectionReset => {
-                        scribbler().debug_with("Socket", "Connection reset by peer");
-                    }
-                    std::io::ErrorKind::BrokenPipe => {
-                        scribbler().debug_with("Socket", "Broken pipe - peer closed unexpectedly");
-                    }
-                    _ => {
-                        scribbler().error_with("Socket", &format!("Read error: {} (kind: {:?})", e, e.kind()));
-                    }
+    async fn recv_envelope(stream: &mut UnixStream) -> Option<Envelope> {
+        let mut size_buf = [0_u8; 8];
+        if let Err(error) = stream.read_exact(&mut size_buf).await {
+            match error.kind() {
+                std::io::ErrorKind::UnexpectedEof => {}
+                std::io::ErrorKind::ConnectionReset => {
+                    scribbler().debug_with("Socket", "Connection reset by peer");
                 }
-                return None;
+                std::io::ErrorKind::BrokenPipe => {
+                    scribbler().debug_with("Socket", "Broken pipe - peer closed unexpectedly");
+                }
+                _ => scribbler().error_with(
+                    "Socket",
+                    &format!("Read error: {error} (kind: {:?})", error.kind()),
+                ),
             }
+            return None;
         }
 
-        let message_size = u64::from_le_bytes(size_buf) as usize;
-        let mut message_buf = vec![0u8; message_size];
-
-        match stream.read_exact(&mut message_buf).await {
-            Ok(_) => {}
-            Err(e) => {
-                scribbler().error_with("Socket", &format!("Error reading message body: {} (kind: {:?})", e, e.kind()));
-                return None;
-            }
+        let envelope_size = u64::from_le_bytes(size_buf) as usize;
+        let mut envelope_buf = vec![0_u8; envelope_size];
+        if let Err(error) = stream.read_exact(&mut envelope_buf).await {
+            scribbler().error_with(
+                "Socket",
+                &format!(
+                    "Error reading envelope body: {error} (kind: {:?})",
+                    error.kind()
+                ),
+            );
+            return None;
         }
 
-        match serde_json::from_slice::<Message>(&message_buf) {
-            Ok(msg) => Some(msg),
-            Err(e) => {
-                let raw = String::from_utf8_lossy(&message_buf);
-                scribbler().error_with("Protocol", &format!("JSON parse error: {}\n  Raw: {}", e, raw));
+        match serde_json::from_slice(&envelope_buf) {
+            Ok(envelope) => Some(envelope),
+            Err(error) => {
+                let raw = String::from_utf8_lossy(&envelope_buf);
+                scribbler().error_with(
+                    "Protocol",
+                    &format!("JSON envelope error: {error}\n  Raw: {raw}"),
+                );
                 None
             }
         }
     }
 
-    /// Send a length-prefixed JSON message over the stream.
-    pub async fn send_message(
-        stream: &mut tokio::net::UnixStream,
-        msg: &Message,
+    async fn write_stamped_envelope(
+        &self,
+        stream: &mut UnixStream,
+        mut envelope: Envelope,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let payload = serde_json::to_vec(msg)?;
+        envelope.validate_manager_to_worker()?;
+        envelope.stamp_trusted(&self.worker_id, &self.socket_path);
+
+        let payload = serde_json::to_vec(&envelope)?;
         let size = (payload.len() as u64).to_le_bytes();
         stream.write_all(&size).await?;
         stream.write_all(&payload).await?;

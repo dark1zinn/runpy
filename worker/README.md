@@ -4,63 +4,69 @@ Python worker SDK for [Runpy](https://github.com/dark1zinn/runpy) — write Pyth
 
 ## Installation
 
-**NOT YET AVAILABLE IN PYPI!!**
+`uv` is required. Until `runpyrs` is published, install it from the repository
+subdirectory:
 
 ```bash
-pip install runpyrs
-```
-
-or
-
-```bash
-uv add runpyrs
-```
-
-or
-
-```bash
-poetry add runpyrs
-```
-
-or
-
-```bash
-pdm add runpyrs
+uv add "git+https://github.com/dark1zinn/runpy#subdirectory=worker"
 ```
 
 ## Quick Start
 
 ```python
-from runpyrs import Worker, RunScript
+from runpyrs import Envelope, Worker, RunScript
+
 
 class MyWorker(Worker):
-    def execute(self, payload: dict) -> dict:
-        # Your business logic here
-        return {"status": "ok", "result": payload}
+    def execute(self, data: dict) -> dict:
+        return {"status": "ok", "result": data}
+
+    def handle_envelope(self, envelope: Envelope) -> None:
+        self.send(
+            {"accepted": True},
+            meta={"correlation_id": envelope["meta"].get("correlation_id")},
+        )
+
 
 if __name__ == "__main__":
     RunScript(MyWorker)
 ```
 
-The Rust manager will launch your script, passing the Unix socket path as the first argument. `RunScript` handles the wiring automatically.
+The Rust manager supplies the Unix socket path and worker ID. `RunScript`
+connects the worker and stamps both values into Runpy-reserved metadata.
 
-## How It Works
+## Envelope
 
-1. The Rust `Manager` spawns your Python script as a child process and provides a Unix socket path.
-2. `RunScript` reads the socket path from `sys.argv`, instantiates your `Worker` subclass, and connects to the socket.
-3. The worker sends a `READY` message and enters a loop waiting for commands (`EXECUTE`, `RETRY`, `TERMINATE`, `META`).
-4. Override `execute()` to define your business logic. Return a dict and it is sent back as a `DONE` message.
-5. Override `handle_request()` for any custom (non-internal) message types.
+Every message has exactly two object fields:
+
+```json
+{
+    "meta": {
+        "x_wid": "worker-id",
+        "x_spath": "/tmp/runpy/rp_worker.sock",
+        "some_custom_meta": 42
+    },
+    "data": {
+        "some": "data"
+    }
+}
+```
+
+Application code owns `data` and metadata keys that do not begin with `x_`.
+Runpy reserves `x_wid`, `x_spath`, and `x_op`. The internal operations are
+`ready`, `execute`, `retry`, `terminate`, `done`, `error`, and `log`.
 
 ## API
 
 | Symbol | Description |
 | --- | --- |
-| `Worker` | Base class — subclass it and override `execute()`. |
-| `RunScript` | Helper that bootstraps a `Worker` subclass from the CLI. |
-| `Worker.send(type, message, data)` | Send a typed message back to the Rust manager. |
-| `Worker.execute(payload)` | *Override* — called on `EXECUTE` messages. |
-| `Worker.handle_request(data)` | *Override* — called for non-internal message types. |
+| `Worker` | Base class for managed Python workers. |
+| `RunScript` | CLI bootstrap used by scripts launched from Rust. |
+| `Worker.send(data, meta=...)` | Send a custom envelope with no internal operation. |
+| `Worker.log(data, level=..., meta=...)` | Send a structured `log` envelope. |
+| `Worker.execute(data)` | Override to process an `execute` envelope. |
+| `Worker.handle_envelope(envelope)` | Override for custom envelopes with no `x_op`. |
+| `create_envelope(data, meta=...)` | Build a custom typed envelope and reject reserved keys. |
 
 ## License
 

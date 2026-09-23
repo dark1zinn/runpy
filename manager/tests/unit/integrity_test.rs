@@ -59,10 +59,8 @@ fn perform_check_fails_on_venv_without_python_binary() {
     // No python binary inside
     let scripts = fake_scripts(&tmp, &["hello"]);
 
-    let checker = runpy_test_helpers::integrity_checker(
-        venv.to_str().unwrap(),
-        scripts.to_str().unwrap(),
-    );
+    let checker =
+        runpy_test_helpers::integrity_checker(venv.to_str().unwrap(), scripts.to_str().unwrap());
 
     let result = checker.perform_check();
     assert!(result.is_err());
@@ -83,7 +81,11 @@ fn perform_check_fails_on_missing_scripts_dir() {
 
     let result = checker.perform_check();
     assert!(result.is_err());
-    assert!(result.unwrap_err().contains("Scripts directory does not exist"));
+    assert!(
+        result
+            .unwrap_err()
+            .contains("Scripts directory does not exist")
+    );
 }
 
 // ─── perform_check — success path ──────────────────────────────────────
@@ -94,10 +96,8 @@ fn perform_check_succeeds_with_valid_venv_and_scripts() {
     let venv = fake_venv(&tmp);
     let scripts = fake_scripts(&tmp, &["scraper", "analyzer"]);
 
-    let checker = runpy_test_helpers::integrity_checker(
-        venv.to_str().unwrap(),
-        scripts.to_str().unwrap(),
-    );
+    let checker =
+        runpy_test_helpers::integrity_checker(venv.to_str().unwrap(), scripts.to_str().unwrap());
 
     assert!(checker.perform_check().is_ok());
 }
@@ -128,11 +128,7 @@ fn check_script_ignores_dunder_files() {
     let tmp = TempDir::new().unwrap();
     let scripts = fake_scripts(&tmp, &["real_script"]);
     // Add an __init__.py manually
-    fs::write(
-        tmp.path().join("scripts/__init__.py"),
-        "# init",
-    )
-    .unwrap();
+    fs::write(tmp.path().join("scripts/__init__.py"), "# init").unwrap();
 
     let checker = runpy_test_helpers::integrity_checker("/unused", scripts.to_str().unwrap());
     assert!(checker.check_script("real_script"));

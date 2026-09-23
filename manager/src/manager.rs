@@ -1,5 +1,5 @@
 use chrono::Local;
-use rand::{distributions::Alphanumeric, Rng};
+use rand::{Rng, distributions::Alphanumeric};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Child;
@@ -7,7 +7,7 @@ use std::sync::Arc;
 use tokio::net::UnixListener;
 use tokio::sync::RwLock;
 
-use crate::protocol::{ControlPlane, Envelope, Message, MessageHandler, MessageSender};
+use crate::protocol::{ControlPlane, Envelope, MessageHandler, MessageSender};
 use crate::scribbler::scribbler;
 use crate::watchdog::WatchdogService;
 
@@ -111,7 +111,7 @@ impl Worker {
 
     /// Add an extra argument that will be passed to the Python process.
     /// Arguments are passed as `--key=value` format after the worker name.
-    /// 
+    ///
     /// Example:
     /// ```ignore
     /// worker.arg("db", "postgres").arg("mode", "lazy");
@@ -132,7 +132,7 @@ impl Worker {
     /// handler (if any).
     pub fn on_message<F>(&mut self, handler: F) -> &mut Self
     where
-        F: Fn(Envelope) + Send + Sync + 'static,
+        F: Fn(crate::protocol::InboundEnvelope) + Send + Sync + 'static,
     {
         self.worker_handler = Some(Arc::new(handler));
         self
@@ -152,16 +152,31 @@ impl Worker {
         let listener = UnixListener::bind(&sock_path)
             .map_err(|e| format!("Failed to bind socket at '{}': {}", sock_path.display(), e))?;
 
-        scribbler().debug_with("Worker", &format!(
-            "Starting '{}' with socket at '{}'",
-            identity.name,
-            sock_path.display()
-        ));
+        let socket_path = match sock_path.to_str() {
+            Some(path) => path.to_string(),
+            None => {
+                let _ = std::fs::remove_file(&sock_path);
+                return Err(format!(
+                    "Socket path is not valid UTF-8: {}",
+                    sock_path.display()
+                ));
+            }
+        };
+
+        scribbler().debug_with(
+            "Worker",
+            &format!(
+                "Starting '{}' with socket at '{}'",
+                identity.name,
+                sock_path.display()
+            ),
+        );
 
         // Start the control plane (runs in background, returns a MessageSender)
         let plane = ControlPlane::new(
             listener,
             identity.name.clone(),
+            socket_path,
             self.global_handler.clone(),
             self.worker_handler.clone(),
         );
@@ -178,9 +193,7 @@ impl Worker {
         let script_file = self.scripts_dir.join(format!("{}.py", self.script));
 
         let mut cmd = std::process::Command::new(&py_executable);
-        cmd.arg(&script_file)
-            .arg(&sock_path)
-            .arg(&identity.name); // Pass worker name as third argument
+        cmd.arg(&script_file).arg(&sock_path).arg(&identity.name); // Pass worker name as third argument
 
         // Pass extra arguments as --key=value format
         for (key, value) in &self.extra_args {
@@ -225,18 +238,17 @@ impl Worker {
         Ok(name)
     }
 
-    /// Send a `Message` to the running worker via its control-plane channel.
-    pub async fn send_message(&self, msg: Message) -> Result<(), String> {
+    /// Send an [`Envelope`] to the running worker.
+    pub async fn send_message(&self, envelope: Envelope) -> Result<(), String> {
         match &self.sender {
-            Some(sender) => sender.send(msg).await,
+            Some(sender) => sender.send(envelope).await,
             None => Err("Worker has not been spawned yet".to_string()),
         }
     }
 
-    /// Request graceful termination: send a TERMINATE message, then wait briefly
-    /// before force-killing the process.
+    /// Request graceful termination, then force-kill the process if necessary.
     pub async fn terminate(&self) -> Result<(), String> {
-        self.send_message(Message::terminate()).await?;
+        self.send_message(Envelope::terminate()).await?;
 
         // Give the worker a moment to shut down cleanly
         tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
