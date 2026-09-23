@@ -309,13 +309,15 @@ impl Worker {
 
     /// Request graceful termination, then force-kill the process if necessary.
     pub async fn terminate(&self) -> Result<(), String> {
-        self.send_message(Envelope::terminate()).await?;
+        let send_result = self.send_message(Envelope::terminate()).await;
 
-        // Give the worker a moment to shut down cleanly
-        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+        if send_result.is_ok() {
+            // Give the worker a moment to shut down cleanly
+            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+        }
 
         // Force-kill if still running
-        if let Some(ref wid) = self.worker_id {
+        if let Some(wid) = &self.worker_id {
             let mut workers = self.workers.write().await;
             if let Some(mut handle) = workers.remove(wid) {
                 force_stop_worker(&mut handle);
@@ -323,6 +325,79 @@ impl Worker {
             }
         }
 
-        Ok(())
+        send_result
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::process::CommandExt;
+    use std::time::{Duration, Instant};
+    use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn terminate_cleans_up_worker_when_message_delivery_fails() {
+        let workers = Arc::new(RwLock::new(HashMap::new()));
+        let integrity = Arc::new(IntegrityChecker::new(".", "uv"));
+        let mut worker = Worker::new(
+            "managed",
+            integrity,
+            &PathBuf::from("/tmp/runpy"),
+            None,
+            workers.clone(),
+        );
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let sender = MessageSender::for_testing(tx);
+
+        let mut command = std::process::Command::new("sleep");
+        command.arg("300").process_group(0);
+        let child = command.spawn().unwrap();
+        let pid = child.id();
+        let worker_id = format!("failed-delivery-{pid}");
+        let sock_path = PathBuf::from(format!("/tmp/runpy/rp_{worker_id}.sock"));
+        std::fs::create_dir_all("/tmp/runpy").unwrap();
+        std::fs::write(&sock_path, []).unwrap();
+
+        worker.worker_id = Some(worker_id.clone());
+        worker.sender = Some(sender.clone());
+        workers.write().await.insert(
+            worker_id.clone(),
+            WorkerHandle {
+                child,
+                identity: WorkerIdentity {
+                    name: worker_id.clone(),
+                    sock_file: sock_path.file_name().unwrap().to_str().unwrap().to_string(),
+                },
+                sock_path: sock_path.clone(),
+                sender,
+                process_group_id: pid,
+            },
+        );
+
+        let started = Instant::now();
+        let result = worker.terminate().await;
+        let elapsed = started.elapsed();
+        let worker_removed = !workers.read().await.contains_key(&worker_id);
+        let process_stopped = unsafe { libc::kill(pid as libc::pid_t, 0) } != 0;
+        let socket_removed = !sock_path.exists();
+
+        if let Some(mut handle) = workers.write().await.remove(&worker_id) {
+            force_stop_worker(&mut handle);
+            let _ = std::fs::remove_file(&handle.sock_path);
+        }
+
+        assert_eq!(
+            result,
+            Err("Failed to send envelope to worker: channel closed".to_string())
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "failed delivery waited for graceful shutdown"
+        );
+        assert!(worker_removed);
+        assert!(process_stopped);
+        assert!(socket_removed);
     }
 }
