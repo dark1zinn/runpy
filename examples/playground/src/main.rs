@@ -15,10 +15,9 @@ fn object(value: Value) -> Data {
 #[tokio::main]
 async fn main() {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let venv_path = format!("{}/../../.venv", manifest_dir);
-    let scripts_path = format!("{}/worker/src/scripts", manifest_dir);
+    let scripts_path = format!("{}/worker", manifest_dir);
 
-    let mut manager = Manager::new(&venv_path, &scripts_path);
+    let mut manager = Manager::new(&scripts_path);
     log().success("Manager initialized");
 
     manager.on_message(|inbound| {

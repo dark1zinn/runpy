@@ -1,3 +1,10 @@
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#   "runpyrs @ git+https://github.com/dark1zinn/runpy#subdirectory=worker",
+# ]
+# ///
+
 from runpyrs import Worker, RunScript
 
 

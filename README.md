@@ -21,6 +21,7 @@ Python is simple to write but limited in concurrency and reliability. Rust is fa
 ## Features
 
 - **Worker Management**: Spawn, monitor, and terminate Python workers
+- **uv-managed Runtime**: Per-script Python versions and dependencies from PEP 723 metadata
 - **Bare JSON Envelopes**: Developer-owned metadata and data with minimal Runpy routing
 - **Watchdog Service**: Automatic health monitoring and dead worker cleanup
 - **Structured Logging**: Environment-aware logging via \`Scribbler\`
@@ -32,7 +33,7 @@ Python is simple to write but limited in concurrency and reliability. Rust is fa
 ```text
 ┌─────────────────────────────────────────────────┐
 │  Rust (Manager)                                 │
-│    ├─ IntegrityChecker   (venv & script checks) │
+│    ├─ IntegrityChecker   (uv & script checks)   │
 │    ├─ Scribbler          (structured logging)   │
 │    ├─ Workers[]          (builder + handle)     │
 │    │    └─ ControlPlane  (Unix socket protocol) │
@@ -52,7 +53,7 @@ Python is simple to write but limited in concurrency and reliability. Rust is fa
 ### Prerequisites
 
 - Rust / Cargo
-- Python 3.10+
+- [`uv`](https://docs.astral.sh/uv/) in development and production
 
 ### Setup
 
@@ -63,18 +64,18 @@ Python is simple to write but limited in concurrency and reliability. Rust is fa
 mkdir myapp && cd myapp
 cargo init
 
-# Add '--branch dev' to get from latest commits
+# Add '--branch dev' to get the latest commits
 cargo add --git https://github.com/dark1zinn/runpy -p runpy
-# Also the needed dependencies
 cargo add tokio serde_json
 
-# Create the Python environment and the worker folder
-python -m venv .venv
-mkdir worker && cd worker
-uv sync
-# Append '#branch=dev' for latest commits
-uv add "runpyrs @ git+https://github.com/dark1zinn/runpy#subdirectory=worker"
-cd ..
+# Create a self-contained worker script
+mkdir worker
+uv init --script worker/my_script.py --python 3.10
+uv add --script worker/my_script.py \
+  "runpyrs @ git+https://github.com/dark1zinn/runpy#subdirectory=worker"
+
+# Optional but recommended for reproducible deployments
+uv lock --script worker/my_script.py
 ```
 
 For a better understanding on how to add the crate/package to your project see [this instalation guide](docs/instalation.md)
@@ -93,7 +94,7 @@ fn object(value: Value) -> Data {
 
 #[tokio::main]
 async fn main() {
-    let mut manager = Manager::new("path/to/.venv", "path/to/scripts");
+    let mut manager = Manager::new("path/to/scripts");
 
     manager.on_message(|inbound| {
         let operation = inbound
@@ -159,6 +160,54 @@ if __name__ == "__main__":
 Developers define and validate the schema of their own `meta` and `data`
 objects. Runpy only owns metadata keys beginning with `x_`.
 
+### uv-managed workers
+
+Runpy launches workers with:
+
+```text
+uv run --no-project --script <worker.py> <socket-path> <worker-id>
+```
+
+Every managed worker declares its own Python and dependency requirements:
+
+```python
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#   "runpyrs @ git+https://github.com/dark1zinn/runpy#subdirectory=worker",
+# ]
+# ///
+```
+
+`uv` selects or downloads a compatible Python and creates an isolated cached
+environment for that script. Runpy does not create a `.venv`, run `uv sync`,
+or inject `runpyrs`; the script metadata is authoritative. Ambient
+`pyproject.toml` dependencies are ignored.
+
+`Manager::new("path/to/scripts")` resolves `uv` from `PATH`. Packaged
+deployments can select another executable:
+
+```rust
+let manager = Manager::with_uv_path("path/to/scripts", "/opt/runpy/bin/uv");
+```
+
+An adjacent lockfile is optional:
+
+```bash
+uv lock --script worker/my_script.py
+```
+
+Commit `<worker>.py.lock` for reproducible deployments. When it exists,
+Runpy passes `--locked`, so a stale lock fails the worker launch instead of
+being modified. Scripts without a lock continue to resolve normally. For
+dependency resolution bounded by publication time, add an RFC 3339 cutoff to
+the inline metadata:
+
+```python
+# [tool.uv]
+# exclude-newer = "2025-01-01T00:00:00Z"
+```
+
 ### Run the tests
 
 ```bash
@@ -194,7 +243,7 @@ runpy/
 │   │   ├── lib.rs             # Manager — top-level orchestrator
 │   │   ├── manager.rs         # Worker builder + handle
 │   │   ├── protocol.rs        # Bare envelope transport and ControlPlane
-│   │   ├── integrity.rs       # Venv & script validation
+│   │   ├── integrity.rs       # uv availability & script validation
 │   │   ├── scribbler.rs       # Structured logging service
 │   │   └── watchdog.rs        # Health monitoring & /proc stats
 │   └── tests/

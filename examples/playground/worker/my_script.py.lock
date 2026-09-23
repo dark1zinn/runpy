@@ -1,0 +1,11 @@
+version = 1
+revision = 3
+requires-python = ">=3.10"
+
+[manifest]
+requirements = [{ name = "runpyrs", git = "https://github.com/dark1zinn/runpy?subdirectory=worker" }]
+
+[[package]]
+name = "runpyrs"
+version = "0.1.0"
+source = { git = "https://github.com/dark1zinn/runpy?subdirectory=worker#16caa5383b6e9e031fa18df408cb184c1705b4bd" }

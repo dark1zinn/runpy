@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::time::{Duration, interval};
 
-use crate::manager::WorkerHandle;
+use crate::manager::{WorkerHandle, force_stop_worker};
 use crate::scribbler::scribbler;
 
 /// The health state of a monitored process.
@@ -77,12 +77,12 @@ impl WatchdogService {
 
                 // Clean up dead workers
                 for id in dead_ids {
-                    let handle = workers.remove(&id);
-                    if let Some(h) = handle {
-                        let _ = std::fs::remove_file(&h.sock_path);
+                    if let Some(mut handle) = workers.remove(&id) {
+                        force_stop_worker(&mut handle);
+                        let _ = std::fs::remove_file(&handle.sock_path);
                         scribbler().info_with(
                             "Watchdog",
-                            &format!("Removed dead worker '{}'", h.identity.name),
+                            &format!("Removed dead worker '{}'", handle.identity.name),
                         );
                     }
                 }

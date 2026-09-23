@@ -1,12 +1,15 @@
 use chrono::Local;
 use rand::{Rng, distributions::Alphanumeric};
 use std::collections::HashMap;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Child;
 use std::sync::Arc;
 use tokio::net::UnixListener;
 use tokio::sync::RwLock;
 
+use crate::integrity::IntegrityChecker;
 use crate::protocol::{ControlPlane, Envelope, MessageHandler, MessageSender};
 use crate::scribbler::scribbler;
 use crate::watchdog::WatchdogService;
@@ -47,6 +50,28 @@ pub struct WorkerHandle {
     pub identity: WorkerIdentity,
     pub sock_path: PathBuf,
     pub sender: MessageSender,
+    pub process_group_id: u32,
+}
+
+pub(crate) fn force_stop_worker(handle: &mut WorkerHandle) {
+    #[cfg(unix)]
+    {
+        let result =
+            unsafe { libc::kill(-(handle.process_group_id as libc::pid_t), libc::SIGKILL) };
+        if result != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                let _ = handle.child.kill();
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = handle.child.kill();
+    }
+
+    let _ = handle.child.wait();
 }
 
 // ── Worker (user-facing) ───────────────────────────────────────────────
@@ -57,8 +82,7 @@ pub struct WorkerHandle {
 pub struct Worker {
     // ── Builder fields (set before spawn) ───────────────────────────
     script: String,
-    venv_path: PathBuf,
-    scripts_dir: PathBuf,
+    integrity: Arc<IntegrityChecker>,
     socket_dir: PathBuf,
     env_vars: HashMap<String, String>,
     extra_args: HashMap<String, String>,
@@ -79,16 +103,14 @@ pub struct Worker {
 impl Worker {
     pub(crate) fn new(
         script: &str,
-        venv_path: &PathBuf,
-        scripts_dir: &PathBuf,
+        integrity: Arc<IntegrityChecker>,
         socket_dir: &PathBuf,
         global_handler: Option<MessageHandler>,
         workers: Arc<RwLock<HashMap<String, WorkerHandle>>>,
     ) -> Self {
         Self {
             script: script.to_string(),
-            venv_path: venv_path.clone(),
-            scripts_dir: scripts_dir.clone(),
+            integrity,
             socket_dir: socket_dir.clone(),
             env_vars: HashMap::new(),
             extra_args: HashMap::new(),
@@ -143,6 +165,38 @@ impl Worker {
     /// Spawn the Python worker process and start its control-plane listener.
     /// Returns the unique worker ID on success.
     pub async fn spawn(&mut self) -> Result<String, String> {
+        self.integrity.perform_check()?;
+
+        let scripts_dir = self.integrity.scripts_dir.canonicalize().map_err(|error| {
+            format!(
+                "Failed to resolve scripts directory '{}': {}",
+                self.integrity.scripts_dir.display(),
+                error
+            )
+        })?;
+        let script_file = scripts_dir.join(format!("{}.py", self.script));
+        if !script_file.is_file() {
+            return Err(format!(
+                "Worker script does not exist: '{}'",
+                script_file.display()
+            ));
+        }
+
+        let uv_path = if self.integrity.uv_path.is_absolute()
+            || self.integrity.uv_path.components().count() == 1
+        {
+            self.integrity.uv_path.clone()
+        } else {
+            self.integrity.uv_path.canonicalize().map_err(|error| {
+                format!(
+                    "Failed to resolve uv executable '{}': {}",
+                    self.integrity.uv_path.display(),
+                    error
+                )
+            })?
+        };
+        let lock_file = script_file.with_extension("py.lock");
+
         let identity = WorkerIdentity::new(&self.script);
         let sock_path = self.socket_dir.join(&identity.sock_file);
 
@@ -182,18 +236,15 @@ impl Worker {
         );
         let sender = plane.start();
 
-        // Resolve the Python executable
-        let py_executable = if cfg!(windows) {
-            self.venv_path.join("Scripts/python.exe")
-        } else {
-            self.venv_path.join("bin/python")
-        };
-
-        // Resolve the script path
-        let script_file = self.scripts_dir.join(format!("{}.py", self.script));
-
-        let mut cmd = std::process::Command::new(&py_executable);
-        cmd.arg(&script_file).arg(&sock_path).arg(&identity.name); // Pass worker name as third argument
+        let mut cmd = std::process::Command::new(&uv_path);
+        cmd.arg("run").arg("--no-project");
+        if lock_file.is_file() {
+            cmd.arg("--locked");
+        }
+        cmd.arg("--script")
+            .arg(&script_file)
+            .arg(&sock_path)
+            .arg(&identity.name);
 
         // Pass extra arguments as --key=value format
         for (key, value) in &self.extra_args {
@@ -205,7 +256,7 @@ impl Worker {
         // importable via `from bridge.worker import ...`.
         // Python sets sys.path[0] to the script's own directory, so we must
         // also inject the parent into PYTHONPATH.
-        if let Some(parent) = self.scripts_dir.parent() {
+        if let Some(parent) = scripts_dir.parent() {
             cmd.current_dir(parent);
             cmd.env("PYTHONPATH", parent);
         }
@@ -214,9 +265,18 @@ impl Worker {
             cmd.env(k, v);
         }
 
-        let child = cmd
-            .spawn()
-            .map_err(|e| format!("Failed to start worker process: {}", e))?;
+        #[cfg(unix)]
+        cmd.process_group(0);
+
+        let child = cmd.spawn().map_err(|error| {
+            let _ = std::fs::remove_file(&sock_path);
+            format!(
+                "Failed to start worker with uv '{}': {}",
+                self.integrity.uv_path.display(),
+                error
+            )
+        })?;
+        let process_group_id = child.id();
 
         let name = identity.name.clone();
 
@@ -225,6 +285,7 @@ impl Worker {
             identity,
             sock_path: sock_path.clone(),
             sender: sender.clone(),
+            process_group_id,
         };
 
         // Store in the shared map
@@ -248,20 +309,95 @@ impl Worker {
 
     /// Request graceful termination, then force-kill the process if necessary.
     pub async fn terminate(&self) -> Result<(), String> {
-        self.send_message(Envelope::terminate()).await?;
+        let send_result = self.send_message(Envelope::terminate()).await;
 
-        // Give the worker a moment to shut down cleanly
-        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+        if send_result.is_ok() {
+            // Give the worker a moment to shut down cleanly
+            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+        }
 
         // Force-kill if still running
-        if let Some(ref wid) = self.worker_id {
+        if let Some(wid) = &self.worker_id {
             let mut workers = self.workers.write().await;
             if let Some(mut handle) = workers.remove(wid) {
-                let _ = handle.child.kill();
+                force_stop_worker(&mut handle);
                 let _ = std::fs::remove_file(&handle.sock_path);
             }
         }
 
-        Ok(())
+        send_result
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::process::CommandExt;
+    use std::time::{Duration, Instant};
+    use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn terminate_cleans_up_worker_when_message_delivery_fails() {
+        let workers = Arc::new(RwLock::new(HashMap::new()));
+        let integrity = Arc::new(IntegrityChecker::new(".", "uv"));
+        let mut worker = Worker::new(
+            "managed",
+            integrity,
+            &PathBuf::from("/tmp/runpy"),
+            None,
+            workers.clone(),
+        );
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let sender = MessageSender::for_testing(tx);
+
+        let mut command = std::process::Command::new("sleep");
+        command.arg("300").process_group(0);
+        let child = command.spawn().unwrap();
+        let pid = child.id();
+        let worker_id = format!("failed-delivery-{pid}");
+        let sock_path = PathBuf::from(format!("/tmp/runpy/rp_{worker_id}.sock"));
+        std::fs::create_dir_all("/tmp/runpy").unwrap();
+        std::fs::write(&sock_path, []).unwrap();
+
+        worker.worker_id = Some(worker_id.clone());
+        worker.sender = Some(sender.clone());
+        workers.write().await.insert(
+            worker_id.clone(),
+            WorkerHandle {
+                child,
+                identity: WorkerIdentity {
+                    name: worker_id.clone(),
+                    sock_file: sock_path.file_name().unwrap().to_str().unwrap().to_string(),
+                },
+                sock_path: sock_path.clone(),
+                sender,
+                process_group_id: pid,
+            },
+        );
+
+        let started = Instant::now();
+        let result = worker.terminate().await;
+        let elapsed = started.elapsed();
+        let worker_removed = !workers.read().await.contains_key(&worker_id);
+        let process_stopped = unsafe { libc::kill(pid as libc::pid_t, 0) } != 0;
+        let socket_removed = !sock_path.exists();
+
+        if let Some(mut handle) = workers.write().await.remove(&worker_id) {
+            force_stop_worker(&mut handle);
+            let _ = std::fs::remove_file(&handle.sock_path);
+        }
+
+        assert_eq!(
+            result,
+            Err("Failed to send envelope to worker: channel closed".to_string())
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "failed delivery waited for graceful shutdown"
+        );
+        assert!(worker_removed);
+        assert!(process_stopped);
+        assert!(socket_removed);
     }
 }

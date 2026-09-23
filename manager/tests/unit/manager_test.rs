@@ -1,214 +1,341 @@
-/// Unit tests for the Manager (lib.rs) and Worker (manager.rs).
-///
-/// These tests exercise the public API: Manager creation, Worker builder
-/// pattern, message sending before/after spawn, env vars, handlers, and
-/// the Manager Drop behaviour.
 use runpy::{Envelope, Manager, Worker, WorkerIdentity};
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+use tempfile::TempDir;
 
-// ─── WorkerIdentity ────────────────────────────────────────────────────
+fn write_executable(tmp: &TempDir, name: &str, body: &str) -> PathBuf {
+    let path = tmp.path().join(name);
+    fs::write(&path, body).unwrap();
+    let mut permissions = fs::metadata(&path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&path, permissions).unwrap();
+    path
+}
+
+fn fake_uv(tmp: &TempDir) -> PathBuf {
+    write_executable(
+        tmp,
+        "uv",
+        "#!/bin/sh\n[ \"$1\" = \"--version\" ] && exit 0\nexit 1\n",
+    )
+}
+
+fn scripts_dir(tmp: &TempDir, names: &[&str]) -> PathBuf {
+    let scripts = tmp.path().join("scripts");
+    fs::create_dir_all(&scripts).unwrap();
+    for name in names {
+        fs::write(scripts.join(format!("{name}.py")), "# stub").unwrap();
+    }
+    scripts
+}
+
+fn manager_with_uv(scripts: &Path, uv: &Path) -> Manager {
+    Manager::with_uv_path(scripts.to_str().unwrap(), uv.to_str().unwrap())
+}
+
+async fn wait_for_file(path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {}",
+            path.display()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[cfg(unix)]
+fn process_exists(pid: u32) -> bool {
+    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(target_os = "linux")]
+fn process_is_stopped(pid: u32) -> bool {
+    let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return !process_exists(pid);
+    };
+    let Some((_, fields)) = stat.rsplit_once(") ") else {
+        return false;
+    };
+
+    matches!(fields.as_bytes().first().copied(), Some(b'Z' | b'X'))
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn process_is_stopped(pid: u32) -> bool {
+    !process_exists(pid)
+}
+
+#[cfg(unix)]
+async fn wait_for_process_exit(pid: u32) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while process_exists(pid) {
+        assert!(
+            Instant::now() < deadline,
+            "process {pid} survived worker termination"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
 
 #[test]
 fn worker_identity_contains_script_name() {
     let id = WorkerIdentity::new("my_script");
-    assert!(
-        id.name.starts_with("my_script_"),
-        "Identity name should start with the script name, got: {}",
-        id.name
-    );
-}
-
-#[test]
-fn worker_identity_sock_file_has_prefix_and_suffix() {
-    let id = WorkerIdentity::new("test");
+    assert!(id.name.starts_with("my_script_"));
     assert!(id.sock_file.starts_with("rp_"));
     assert!(id.sock_file.ends_with(".sock"));
 }
 
 #[test]
 fn worker_identity_is_unique() {
-    let id1 = WorkerIdentity::new("same");
-    let id2 = WorkerIdentity::new("same");
-    // The random suffix makes them different (overwhelmingly likely)
-    assert_ne!(id1.name, id2.name);
-    assert_ne!(id1.sock_file, id2.sock_file);
-}
-
-#[test]
-fn worker_identity_clone() {
-    let id = WorkerIdentity::new("cloneable");
-    let cloned = id.clone();
-    assert_eq!(id.name, cloned.name);
-    assert_eq!(id.sock_file, cloned.sock_file);
-}
-
-// ─── Manager creation ──────────────────────────────────────────────────
-
-#[tokio::test]
-async fn manager_new_with_invalid_venv_does_not_panic() {
-    // Manager::new logs an error but does not panic
-    let _manager = Manager::new("/nonexistent/venv", "/nonexistent/scripts");
-    // If we get here, it didn't panic — that's the test.
+    let first = WorkerIdentity::new("same");
+    let second = WorkerIdentity::new("same");
+    assert_ne!(first.name, second.name);
+    assert_ne!(first.sock_file, second.sock_file);
 }
 
 #[tokio::test]
-async fn manager_new_with_valid_paths() {
-    let tmp = tempfile::TempDir::new().unwrap();
+async fn manager_accepts_uv_and_scripts_paths() {
+    let tmp = TempDir::new().unwrap();
+    let uv = fake_uv(&tmp);
+    let scripts = scripts_dir(&tmp, &["hello"]);
+    let manager = manager_with_uv(&scripts, &uv);
 
-    // Create a fake venv
-    let venv = tmp.path().join("venv");
-    let bin = venv.join("bin");
-    std::fs::create_dir_all(&bin).unwrap();
-    std::os::unix::fs::symlink("/bin/sh", bin.join("python")).unwrap();
-
-    // Create a scripts dir
-    let scripts = tmp.path().join("scripts");
-    std::fs::create_dir_all(&scripts).unwrap();
-    std::fs::write(scripts.join("hello.py"), "# stub").unwrap();
-
-    let manager = Manager::new(venv.to_str().unwrap(), scripts.to_str().unwrap());
-
-    // check_integrity should succeed
     assert!(manager.check_integrity().is_ok());
 }
 
-// ─── Manager::check_integrity ──────────────────────────────────────────
-
 #[tokio::test]
-async fn check_integrity_fails_on_invalid_venv() {
-    let manager = Manager::new("/nonexistent/venv", "/nonexistent/scripts");
-    let result = manager.check_integrity();
-    assert!(result.is_err());
-}
+async fn worker_builder_methods_are_chainable() {
+    let tmp = TempDir::new().unwrap();
+    let uv = fake_uv(&tmp);
+    let scripts = scripts_dir(&tmp, &["test"]);
+    let manager = manager_with_uv(&scripts, &uv);
+    let mut worker: Worker = manager.worker("test");
 
-// ─── Manager::on_message ───────────────────────────────────────────────
-
-#[tokio::test]
-async fn manager_on_message_registers_handler() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let venv = tmp.path().join("venv");
-    std::fs::create_dir_all(venv.join("bin")).unwrap();
-    std::os::unix::fs::symlink("/bin/sh", venv.join("bin/python")).unwrap();
-    let scripts = tmp.path().join("scripts");
-    std::fs::create_dir_all(&scripts).unwrap();
-
-    let mut manager = Manager::new(venv.to_str().unwrap(), scripts.to_str().unwrap());
-
-    let called = Arc::new(AtomicBool::new(false));
-    let called_clone = called.clone();
-
-    manager.on_message(move |_envelope| {
-        called_clone.store(true, Ordering::SeqCst);
-    });
-
-    // We can't trigger the handler without a real worker connection,
-    // but we can verify the manager accepts the handler without error.
-    // The handler is tested more thoroughly in the integration test.
-}
-
-// ─── Manager::worker (builder) ─────────────────────────────────────────
-
-#[tokio::test]
-async fn manager_worker_returns_worker_builder() {
-    let manager = Manager::new("/fake/venv", "/fake/scripts");
-    let _worker: Worker = manager.worker("some_script");
-    // If this compiles and runs, the builder was created.
-}
-
-// ─── Worker builder methods ────────────────────────────────────────────
-
-#[tokio::test]
-async fn worker_env_is_chainable() {
-    let manager = Manager::new("/fake/venv", "/fake/scripts");
-    let mut worker = manager.worker("test");
-    // env() returns &mut Self, so chaining should work
-    worker.env("A", "1").env("B", "2").env("C", "3");
-    // No panic = success
+    worker
+        .env("A", "1")
+        .env("B", "2")
+        .arg("mode", "test")
+        .on_message(|_| {});
 }
 
 #[tokio::test]
-async fn worker_on_message_is_chainable() {
-    let manager = Manager::new("/fake/venv", "/fake/scripts");
-    let mut worker = manager.worker("test");
-    worker.on_message(|_env| {
-        println!("handler 1");
-    });
-    // Setting a new handler replaces the old one (no panic)
-    worker.on_message(|_env| {
-        println!("handler 2");
-    });
-}
-
-// ─── Worker::send_message before spawn ─────────────────────────────────
-
-#[tokio::test]
-async fn send_message_before_spawn_returns_error() {
-    let manager = Manager::new("/fake/venv", "/fake/scripts");
+async fn send_and_terminate_before_spawn_return_errors() {
+    let tmp = TempDir::new().unwrap();
+    let uv = fake_uv(&tmp);
+    let scripts = scripts_dir(&tmp, &["test"]);
+    let manager = manager_with_uv(&scripts, &uv);
     let worker = manager.worker("test");
 
-    let result = worker.send_message(Envelope::terminate()).await;
-    assert!(result.is_err());
-    assert!(result.unwrap_err().contains("not been spawned"));
-}
+    let send_error = worker
+        .send_message(Envelope::terminate())
+        .await
+        .unwrap_err();
+    assert!(send_error.contains("not been spawned"));
 
-// ─── Worker::terminate before spawn ────────────────────────────────────
+    let terminate_error = worker.terminate().await.unwrap_err();
+    assert!(terminate_error.contains("not been spawned"));
+}
 
 #[tokio::test]
-async fn terminate_before_spawn_returns_error() {
-    let manager = Manager::new("/fake/venv", "/fake/scripts");
-    let worker = manager.worker("test");
+async fn spawn_rejects_missing_worker_script_before_binding() {
+    let tmp = TempDir::new().unwrap();
+    let uv = fake_uv(&tmp);
+    let scripts = scripts_dir(&tmp, &[]);
+    let manager = manager_with_uv(&scripts, &uv);
+    let mut worker = manager.worker("missing");
 
-    let result = worker.terminate().await;
-    assert!(result.is_err());
-    assert!(result.unwrap_err().contains("not been spawned"));
+    assert_eq!(
+        worker.spawn().await,
+        Err(format!(
+            "Worker script does not exist: '{}'",
+            scripts.join("missing.py").display()
+        ))
+    );
 }
 
-// ─── Worker::spawn with nonexistent python ─────────────────────────────
-
+#[cfg(unix)]
 #[tokio::test]
-async fn spawn_with_nonexistent_python_returns_error() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let scripts = tmp.path().join("scripts");
-    std::fs::create_dir_all(&scripts).unwrap();
-    std::fs::write(scripts.join("test.py"), "# stub").unwrap();
+async fn uv_runner_receives_worker_arguments_and_termination_kills_process_group() {
+    let tmp = TempDir::new().unwrap();
+    let args_file = tmp.path().join("args");
+    let descendant_file = tmp.path().join("descendant-pid");
+    let uv = write_executable(
+        &tmp,
+        "uv",
+        r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+    echo "uv 0.11.2"
+    exit 0
+fi
+printf '%s\n' "$@" > "$RUNPY_TEST_ARGS"
+sleep 300 &
+descendant=$!
+printf '%s' "$descendant" > "$RUNPY_TEST_DESCENDANT"
+wait "$descendant"
+"#,
+    );
+    let scripts = scripts_dir(&tmp, &["managed"]);
+    let manager = manager_with_uv(&scripts, &uv);
+    let mut worker = manager.worker("managed");
+    worker
+        .env("RUNPY_TEST_ARGS", args_file.to_str().unwrap())
+        .env("RUNPY_TEST_DESCENDANT", descendant_file.to_str().unwrap())
+        .arg("mode", "test");
 
-    // Socket dir must exist
-    std::fs::create_dir_all("/tmp/runpy").ok();
+    let worker_id = worker.spawn().await.unwrap();
+    wait_for_file(&args_file).await;
+    wait_for_file(&descendant_file).await;
 
-    let manager = Manager::new("/nonexistent/venv", scripts.to_str().unwrap());
-    let mut worker = manager.worker("test");
-    let result = worker.spawn().await;
-    // Should fail — either the socket bind fails (if /tmp/runpy was cleaned)
-    // or the python binary is not found. Either way it must be an error.
-    assert!(result.is_err(), "Expected error, got Ok({:?})", result.ok());
+    let arguments: Vec<_> = fs::read_to_string(&args_file)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(&arguments[0..3], ["run", "--no-project", "--script"]);
+    assert!(!arguments.iter().any(|argument| argument == "--locked"));
+    assert_eq!(arguments[3], scripts.join("managed.py").to_str().unwrap());
+    assert!(arguments[4].starts_with("/tmp/runpy/rp_managed_"));
+    assert_eq!(arguments[5], worker_id);
+    assert_eq!(arguments[6], "--mode=test");
+
+    let uv_pid = manager.dog.report_worker(&worker_id).await.unwrap().pid;
+    let descendant_pid: u32 = fs::read_to_string(&descendant_file)
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(process_exists(uv_pid));
+    assert!(process_exists(descendant_pid));
+
+    worker.terminate().await.unwrap();
+    wait_for_process_exit(uv_pid).await;
+    wait_for_process_exit(descendant_pid).await;
 }
 
-// ─── Manager Drop does not panic ───────────────────────────────────────
+#[cfg(unix)]
+#[tokio::test]
+async fn relative_runtime_paths_are_absolutized_and_adjacent_lock_is_enforced() {
+    let current_dir = std::env::current_dir().unwrap();
+    let tmp = tempfile::Builder::new()
+        .prefix(".runpy-relative-")
+        .tempdir_in(&current_dir)
+        .unwrap();
+    let args_file = tmp.path().join("args");
+    let uv = write_executable(
+        &tmp,
+        "uv",
+        r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+    echo "uv 0.11.2"
+    exit 0
+fi
+printf '%s\n' "$@" > "$RUNPY_TEST_ARGS"
+"#,
+    );
+    let scripts = scripts_dir(&tmp, &["managed"]);
+    fs::write(scripts.join("managed.py.lock"), "locked").unwrap();
+
+    let relative_uv = uv.strip_prefix(&current_dir).unwrap();
+    let relative_scripts = scripts.strip_prefix(&current_dir).unwrap();
+    let manager = manager_with_uv(relative_scripts, relative_uv);
+    let mut worker = manager.worker("managed");
+    worker.env("RUNPY_TEST_ARGS", args_file.to_str().unwrap());
+
+    let worker_id = worker.spawn().await.unwrap();
+    wait_for_file(&args_file).await;
+
+    let arguments: Vec<_> = fs::read_to_string(&args_file)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(
+        &arguments[0..4],
+        ["run", "--no-project", "--locked", "--script"]
+    );
+    assert_eq!(
+        arguments[4],
+        scripts
+            .canonicalize()
+            .unwrap()
+            .join("managed.py")
+            .to_str()
+            .unwrap()
+    );
+    assert!(arguments[5].starts_with("/tmp/runpy/rp_managed_"));
+    assert_eq!(arguments[6], worker_id);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn watchdog_cleanup_kills_descendants_after_uv_exits() {
+    let tmp = TempDir::new().unwrap();
+    let descendant_file = tmp.path().join("descendant-pid");
+    let uv = write_executable(
+        &tmp,
+        "uv",
+        r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+    echo "uv 0.11.2"
+    exit 0
+fi
+sleep 300 &
+printf '%s' "$!" > "$RUNPY_TEST_DESCENDANT"
+exit 0
+"#,
+    );
+    let scripts = scripts_dir(&tmp, &["managed"]);
+    let manager = manager_with_uv(&scripts, &uv);
+    let mut worker = manager.worker("managed");
+    worker.env("RUNPY_TEST_DESCENDANT", descendant_file.to_str().unwrap());
+
+    let worker_id = worker.spawn().await.unwrap();
+    let socket_path = PathBuf::from(format!("/tmp/runpy/rp_{worker_id}.sock"));
+    wait_for_file(&descendant_file).await;
+    let descendant_pid: u32 = fs::read_to_string(&descendant_file)
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(process_exists(descendant_pid));
+    assert!(socket_path.exists());
+
+    worker.dog.start_monitoring(1);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let worker_removed = manager.dog.report_worker(&worker_id).await.is_none();
+        if worker_removed && process_is_stopped(descendant_pid) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "watchdog did not remove worker and stop descendant process"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    assert!(!socket_path.exists());
+}
 
 #[tokio::test]
 async fn manager_drop_does_not_panic_without_workers() {
-    let manager = Manager::new("/fake/venv", "/fake/scripts");
+    let tmp = TempDir::new().unwrap();
+    let uv = fake_uv(&tmp);
+    let scripts = scripts_dir(&tmp, &[]);
+    let manager = manager_with_uv(&scripts, &uv);
+
     drop(manager);
-    // No panic = success
 }
 
 #[tokio::test]
-async fn manager_drop_does_not_panic_in_async_context() {
-    {
-        let _manager = Manager::new("/fake/venv", "/fake/scripts");
-        // Manager is dropped at end of this block, inside an async runtime.
-    }
-    // If we reach here, try_write() in Drop worked without panicking.
-}
+async fn watchdog_report_is_empty_without_workers() {
+    let tmp = TempDir::new().unwrap();
+    let uv = fake_uv(&tmp);
+    let scripts = scripts_dir(&tmp, &[]);
+    let manager = manager_with_uv(&scripts, &uv);
 
-// ─── Watchdog report on empty manager ──────────────────────────────────
-
-#[tokio::test]
-async fn watchdog_report_empty_when_no_workers() {
-    let manager = Manager::new("/fake/venv", "/fake/scripts");
-    let reports = manager.dog.report().await;
-    assert!(reports.is_empty());
+    assert!(manager.dog.report().await.is_empty());
 }
