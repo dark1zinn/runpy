@@ -53,6 +53,23 @@ fn process_exists(pid: u32) -> bool {
     result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
+#[cfg(target_os = "linux")]
+fn process_is_stopped(pid: u32) -> bool {
+    let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return !process_exists(pid);
+    };
+    let Some((_, fields)) = stat.rsplit_once(") ") else {
+        return false;
+    };
+
+    matches!(fields.as_bytes().first().copied(), Some(b'Z' | b'X'))
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn process_is_stopped(pid: u32) -> bool {
+    !process_exists(pid)
+}
+
 #[cfg(unix)]
 async fn wait_for_process_exit(pid: u32) {
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -290,7 +307,7 @@ exit 0
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
         let worker_removed = manager.dog.report_worker(&worker_id).await.is_none();
-        if worker_removed && !process_exists(descendant_pid) {
+        if worker_removed && process_is_stopped(descendant_pid) {
             break;
         }
         assert!(
