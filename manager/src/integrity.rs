@@ -80,7 +80,7 @@ impl IntegrityChecker {
 
         scribbler().debug_with(
             "Integrity",
-            &format!("Indexed {} scripts: {:?}", scripts.len(), scripts)
+            &format!("Indexed {} scripts: {:?}", scripts.len(), scripts),
         );
     }
 

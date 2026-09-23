@@ -1,8 +1,8 @@
+use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tokio::time::{interval, Duration};
-use serde::Serialize;
+use tokio::time::{Duration, interval};
 
 use crate::manager::WorkerHandle;
 use crate::scribbler::scribbler;
@@ -58,7 +58,7 @@ impl WatchdogService {
                                     handle.identity.name,
                                     handle.child.id(),
                                     status
-                                )
+                                ),
                             );
                             dead_ids.push(id.clone());
                         }
@@ -68,7 +68,7 @@ impl WatchdogService {
                         Err(e) => {
                             scribbler().error_with(
                                 "Watchdog",
-                                &format!("Error checking worker '{}': {}", handle.identity.name, e)
+                                &format!("Error checking worker '{}': {}", handle.identity.name, e),
                             );
                             dead_ids.push(id.clone());
                         }
@@ -80,7 +80,10 @@ impl WatchdogService {
                     let handle = workers.remove(&id);
                     if let Some(h) = handle {
                         let _ = std::fs::remove_file(&h.sock_path);
-                        scribbler().info_with("Watchdog", &format!("Removed dead worker '{}'", h.identity.name));
+                        scribbler().info_with(
+                            "Watchdog",
+                            &format!("Removed dead worker '{}'", h.identity.name),
+                        );
                     }
                 }
             }
@@ -141,11 +144,7 @@ impl WatchdogService {
     fn read_proc_status(pid: u32) -> Option<String> {
         // Fallback: check if process exists via kill(pid, 0)
         let ret = unsafe { libc::kill(pid as i32, 0) };
-        if ret == 0 {
-            Some(String::new())
-        } else {
-            None
-        }
+        if ret == 0 { Some(String::new()) } else { None }
     }
 
     #[cfg(target_os = "linux")]

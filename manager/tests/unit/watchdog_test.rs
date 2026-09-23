@@ -39,7 +39,11 @@ async fn watchdog_new_creates_empty_service() {
 async fn report_returns_empty_vec_with_no_workers() {
     let manager = runpy::Manager::new("/fake/venv", "/fake/scripts");
     let reports = manager.dog.report().await;
-    assert!(reports.is_empty(), "Expected no reports, got {:?}", reports.len());
+    assert!(
+        reports.is_empty(),
+        "Expected no reports, got {:?}",
+        reports.len()
+    );
 }
 
 // ─── report_worker() on missing ID ────────────────────────────────────
