@@ -104,7 +104,7 @@ async fn main() {
     }
 
     // ── 4. Let it run, then shut down ────────────────────────────
-
+    // TODO: make so main process only exits when all workers are done or explicitly signaled/terminated, instead of just sleeping for a bit
     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
 
     // Check health via watchdog
