@@ -97,7 +97,17 @@ class Worker:
 
         log_meta = dict(meta or {})
         log_meta["level"] = level
-        self._send_operation("log", data, meta=log_meta)
+        try:
+            self._send_operation("log", data, meta=log_meta)
+        except OSError:
+            try:
+                print(
+                    f"[runpy-log-fallback][level={level}] {data!r}",
+                    flush=True,
+                )
+            except OSError:
+                pass
+            raise
 
     def handle_envelope(self, envelope: Envelope) -> None:
         """Handle an application-defined envelope."""
