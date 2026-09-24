@@ -188,6 +188,8 @@ fn validate_wire_meta(meta: &Meta) -> Result<(), EnvelopeError> {
     Ok(())
 }
 
+/// Accept a missing operation or one allowed for the given message direction.
+/// Return `EnvelopeError::WrongDirection` with `direction` for any other operation.
 fn validate_direction(
     operation: Option<&str>,
     allowed: &[&str],

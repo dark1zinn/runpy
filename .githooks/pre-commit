@@ -4,6 +4,7 @@ set -eu
 repo_root=$(git rev-parse --show-toplevel)
 cd "$repo_root"
 
+# Return success for matching staged changes or a Git diff error.
 has_staged_changes() {
     ! git diff --cached --quiet -- "$@"
 }

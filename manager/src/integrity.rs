@@ -89,6 +89,9 @@ impl IntegrityChecker {
         );
     }
 
+    /// Add `.py` path stems from `dir` and its subdirectories to `scripts`,
+    /// excluding names starting with `__`. Skip unreadable entries and
+    /// directories, as well as stems that are not valid UTF-8.
     fn walk_dir(&self, dir: &PathBuf, scripts: &mut HashSet<String>) {
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {

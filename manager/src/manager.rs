@@ -101,6 +101,9 @@ pub struct Worker {
 }
 
 impl Worker {
+    /// Create an unspawned worker builder for `script`, using `socket_dir` as
+    /// the base directory for its control socket. Share the manager's integrity
+    /// checker, global message handler, and running-worker registry.
     pub(crate) fn new(
         script: &str,
         integrity: Arc<IntegrityChecker>,
