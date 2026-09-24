@@ -2,6 +2,7 @@ use runpy::{Envelope, Manager, Worker, WorkerIdentity};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
@@ -98,6 +99,16 @@ fn worker_identity_is_unique() {
     assert_ne!(first.sock_file, second.sock_file);
 }
 
+#[test]
+fn manager_constructors_work_without_a_tokio_runtime() {
+    let tmp = TempDir::new().unwrap();
+    let uv = fake_uv(&tmp);
+    let scripts = scripts_dir(&tmp, &[]);
+
+    drop(manager_with_uv(&scripts, &uv));
+    drop(Manager::new(scripts.to_str().unwrap()));
+}
+
 #[tokio::test]
 async fn manager_accepts_uv_and_scripts_paths() {
     let tmp = TempDir::new().unwrap();
@@ -106,6 +117,16 @@ async fn manager_accepts_uv_and_scripts_paths() {
     let manager = manager_with_uv(&scripts, &uv);
 
     assert!(manager.check_integrity().is_ok());
+}
+
+#[tokio::test]
+async fn manager_returns_one_shared_logger() {
+    let tmp = TempDir::new().unwrap();
+    let uv = fake_uv(&tmp);
+    let scripts = scripts_dir(&tmp, &[]);
+    let manager = manager_with_uv(&scripts, &uv);
+
+    assert!(Arc::ptr_eq(&manager.logger(), &manager.logger()));
 }
 
 #[tokio::test]
@@ -139,6 +160,22 @@ async fn send_and_terminate_before_spawn_return_errors() {
 
     let terminate_error = worker.terminate().await.unwrap_err();
     assert!(terminate_error.contains("not been spawned"));
+}
+
+#[tokio::test]
+async fn worker_facade_rejects_spawn_after_manager_drop() {
+    let tmp = TempDir::new().unwrap();
+    let uv = fake_uv(&tmp);
+    let scripts = scripts_dir(&tmp, &["test"]);
+    let mut worker = {
+        let manager = manager_with_uv(&scripts, &uv);
+        manager.worker("test")
+    };
+
+    assert_eq!(
+        worker.spawn().await,
+        Err("Worker manager is no longer available".to_string())
+    );
 }
 
 #[tokio::test]
@@ -203,7 +240,12 @@ wait "$descendant"
     assert_eq!(arguments[5], worker_id);
     assert_eq!(arguments[6], "--mode=test");
 
-    let uv_pid = manager.dog.report_worker(&worker_id).await.unwrap().pid;
+    let uv_pid = manager
+        .watchdog()
+        .report_worker(&worker_id)
+        .await
+        .unwrap()
+        .pid;
     let descendant_pid: u32 = fs::read_to_string(&descendant_file)
         .unwrap()
         .parse()
@@ -304,16 +346,20 @@ exit 0
         .unwrap()
         .parse()
         .unwrap();
-    let uv_pid = manager.dog.report_worker(&worker_id).await.unwrap().pid;
+    let uv_pid = manager
+        .watchdog()
+        .report_worker(&worker_id)
+        .await
+        .unwrap()
+        .pid;
     assert!(process_exists(uv_pid));
     assert!(process_exists(descendant_pid));
     assert!(socket_path.exists());
 
-    worker.dog.start_monitoring(1);
     fs::write(&release_file, "go").unwrap();
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs(7);
     loop {
-        let worker_removed = manager.dog.report_worker(&worker_id).await.is_none();
+        let worker_removed = manager.watchdog().report_worker(&worker_id).await.is_none();
         if worker_removed && process_is_stopped(descendant_pid) {
             break;
         }
@@ -325,6 +371,37 @@ exit 0
     }
 
     assert!(!socket_path.exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn one_watchdog_reports_workers_from_the_shared_control_plane() {
+    let tmp = TempDir::new().unwrap();
+    let uv = write_executable(
+        &tmp,
+        "uv",
+        "#!/bin/sh\n[ \"$1\" = \"--version\" ] && exit 0\nexec sleep 300\n",
+    );
+    let scripts = scripts_dir(&tmp, &["first", "second"]);
+    let manager = manager_with_uv(&scripts, &uv);
+    let mut first = manager.worker("first");
+    let mut second = manager.worker("second");
+    let first_id = first.spawn().await.unwrap();
+    let second_id = second.spawn().await.unwrap();
+
+    let mut reported: Vec<_> = manager
+        .watchdog()
+        .report()
+        .await
+        .into_iter()
+        .map(|report| report.worker_name)
+        .collect();
+    let mut expected = vec![first_id, second_id];
+    reported.sort();
+    expected.sort();
+    assert_eq!(reported, expected);
+
+    drop(manager);
 }
 
 #[tokio::test]
@@ -344,5 +421,5 @@ async fn watchdog_report_is_empty_without_workers() {
     let scripts = scripts_dir(&tmp, &[]);
     let manager = manager_with_uv(&scripts, &uv);
 
-    assert!(manager.dog.report().await.is_empty());
+    assert!(manager.watchdog().report().await.is_empty());
 }

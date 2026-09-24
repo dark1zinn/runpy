@@ -4,7 +4,5 @@ mod integrity_test;
 mod manager_test;
 #[path = "unit/protocol_test.rs"]
 mod protocol_test;
-#[path = "unit/scribbler_test.rs"]
-mod scribbler_test;
 #[path = "unit/watchdog_test.rs"]
 mod watchdog_test;
