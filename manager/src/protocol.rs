@@ -6,7 +6,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
 
-use crate::scribbler::scribbler;
+use crate::scribbler::Scribbler;
 
 pub type Meta = Map<String, Value>;
 pub type Data = Map<String, Value>;
@@ -220,24 +220,34 @@ pub struct InboundEnvelope {
 pub struct Mailer {
     tx: mpsc::Sender<Envelope>,
     worker_id: String,
+    logger: Arc<Scribbler>,
 }
 
 impl Mailer {
-    fn new(tx: mpsc::Sender<Envelope>, worker_id: String) -> Self {
-        Self { tx, worker_id }
+    fn new(tx: mpsc::Sender<Envelope>, worker_id: String, logger: Arc<Scribbler>) -> Self {
+        Self {
+            tx,
+            worker_id,
+            logger,
+        }
     }
 
     #[doc(hidden)]
     pub fn for_testing(worker_id: String) -> Self {
         let (tx, _rx) = mpsc::channel::<Envelope>(1);
-        Self { tx, worker_id }
+        Self {
+            tx,
+            worker_id,
+            logger: Arc::new(Scribbler::new()),
+        }
     }
 
     pub fn send(&self, envelope: Envelope) {
         let tx = self.tx.clone();
+        let logger = self.logger.clone();
         tokio::spawn(async move {
             if let Err(error) = tx.send(envelope).await {
-                scribbler().error_with("Mailer", &format!("Failed to send envelope: {error}"));
+                logger.error_with("Mailer", &format!("Failed to send envelope: {error}"));
             }
         });
     }
@@ -279,6 +289,7 @@ pub struct ControlPlane {
     socket_path: String,
     global_handler: Option<MessageHandler>,
     worker_handler: Option<MessageHandler>,
+    logger: Arc<Scribbler>,
 }
 
 impl ControlPlane {
@@ -288,6 +299,7 @@ impl ControlPlane {
         socket_path: String,
         global_handler: Option<MessageHandler>,
         worker_handler: Option<MessageHandler>,
+        logger: Arc<Scribbler>,
     ) -> Self {
         Self {
             listener,
@@ -295,6 +307,7 @@ impl ControlPlane {
             socket_path,
             global_handler,
             worker_handler,
+            logger,
         }
     }
 
@@ -312,7 +325,7 @@ impl ControlPlane {
             let (mut stream, _) = match self.listener.accept().await {
                 Ok(connection) => connection,
                 Err(error) => {
-                    scribbler().error_with(
+                    self.logger.error_with(
                         "ControlPlane",
                         &format!("{} Accept error: {error}", self.worker_id),
                     );
@@ -324,19 +337,23 @@ impl ControlPlane {
 
             loop {
                 tokio::select! {
-                    received = Self::recv_envelope(&mut stream) => {
+                    received = self.recv_envelope(&mut stream) => {
                         let Some(mut envelope) = received else {
                             break;
                         };
                         if let Err(error) = envelope.validate_worker_to_manager() {
-                            scribbler().error_with("Protocol", &error.to_string());
+                            self.logger.error_with("Protocol", &error.to_string());
                             break;
                         }
                         envelope.stamp_trusted(&self.worker_id, &self.socket_path);
 
                         let inbound = InboundEnvelope {
                             envelope,
-                            mailer: Mailer::new(response_tx.clone(), self.worker_id.clone()),
+                            mailer: Mailer::new(
+                                response_tx.clone(),
+                                self.worker_id.clone(),
+                                self.logger.clone(),
+                            ),
                         };
 
                         if let Some(handler) = &self.global_handler {
@@ -348,7 +365,7 @@ impl ControlPlane {
                     }
                     Some(envelope) = outbound_rx.recv() => {
                         if let Err(error) = self.write_stamped_envelope(&mut stream, envelope).await {
-                            scribbler().error_with(
+                            self.logger.error_with(
                                 "ControlPlane",
                                 &format!("{} Send error: {error}", self.worker_id),
                             );
@@ -357,7 +374,7 @@ impl ControlPlane {
                     }
                     Some(envelope) = response_rx.recv() => {
                         if let Err(error) = self.write_stamped_envelope(&mut stream, envelope).await {
-                            scribbler().error_with(
+                            self.logger.error_with(
                                 "ControlPlane",
                                 &format!("{} Response send error: {error}", self.worker_id),
                             );
@@ -369,18 +386,19 @@ impl ControlPlane {
         }
     }
 
-    async fn recv_envelope(stream: &mut UnixStream) -> Option<Envelope> {
+    async fn recv_envelope(&self, stream: &mut UnixStream) -> Option<Envelope> {
         let mut size_buf = [0_u8; 8];
         if let Err(error) = stream.read_exact(&mut size_buf).await {
             match error.kind() {
                 std::io::ErrorKind::UnexpectedEof => {}
                 std::io::ErrorKind::ConnectionReset => {
-                    scribbler().debug_with("Socket", "Connection reset by peer");
+                    self.logger.debug_with("Socket", "Connection reset by peer");
                 }
                 std::io::ErrorKind::BrokenPipe => {
-                    scribbler().debug_with("Socket", "Broken pipe - peer closed unexpectedly");
+                    self.logger
+                        .debug_with("Socket", "Broken pipe - peer closed unexpectedly");
                 }
-                _ => scribbler().error_with(
+                _ => self.logger.error_with(
                     "Socket",
                     &format!("Read error: {error} (kind: {:?})", error.kind()),
                 ),
@@ -391,7 +409,7 @@ impl ControlPlane {
         let envelope_size = u64::from_le_bytes(size_buf) as usize;
         let mut envelope_buf = vec![0_u8; envelope_size];
         if let Err(error) = stream.read_exact(&mut envelope_buf).await {
-            scribbler().error_with(
+            self.logger.error_with(
                 "Socket",
                 &format!(
                     "Error reading envelope body: {error} (kind: {:?})",
@@ -405,7 +423,7 @@ impl ControlPlane {
             Ok(envelope) => Some(envelope),
             Err(error) => {
                 let raw = String::from_utf8_lossy(&envelope_buf);
-                scribbler().error_with(
+                self.logger.error_with(
                     "Protocol",
                     &format!("JSON envelope error: {error}\n  Raw: {raw}"),
                 );

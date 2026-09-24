@@ -16,9 +16,8 @@
 //! ## Usage
 //!
 //! ```ignore
-//! use runpy::Scribbler;
-//!
-//! let log = Scribbler::new();
+//! let manager = runpy::Manager::new("./scripts");
+//! let log = manager.logger();
 //! log.info("Worker started");
 //! log.debug("Connection established");
 //! log.error("Failed to connect");
@@ -26,7 +25,6 @@
 
 use chrono::Local;
 use std::env;
-use std::sync::OnceLock;
 
 // ── ANSI Color Codes ───────────────────────────────────────────────────
 
@@ -93,15 +91,6 @@ impl LogLevel {
     }
 }
 
-// ── Global Scribbler Instance ──────────────────────────────────────────
-
-static GLOBAL_SCRIBBLER: OnceLock<Scribbler> = OnceLock::new();
-
-/// Get the global scribbler instance.
-pub fn scribbler() -> &'static Scribbler {
-    GLOBAL_SCRIBBLER.get_or_init(Scribbler::new)
-}
-
 // ── Scribbler ──────────────────────────────────────────────────────────
 
 /// The main logging service for runpy.
@@ -117,15 +106,9 @@ pub struct Scribbler {
     use_colors: bool,
 }
 
-impl Default for Scribbler {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Scribbler {
-    /// Create a new Scribbler, reading configuration from environment variables.
-    pub fn new() -> Self {
+    /// Create a Scribbler from the process environment for a Manager.
+    pub(crate) fn new() -> Self {
         let environment = env::var("ENVIRONMENT").unwrap_or_default();
         let is_dev = environment.eq_ignore_ascii_case("development")
             || environment.eq_ignore_ascii_case("dev");
@@ -148,8 +131,9 @@ impl Scribbler {
         }
     }
 
-    /// Create a Scribbler with a specific log level (useful for testing).
-    pub fn with_level(level: LogLevel) -> Self {
+    #[cfg(test)]
+    /// Create a Scribbler with a specific log level for internal tests.
+    pub(crate) fn with_level(level: LogLevel) -> Self {
         Self {
             level,
             is_dev: false,
@@ -294,31 +278,6 @@ impl Scribbler {
     pub fn level(&self) -> LogLevel {
         self.level
     }
-}
-
-// ── Convenience macros ─────────────────────────────────────────────────
-
-/// Quick access to the global scribbler for logging.
-///
-/// Usage:
-/// ```ignore
-/// use runpy::log;
-/// log!(info, "Server started on port {}", 8080);
-/// log!(error, "Connection failed: {}", err);
-/// log!(debug, Manager, "Worker count: {}", count);
-/// ```
-#[macro_export]
-macro_rules! log {
-    // With component: log!(info, Component, "message {}", arg)
-    ($level:ident, $component:ident, $($arg:tt)*) => {{
-        let msg = format!($($arg)*);
-        $crate::scribbler::scribbler().$level(&format!("[{}] {}", stringify!($component), msg));
-    }};
-    // Without component: log!(info, "message {}", arg)
-    ($level:ident, $($arg:tt)*) => {{
-        let msg = format!($($arg)*);
-        $crate::scribbler::scribbler().$level(&msg);
-    }};
 }
 
 #[cfg(test)]

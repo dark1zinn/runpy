@@ -72,7 +72,7 @@
 mod integrity;
 mod manager;
 mod protocol;
-pub mod scribbler;
+mod scribbler;
 mod watchdog;
 
 use std::collections::HashMap;
@@ -90,7 +90,7 @@ pub use protocol::{
     ControlPlane, Data, Envelope, EnvelopeError, InboundEnvelope, Mailer, MessageHandler,
     MessageSender, Meta,
 };
-pub use scribbler::{LogLevel, Scribbler, scribbler};
+pub use scribbler::{LogLevel, Scribbler};
 pub use watchdog::{ProcessState, WatchdogService as Watchdog, WorkerReport};
 
 // ── Manager ────────────────────────────────────────────────────────────
@@ -111,6 +111,7 @@ pub use watchdog::{ProcessState, WatchdogService as Watchdog, WorkerReport};
 /// ```
 pub struct Manager {
     integrity: Arc<IntegrityChecker>,
+    logger: Arc<Scribbler>,
     workers: Arc<RwLock<HashMap<String, WorkerHandle>>>,
     socket_dir: PathBuf,
     global_handler: Option<MessageHandler>,
@@ -134,24 +135,26 @@ impl Manager {
     /// Use this when uv is packaged outside `PATH`. Runtime behavior is
     /// otherwise identical to [`Manager::new`].
     pub fn with_uv_path(scripts_path: &str, uv_path: &str) -> Self {
-        let integrity = Arc::new(IntegrityChecker::new(scripts_path, uv_path));
+        let logger = Arc::new(Scribbler::new());
+        let integrity = Arc::new(IntegrityChecker::new(scripts_path, uv_path, logger.clone()));
 
         // Run initial integrity check (non-fatal — logs errors)
         if let Err(e) = integrity.perform_check() {
-            scribbler::scribbler().error_with("Manager", &format!("Integrity check failed: {}", e));
+            logger.error_with("Manager", &format!("Integrity check failed: {}", e));
         }
 
         let socket_dir = PathBuf::from("/tmp/runpy");
         let workers: Arc<RwLock<HashMap<String, WorkerHandle>>> =
             Arc::new(RwLock::new(HashMap::new()));
 
-        let dog = WatchdogService::new(workers.clone());
+        let dog = WatchdogService::new(workers.clone(), logger.clone());
 
         // Start background watchdog with a 5-second interval
         dog.start_monitoring(5);
 
         Self {
             integrity,
+            logger,
             workers,
             socket_dir,
             global_handler: None,
@@ -165,9 +168,15 @@ impl Manager {
             script,
             self.integrity.clone(),
             &self.socket_dir,
+            self.logger.clone(),
             self.global_handler.clone(),
             self.workers.clone(),
         )
+    }
+
+    /// Return the Manager-owned logger shared by every Runpy service.
+    pub fn logger(&self) -> Arc<Scribbler> {
+        self.logger.clone()
     }
 
     /// Register a **global** message handler that fires for every message from
@@ -211,7 +220,7 @@ impl Manager {
         for (id, mut handle) in workers.drain() {
             force_stop_worker(&mut handle);
             let _ = std::fs::remove_file(&handle.sock_path);
-            scribbler::scribbler().info_with(
+            self.logger.info_with(
                 "Manager",
                 &format!("Terminated worker: {} ({})", handle.identity.name, id),
             );
@@ -221,7 +230,8 @@ impl Manager {
 
 impl Drop for Manager {
     fn drop(&mut self) {
-        scribbler::scribbler().info_with("Manager", "Shutting down all workers...");
+        self.logger
+            .info_with("Manager", "Shutting down all workers...");
 
         // `try_write()` is non-blocking and safe inside an async runtime
         // (unlike `blocking_write()` which panics on a current-thread runtime).
@@ -230,18 +240,18 @@ impl Drop for Manager {
                 for (id, mut handle) in workers.drain() {
                     force_stop_worker(&mut handle);
                     let _ = std::fs::remove_file(&handle.sock_path);
-                    scribbler::scribbler().info_with(
+                    self.logger.info_with(
                         "Manager",
                         &format!("Terminated worker: {} ({})", handle.identity.name, id),
                     );
                 }
             }
             Err(_) => {
-                scribbler::scribbler()
+                self.logger
                     .warning_with("Manager", "Could not acquire worker lock during shutdown");
             }
         }
 
-        scribbler::scribbler().success("All workers terminated.");
+        self.logger.success("All workers terminated.");
     }
 }

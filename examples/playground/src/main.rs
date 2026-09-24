@@ -1,9 +1,5 @@
-use runpy::{scribbler, Data, Envelope, Manager, Meta};
+use runpy::{Data, Envelope, Manager, Meta};
 use serde_json::{json, Value};
-
-fn log() -> &'static runpy::Scribbler {
-    scribbler()
-}
 
 fn object(value: Value) -> Data {
     value
@@ -18,16 +14,18 @@ async fn main() {
     let scripts_path = format!("{}/worker", manifest_dir);
 
     let mut manager = Manager::new(&scripts_path);
-    log().success("Manager initialized");
+    let logger = manager.logger();
+    logger.success("Manager initialized");
 
-    manager.on_message(|inbound| {
+    let global_logger = logger.clone();
+    manager.on_message(move |inbound| {
         let worker_id = inbound
             .envelope
             .meta()
             .get("x_wid")
             .and_then(Value::as_str)
             .unwrap_or("unknown");
-        log().verbose_with(
+        global_logger.verbose_with(
             "Global",
             &format!("Worker '{worker_id}' -> {:?}", inbound.envelope),
         );
@@ -36,12 +34,13 @@ async fn main() {
     let mut worker = manager.worker("my_script");
     worker.env("MY_ENV_VAR", "some_value");
 
-    worker.on_message(|inbound| {
+    let worker_logger = logger.clone();
+    worker.on_message(move |inbound| {
         let operation = inbound.envelope.meta().get("x_op").and_then(Value::as_str);
 
         match operation {
             Some("ready") => {
-                log().info_with("Worker", "ready");
+                worker_logger.info_with("Worker", "ready");
                 inbound
                     .mailer
                     .send(Envelope::execute(object(json!({"name": "RunPy"}))));
@@ -60,16 +59,16 @@ async fn main() {
                     .get("level")
                     .and_then(Value::as_str)
                     .unwrap_or("info");
-                log().info_with(level, &format!("{:?}", inbound.envelope.data()));
+                worker_logger.info_with(level, &format!("{:?}", inbound.envelope.data()));
             }
             Some("done") => {
-                log().success(&format!("Done: {:?}", inbound.envelope.data()));
+                worker_logger.success(&format!("Done: {:?}", inbound.envelope.data()));
             }
             Some("error") => {
-                log().error_with("Worker", &format!("{:?}", inbound.envelope.data()));
+                worker_logger.error_with("Worker", &format!("{:?}", inbound.envelope.data()));
             }
             None => {
-                log().info_with(
+                worker_logger.info_with(
                     "Custom",
                     &format!(
                         "meta={:?} data={:?}",
@@ -79,15 +78,15 @@ async fn main() {
                 );
             }
             Some(other) => {
-                log().warning_with("Worker", &format!("Unexpected operation: {other}"));
+                worker_logger.warning_with("Worker", &format!("Unexpected operation: {other}"));
             }
         }
     });
 
     match worker.spawn().await {
-        Ok(id) => log().success(&format!("Worker spawned: {id}")),
+        Ok(id) => logger.success(&format!("Worker spawned: {id}")),
         Err(error) => {
-            log().error(&format!("Failed to spawn worker: {error}"));
+            logger.error(&format!("Failed to spawn worker: {error}"));
             return;
         }
     }
@@ -95,7 +94,7 @@ async fn main() {
     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
 
     for report in manager.dog.report().await {
-        log().info_with(
+        logger.info_with(
             "Health",
             &format!(
                 "[{:?}] {} (pid {})",
@@ -104,5 +103,5 @@ async fn main() {
         );
     }
 
-    log().info("Shutting down...");
+    logger.info("Shutting down...");
 }

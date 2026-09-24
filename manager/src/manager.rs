@@ -11,7 +11,7 @@ use tokio::sync::RwLock;
 
 use crate::integrity::IntegrityChecker;
 use crate::protocol::{ControlPlane, Envelope, MessageHandler, MessageSender};
-use crate::scribbler::scribbler;
+use crate::scribbler::Scribbler;
 use crate::watchdog::WatchdogService;
 
 // ── Worker Identity ────────────────────────────────────────────────────
@@ -83,6 +83,7 @@ pub struct Worker {
     // ── Builder fields (set before spawn) ───────────────────────────
     script: String,
     integrity: Arc<IntegrityChecker>,
+    logger: Arc<Scribbler>,
     socket_dir: PathBuf,
     env_vars: HashMap<String, String>,
     extra_args: HashMap<String, String>,
@@ -108,12 +109,14 @@ impl Worker {
         script: &str,
         integrity: Arc<IntegrityChecker>,
         socket_dir: &Path,
+        logger: Arc<Scribbler>,
         global_handler: Option<MessageHandler>,
         workers: Arc<RwLock<HashMap<String, WorkerHandle>>>,
     ) -> Self {
         Self {
             script: script.to_string(),
             integrity,
+            logger: logger.clone(),
             socket_dir: socket_dir.to_path_buf(),
             env_vars: HashMap::new(),
             extra_args: HashMap::new(),
@@ -121,7 +124,7 @@ impl Worker {
             global_handler,
             worker_id: None,
             sender: None,
-            dog: WatchdogService::new(workers.clone()),
+            dog: WatchdogService::new(workers.clone(), logger.clone()),
             workers,
         }
     }
@@ -220,7 +223,7 @@ impl Worker {
             }
         };
 
-        scribbler().debug_with(
+        self.logger.debug_with(
             "Worker",
             &format!(
                 "Starting '{}' with socket at '{}'",
@@ -236,6 +239,7 @@ impl Worker {
             socket_path,
             self.global_handler.clone(),
             self.worker_handler.clone(),
+            self.logger.clone(),
         );
         let sender = plane.start();
 
@@ -298,7 +302,7 @@ impl Worker {
         self.worker_id = Some(name.clone());
         self.sender = Some(sender);
 
-        scribbler().success(&format!("Spawned worker: {}", name));
+        self.logger.success(&format!("Spawned worker: {}", name));
         Ok(name)
     }
 
@@ -335,6 +339,7 @@ impl Worker {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use crate::scribbler::LogLevel;
     use std::os::unix::process::CommandExt;
     use std::time::{Duration, Instant};
     use tokio::sync::mpsc;
@@ -342,11 +347,13 @@ mod tests {
     #[tokio::test]
     async fn terminate_cleans_up_worker_when_message_delivery_fails() {
         let workers = Arc::new(RwLock::new(HashMap::new()));
-        let integrity = Arc::new(IntegrityChecker::new(".", "uv"));
+        let logger = Arc::new(Scribbler::with_level(LogLevel::Off));
+        let integrity = Arc::new(IntegrityChecker::new(".", "uv", logger.clone()));
         let mut worker = Worker::new(
             "managed",
             integrity,
             &PathBuf::from("/tmp/runpy"),
+            logger,
             None,
             workers.clone(),
         );

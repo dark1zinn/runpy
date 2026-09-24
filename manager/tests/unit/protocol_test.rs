@@ -1,4 +1,7 @@
-use runpy::{ControlPlane, Data, Envelope, EnvelopeError, MessageHandler, MessageSender, Meta};
+use runpy::{
+    ControlPlane, Data, Envelope, EnvelopeError, Manager, MessageHandler, MessageSender, Meta,
+    Scribbler,
+};
 use serde_json::{Value, json};
 use std::sync::{
     Arc,
@@ -16,6 +19,10 @@ fn object(value: Value) -> Data {
         .as_object()
         .cloned()
         .expect("test value must be an object")
+}
+
+fn test_logger() -> Arc<Scribbler> {
+    Manager::with_uv_path("/fake/scripts", "/bin/true").logger()
 }
 
 async fn write_frame(stream: &mut UnixStream, payload: &[u8]) {
@@ -148,6 +155,7 @@ async fn inbound_envelope_gets_trusted_metadata() {
         "/tmp/trusted.sock".into(),
         Some(handler),
         None,
+        test_logger(),
     );
     let _sender = plane.start();
 
@@ -182,6 +190,7 @@ async fn outbound_envelope_gets_trusted_metadata() {
         "/tmp/trusted.sock".into(),
         None,
         None,
+        test_logger(),
     );
     let sender = plane.start();
 
@@ -218,6 +227,7 @@ async fn mailer_reply_uses_stamped_wire_path() {
         "/tmp/trusted.sock".into(),
         None,
         Some(handler),
+        test_logger(),
     );
     let _sender = plane.start();
 
@@ -255,6 +265,7 @@ async fn worker_to_manager_wrong_direction_closes_connection_without_dispatch() 
         "/tmp/worker.sock".into(),
         Some(handler),
         None,
+        test_logger(),
     );
     let _sender = plane.start();
 
@@ -281,6 +292,7 @@ async fn manager_to_worker_wrong_direction_writes_nothing_and_closes_connection(
         "/tmp/worker.sock".into(),
         None,
         None,
+        test_logger(),
     );
     let sender = plane.start();
 

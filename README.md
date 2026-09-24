@@ -245,7 +245,7 @@ uv run ruff format worker/src/runpyrs worker/tests examples/playground/worker/my
 
 ## Environment Variables
 
-The `Scribbler` logger respects these environment variables:
+The Manager-owned `Scribbler` returned by `Manager::logger()` respects these environment variables:
 
 | Variable      | Values                                                         | Description                   |
 | ------------- | -------------------------------------------------------------- | ----------------------------- |

@@ -5,7 +5,7 @@ use tokio::sync::RwLock;
 use tokio::time::{Duration, interval};
 
 use crate::manager::{WorkerHandle, force_stop_worker};
-use crate::scribbler::scribbler;
+use crate::scribbler::Scribbler;
 
 /// The health state of a monitored process.
 #[derive(Debug, Clone, Serialize)]
@@ -30,16 +30,21 @@ pub struct WorkerReport {
 #[derive(Clone)]
 pub struct WatchdogService {
     workers: Arc<RwLock<HashMap<String, WorkerHandle>>>,
+    logger: Arc<Scribbler>,
 }
 
 impl WatchdogService {
-    pub fn new(workers: Arc<RwLock<HashMap<String, WorkerHandle>>>) -> Self {
-        Self { workers }
+    pub fn new(
+        workers: Arc<RwLock<HashMap<String, WorkerHandle>>>,
+        logger: Arc<Scribbler>,
+    ) -> Self {
+        Self { workers, logger }
     }
 
     /// Start a background task that periodically checks every worker.
     /// Dead workers are logged (and could be restarted in the future).
     pub fn start_monitoring(&self, interval_secs: u64) {
+        let logger = self.logger.clone();
         let workers = self.workers.clone();
         tokio::spawn(async move {
             let mut tick = interval(Duration::from_secs(interval_secs));
@@ -51,7 +56,7 @@ impl WatchdogService {
                 for (id, handle) in workers.iter_mut() {
                     match handle.child.try_wait() {
                         Ok(Some(status)) => {
-                            scribbler().warning_with(
+                            logger.warning_with(
                                 "Watchdog",
                                 &format!(
                                     "Worker '{}' (pid {}) exited with status: {}",
@@ -66,7 +71,7 @@ impl WatchdogService {
                             // Still running — healthy as far as OS is concerned
                         }
                         Err(e) => {
-                            scribbler().error_with(
+                            logger.error_with(
                                 "Watchdog",
                                 &format!("Error checking worker '{}': {}", handle.identity.name, e),
                             );
@@ -80,7 +85,7 @@ impl WatchdogService {
                     if let Some(mut handle) = workers.remove(&id) {
                         force_stop_worker(&mut handle);
                         let _ = std::fs::remove_file(&handle.sock_path);
-                        scribbler().info_with(
+                        logger.info_with(
                             "Watchdog",
                             &format!("Removed dead worker '{}'", handle.identity.name),
                         );

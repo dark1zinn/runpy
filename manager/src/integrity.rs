@@ -2,22 +2,24 @@ use std::collections::HashSet;
 use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
-use crate::scribbler::scribbler;
+use crate::scribbler::Scribbler;
 
 pub struct IntegrityChecker {
     pub uv_path: PathBuf,
     pub scripts_dir: PathBuf,
     pub registry: Mutex<HashSet<String>>,
+    logger: Arc<Scribbler>,
 }
 
 impl IntegrityChecker {
-    pub fn new(scripts: &str, uv_path: &str) -> Self {
+    pub fn new(scripts: &str, uv_path: &str, logger: Arc<Scribbler>) -> Self {
         Self {
             uv_path: PathBuf::from(uv_path),
             scripts_dir: PathBuf::from(scripts),
             registry: Mutex::new(HashSet::new()),
+            logger,
         }
     }
 
@@ -83,7 +85,7 @@ impl IntegrityChecker {
 
         self.walk_dir(&self.scripts_dir, &mut scripts);
 
-        scribbler().debug_with(
+        self.logger.debug_with(
             "Integrity",
             &format!("Indexed {} scripts: {:?}", scripts.len(), scripts),
         );

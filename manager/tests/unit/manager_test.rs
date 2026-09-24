@@ -2,6 +2,7 @@ use runpy::{Envelope, Manager, Worker, WorkerIdentity};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
@@ -106,6 +107,16 @@ async fn manager_accepts_uv_and_scripts_paths() {
     let manager = manager_with_uv(&scripts, &uv);
 
     assert!(manager.check_integrity().is_ok());
+}
+
+#[tokio::test]
+async fn manager_returns_one_shared_logger() {
+    let tmp = TempDir::new().unwrap();
+    let uv = fake_uv(&tmp);
+    let scripts = scripts_dir(&tmp, &[]);
+    let manager = manager_with_uv(&scripts, &uv);
+
+    assert!(Arc::ptr_eq(&manager.logger(), &manager.logger()));
 }
 
 #[tokio::test]
