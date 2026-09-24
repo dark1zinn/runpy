@@ -208,11 +208,38 @@ the inline metadata:
 # exclude-newer = "2025-01-01T00:00:00Z"
 ```
 
-### Run the tests
+### Development checks
+
+Enable the repository's pre-commit hook once per clone:
 
 ```bash
-cargo test
-uv run --package runpyrs --extra dev pytest worker/tests
+git config --local core.hooksPath .githooks
+```
+
+The hook checks only languages affected by staged files. It verifies formatting
+and linting without rewriting files.
+
+Run the complete Rust checks from the repository root:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --all-features --locked -- --test-threads=1
+```
+
+Run the complete Python checks from the repository root:
+
+```bash
+uv run --frozen ruff format --check worker/src/runpyrs worker/tests examples/playground/worker/my_script.py
+uv run --frozen ruff check worker/src/runpyrs worker/tests examples/playground/worker/my_script.py
+uv run --frozen --package runpyrs --extra dev pytest worker/tests
+```
+
+To apply formatting intentionally before re-staging files, run:
+
+```bash
+cargo fmt --all
+uv run ruff format worker/src/runpyrs worker/tests examples/playground/worker/my_script.py
 ```
 
 
