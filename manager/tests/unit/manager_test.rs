@@ -275,6 +275,7 @@ printf '%s\n' "$@" > "$RUNPY_TEST_ARGS"
 async fn watchdog_cleanup_kills_descendants_after_uv_exits() {
     let tmp = TempDir::new().unwrap();
     let descendant_file = tmp.path().join("descendant-pid");
+    let release_file = tmp.path().join("release-uv");
     let uv = write_executable(
         &tmp,
         "uv",
@@ -285,13 +286,16 @@ if [ "$1" = "--version" ]; then
 fi
 sleep 300 &
 printf '%s' "$!" > "$RUNPY_TEST_DESCENDANT"
+while [ ! -e "$RUNPY_TEST_RELEASE" ]; do sleep 0.01; done
 exit 0
 "#,
     );
     let scripts = scripts_dir(&tmp, &["managed"]);
     let manager = manager_with_uv(&scripts, &uv);
     let mut worker = manager.worker("managed");
-    worker.env("RUNPY_TEST_DESCENDANT", descendant_file.to_str().unwrap());
+    worker
+        .env("RUNPY_TEST_DESCENDANT", descendant_file.to_str().unwrap())
+        .env("RUNPY_TEST_RELEASE", release_file.to_str().unwrap());
 
     let worker_id = worker.spawn().await.unwrap();
     let socket_path = PathBuf::from(format!("/tmp/runpy/rp_{worker_id}.sock"));
@@ -300,10 +304,13 @@ exit 0
         .unwrap()
         .parse()
         .unwrap();
+    let uv_pid = manager.dog.report_worker(&worker_id).await.unwrap().pid;
+    assert!(process_exists(uv_pid));
     assert!(process_exists(descendant_pid));
     assert!(socket_path.exists());
 
     worker.dog.start_monitoring(1);
+    fs::write(&release_file, "go").unwrap();
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
         let worker_removed = manager.dog.report_worker(&worker_id).await.is_none();

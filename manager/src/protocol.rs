@@ -188,18 +188,20 @@ fn validate_wire_meta(meta: &Meta) -> Result<(), EnvelopeError> {
     Ok(())
 }
 
+/// Accept a missing operation or one allowed for the given message direction.
+/// Return `EnvelopeError::WrongDirection` with `direction` for any other operation.
 fn validate_direction(
     operation: Option<&str>,
     allowed: &[&str],
     direction: &'static str,
 ) -> Result<(), EnvelopeError> {
-    if let Some(operation) = operation {
-        if !allowed.contains(&operation) {
-            return Err(EnvelopeError::WrongDirection {
-                operation: operation.to_string(),
-                direction,
-            });
-        }
+    if let Some(operation) = operation
+        && !allowed.contains(&operation)
+    {
+        return Err(EnvelopeError::WrongDirection {
+            operation: operation.to_string(),
+            direction,
+        });
     }
     Ok(())
 }

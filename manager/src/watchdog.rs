@@ -95,7 +95,7 @@ impl WatchdogService {
         let workers = self.workers.read().await;
         let mut reports = Vec::new();
 
-        for (_id, handle) in workers.iter() {
+        for handle in workers.values() {
             let pid = handle.child.id();
             let state = match Self::read_proc_status(pid) {
                 Some(_) => ProcessState::Healthy,

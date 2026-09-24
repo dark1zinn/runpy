@@ -1,0 +1,76 @@
+name: Python quality
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  changes:
+    name: Detect Python changes
+    runs-on: ubuntu-latest
+    outputs:
+      python: ${{ steps.filter.outputs.python }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Detect Python inputs
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            python:
+              - '**/*.py'
+              - 'worker/src/runpyrs/py.typed'
+              - 'pyproject.toml'
+              - '**/pyproject.toml'
+              - 'uv.lock'
+              - '**/uv.lock'
+              - 'ruff.toml'
+              - '.ruff.toml'
+              - '**/ruff.toml'
+              - '**/.ruff.toml'
+              - '.githooks/pre-commit'
+              - '.github/workflows/python-quality.yml'
+
+  quality:
+    name: Python quality
+    needs: changes
+    if: needs.changes.outputs.python == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install Python 3.10
+        run: uv python install 3.10
+
+      - name: Check formatting
+        run: >-
+          uv run --frozen --python 3.10 ruff format --check
+          worker/src/runpyrs
+          worker/tests
+          examples/playground/worker/my_script.py
+
+      - name: Run Ruff
+        run: >-
+          uv run --frozen --python 3.10 ruff check
+          worker/src/runpyrs
+          worker/tests
+          examples/playground/worker/my_script.py
+
+      - name: Run tests
+        run: >-
+          uv run --frozen --python 3.10 --package runpyrs --extra dev
+          pytest worker/tests

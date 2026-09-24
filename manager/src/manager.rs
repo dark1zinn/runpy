@@ -3,7 +3,7 @@ use rand::{Rng, distributions::Alphanumeric};
 use std::collections::HashMap;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::sync::Arc;
 use tokio::net::UnixListener;
@@ -101,17 +101,20 @@ pub struct Worker {
 }
 
 impl Worker {
+    /// Create an unspawned worker builder for `script`, using `socket_dir` as
+    /// the base directory for its control socket. Share the manager's integrity
+    /// checker, global message handler, and running-worker registry.
     pub(crate) fn new(
         script: &str,
         integrity: Arc<IntegrityChecker>,
-        socket_dir: &PathBuf,
+        socket_dir: &Path,
         global_handler: Option<MessageHandler>,
         workers: Arc<RwLock<HashMap<String, WorkerHandle>>>,
     ) -> Self {
         Self {
             script: script.to_string(),
             integrity,
-            socket_dir: socket_dir.clone(),
+            socket_dir: socket_dir.to_path_buf(),
             env_vars: HashMap::new(),
             extra_args: HashMap::new(),
             worker_handler: None,

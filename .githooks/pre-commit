@@ -1,0 +1,56 @@
+#!/bin/sh
+set -eu
+
+repo_root=$(git rev-parse --show-toplevel)
+cd "$repo_root"
+
+# Return success for matching staged changes or a Git diff error.
+has_staged_changes() {
+    ! git diff --cached --quiet -- "$@"
+}
+
+if has_staged_changes \
+    ':(glob)**/*.rs' \
+    'Cargo.toml' \
+    ':(glob)**/Cargo.toml' \
+    'Cargo.lock' \
+    ':(glob).cargo/**' \
+    ':(glob)**/.cargo/**' \
+    'rust-toolchain' \
+    'rust-toolchain.toml' \
+    'rustfmt.toml' \
+    '.rustfmt.toml' \
+    'clippy.toml' \
+    '.clippy.toml' \
+    '.githooks/pre-commit'
+then
+    printf '%s\n' 'Checking Rust formatting...'
+    cargo fmt --all -- --check
+    printf '%s\n' 'Checking Rust lints...'
+    cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+fi
+
+if has_staged_changes \
+    ':(glob)**/*.py' \
+    'pyproject.toml' \
+    ':(glob)**/pyproject.toml' \
+    'uv.lock' \
+    ':(glob)**/uv.lock' \
+    'ruff.toml' \
+    '.ruff.toml' \
+    ':(glob)**/ruff.toml' \
+    ':(glob)**/.ruff.toml' \
+    'worker/src/runpyrs/py.typed' \
+    '.githooks/pre-commit'
+then
+    printf '%s\n' 'Checking Python formatting...'
+    uv run --frozen ruff format --check \
+        worker/src/runpyrs \
+        worker/tests \
+        examples/playground/worker/my_script.py
+    printf '%s\n' 'Checking Python lints...'
+    uv run --frozen ruff check \
+        worker/src/runpyrs \
+        worker/tests \
+        examples/playground/worker/my_script.py
+fi

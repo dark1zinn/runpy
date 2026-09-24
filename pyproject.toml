@@ -12,3 +12,6 @@ dev = [
     "ruff>=0.15.8",
     "uv>=0.11.2",
 ]
+
+[tool.ruff]
+target-version = "py310"
