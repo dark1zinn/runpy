@@ -25,6 +25,7 @@ Python is simple to write but limited in concurrency and reliability. Rust is fa
 - **Bare JSON Envelopes**: Developer-owned metadata and data with minimal Runpy routing
 - **Watchdog Service**: Automatic health monitoring and dead worker cleanup
 - **Structured Logging**: Environment-aware logging via \`Scribbler\`
+- **Unified Worker Output**: Attributed, bounded stdout/stderr capture through the Manager logger
 - **Bidirectional Communication**: Send commands and receive responses
 - **Extra Arguments**: Pass custom \`--key=value\` arguments to workers
 
@@ -37,13 +38,15 @@ Manager
 └── ControlPlane
     ├── Watchdog
     ├── Mailer
+    ├── Output Dispatcher
     └── Workers
 ```
 
 `Manager` is the sole composition root. Its shared `ControlPlane` owns the
-worker registry, one watchdog, and the internal reply router. `Worker` values
-are lightweight facades into those Manager-owned services; each running worker
-still communicates over its own length-prefixed JSON Unix socket.
+worker registry, one watchdog, the internal reply router, and worker output
+capture. `Worker` values are lightweight facades into those Manager-owned
+services; each running worker still communicates over its own length-prefixed
+JSON Unix socket.
 
 ## Quick Start
 
@@ -258,6 +261,46 @@ ENVIRONMENT=development
 LOG=debug
 ```
 
+### Worker process output
+
+Runpy pipes each managed `uv` process's stdout and stderr, including output
+inherited by Python and its descendants. Records are emitted through the
+Manager-owned `Scribbler` with trusted attribution:
+
+```text
+[worker:<worker-id>][stdout] <line>
+[worker:<worker-id>][stderr] <line>
+```
+
+Stdout uses the `info` level and stderr uses `warning`; the `LOG` setting can
+therefore filter captured output, but both pipes are always drained. Register a
+live observer when application policy needs the raw attributed record:
+
+```rust
+manager.on_worker_output(|output| {
+    println!(
+        "{} {:?}: {}",
+        output.worker_id, output.stream, output.line
+    );
+});
+```
+
+The observer runs on Runpy's output-dispatcher thread and must return promptly.
+Runpy does not infer failure or terminate workers from stderr or message text.
+Applications can send observer decisions to their own async control path.
+
+Capture is bounded and best effort. Records preserve order within one stream,
+but stdout, stderr, and socket envelopes have no total ordering. A logical line
+longer than 16 KiB is emitted in continuation records; invalid UTF-8 is decoded
+lossily and terminal control characters are escaped. A shared 256-record queue
+drops output rather than blocking a noisy worker, and the next delivered record
+reports prior loss when possible. Final output during immediate Manager drop is
+not guaranteed.
+
+Piped streams are not TTYs. Runpy forces `PYTHONUNBUFFERED=1` after worker
+environment configuration so Python output remains prompt; this trades some
+throughput for real-time visibility.
+
 ## Project Structure
 
 ```text
@@ -348,6 +391,12 @@ Runpy uses these lower-case `x_op` values:
 | `done`      | Python → Rust | `data` is the direct execution result.        |
 | `error`     | Python → Rust | `data.message` describes a worker failure.    |
 | `log`       | Python → Rust | `data` contains developer-selected log data.  |
+
+The structured `log` operation is separate from process stdout/stderr.
+Successful `Worker.log(...)` calls remain application-routed envelopes with the
+normal reply-capable callback context. Captured process output is an attributed
+observability record with no envelope reply route and no automatic lifecycle
+policy.
 
 Applications build their own higher-level routing, schemas, validation, and
 type safety with non-`x_` metadata and the `data` object. Old

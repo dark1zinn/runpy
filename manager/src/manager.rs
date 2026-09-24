@@ -4,6 +4,7 @@ use std::collections::HashMap;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::{Arc, Weak};
 use tokio::net::UnixListener;
 
@@ -188,6 +189,9 @@ impl Worker {
         for (key, value) in &self.env_vars {
             cmd.env(key, value);
         }
+        cmd.env("PYTHONUNBUFFERED", "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         #[cfg(unix)]
         cmd.process_group(0);
 
