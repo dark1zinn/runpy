@@ -133,7 +133,9 @@ impl Manager {
         }
 
         let control_plane = ControlPlane::new(logger.clone());
-        control_plane.start_monitoring(5);
+        if tokio::runtime::Handle::try_current().is_ok() {
+            control_plane.start_monitoring(5);
+        }
 
         Self {
             integrity,

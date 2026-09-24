@@ -99,6 +99,16 @@ fn worker_identity_is_unique() {
     assert_ne!(first.sock_file, second.sock_file);
 }
 
+#[test]
+fn manager_constructors_work_without_a_tokio_runtime() {
+    let tmp = TempDir::new().unwrap();
+    let uv = fake_uv(&tmp);
+    let scripts = scripts_dir(&tmp, &[]);
+
+    drop(manager_with_uv(&scripts, &uv));
+    drop(Manager::new(scripts.to_str().unwrap()));
+}
+
 #[tokio::test]
 async fn manager_accepts_uv_and_scripts_paths() {
     let tmp = TempDir::new().unwrap();

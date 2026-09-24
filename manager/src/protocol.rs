@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
 use std::process::Child;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
@@ -293,6 +294,7 @@ pub(crate) fn force_stop_worker(handle: &mut WorkerHandle) {
 
 /// The single worker router owned by a [`crate::Manager`].
 pub(crate) struct ControlPlane {
+    closed: AtomicBool,
     workers: Arc<RwLock<HashMap<String, WorkerHandle>>>,
     sessions: Mutex<HashMap<String, JoinHandle<()>>>,
     global_handler: RwLock<Option<MessageHandler>>,
@@ -312,6 +314,7 @@ impl ControlPlane {
         });
 
         Arc::new(Self {
+            closed: AtomicBool::new(false),
             workers,
             sessions: Mutex::new(HashMap::new()),
             global_handler: RwLock::new(None),
@@ -328,7 +331,7 @@ impl ControlPlane {
 
     pub(crate) fn start_monitoring(self: &Arc<Self>, interval_secs: u64) {
         let mut monitor = self.monitor.lock();
-        if monitor.is_some() {
+        if monitor.is_some() || self.closed.load(Ordering::Acquire) {
             return;
         }
 
@@ -363,13 +366,32 @@ impl ControlPlane {
         socket_path: String,
         listener: UnixListener,
         worker_handler: Option<MessageHandler>,
-    ) {
+    ) -> Result<(), String> {
         let worker_id = identity.name.clone();
         let process_group_id = child.id();
         let (tx, outbound_rx) = mpsc::channel::<Envelope>(64);
         let sender = MessageSender { tx };
 
-        self.workers.write().insert(
+        // Keep session registration and worker insertion together with shutdown.
+        let mut sessions = self.sessions.lock();
+        let mut workers = self.workers.write();
+        if self.closed.load(Ordering::Acquire) {
+            let mut handle = WorkerHandle {
+                child,
+                identity,
+                sock_path,
+                sender,
+                process_group_id,
+            };
+            drop(workers);
+            drop(sessions);
+            force_stop_worker(&mut handle);
+            let _ = std::fs::remove_file(&handle.sock_path);
+            return Err("Worker manager is shutting down".to_string());
+        }
+
+        self.start_monitoring(5);
+        workers.insert(
             worker_id.clone(),
             WorkerHandle {
                 child,
@@ -390,7 +412,8 @@ impl ControlPlane {
             mailer: self.mailer.clone(),
             logger: self.logger.clone(),
         }));
-        self.sessions.lock().insert(worker_id, task);
+        sessions.insert(worker_id, task);
+        Ok(())
     }
 
     pub(crate) async fn send(&self, worker_id: &str, envelope: Envelope) -> Result<(), String> {
@@ -456,10 +479,12 @@ impl ControlPlane {
     }
 
     pub(crate) fn shutdown_now(&self) {
+        self.closed.store(true, Ordering::Release);
         if let Some(task) = self.monitor.lock().take() {
             task.abort();
         }
-        for (_, task) in self.sessions.lock().drain() {
+        let mut sessions = self.sessions.lock();
+        for (_, task) in sessions.drain() {
             task.abort();
         }
 
@@ -614,14 +639,36 @@ struct Mailer {
 
 impl Mailer {
     fn send(self: &Arc<Self>, worker_id: String, envelope: Envelope) {
-        let mailer = self.clone();
-        tokio::spawn(async move {
-            if let Err(error) = mailer.send_async(&worker_id, envelope).await {
-                mailer
-                    .logger
-                    .error_with("Mailer", &format!("Failed to send envelope: {error}"));
+        let sender = self
+            .workers
+            .read()
+            .get(&worker_id)
+            .map(|handle| handle.sender.clone());
+        let Some(sender) = sender else {
+            self.logger.error_with(
+                "Mailer",
+                &format!("Failed to send envelope: Worker '{worker_id}' is not registered"),
+            );
+            return;
+        };
+
+        match sender.tx.try_send(envelope) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Closed(_)) => self.logger.error_with(
+                "Mailer",
+                "Failed to send envelope: worker channel is closed",
+            ),
+            Err(mpsc::error::TrySendError::Full(envelope)) => {
+                let mailer = self.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = sender.send(envelope).await {
+                        mailer
+                            .logger
+                            .error_with("Mailer", &format!("Failed to send envelope: {error}"));
+                    }
+                });
             }
-        });
+        }
     }
 
     async fn send_async(&self, worker_id: &str, envelope: Envelope) -> Result<(), String> {
@@ -681,7 +728,8 @@ mod tests {
                 listener,
                 handler,
             )
-            .await;
+            .await
+            .unwrap();
         UnixStream::connect(sock_path).await.unwrap()
     }
 
@@ -791,5 +839,99 @@ mod tests {
 
         let error = sender.send(Envelope::terminate()).await.unwrap_err();
         assert!(error.contains("Failed to send envelope"));
+    }
+
+    #[test]
+    fn registration_starts_monitoring_after_synchronous_construction() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let control_plane = ControlPlane::new(test_logger());
+        assert!(control_plane.monitor.lock().is_none());
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let _stream = register_worker(&control_plane, directory.path(), "worker", None).await;
+            assert!(control_plane.monitor.lock().is_some());
+            control_plane.shutdown_now();
+        });
+    }
+
+    #[tokio::test]
+    async fn registration_after_shutdown_stops_child_and_removes_socket() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let control_plane = ControlPlane::new(test_logger());
+        let sock_path = directory.path().join("worker.sock");
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        let socket_path = sock_path.to_string_lossy().into_owned();
+        let mut command = Command::new("sleep");
+        command.arg("300").process_group(0);
+        let child = command.spawn().unwrap();
+        let pid = child.id();
+
+        control_plane.shutdown_now();
+        let error = control_plane
+            .register_worker(
+                child,
+                WorkerIdentity {
+                    name: "worker".to_string(),
+                    sock_file: "worker.sock".to_string(),
+                },
+                sock_path.clone(),
+                socket_path,
+                listener,
+                None,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.contains("shutting down"));
+        assert!(!sock_path.exists());
+        assert!(control_plane.workers.read().is_empty());
+        assert!(control_plane.sessions.lock().is_empty());
+        assert!(control_plane.monitor.lock().is_none());
+        assert_eq!(unsafe { libc::kill(pid as libc::pid_t, 0) }, -1);
+    }
+
+    #[tokio::test]
+    async fn mailer_queues_replies_in_call_order_and_waits_when_full() {
+        let (tx, mut rx) = mpsc::channel(2);
+        let mut command = Command::new("sleep");
+        command.arg("300").process_group(0);
+        let child = command.spawn().unwrap();
+        let workers = Arc::new(RwLock::new(HashMap::from([(
+            "worker".to_string(),
+            WorkerHandle {
+                process_group_id: child.id(),
+                child,
+                identity: WorkerIdentity {
+                    name: "worker".to_string(),
+                    sock_file: "worker.sock".to_string(),
+                },
+                sock_path: PathBuf::from("worker.sock"),
+                sender: MessageSender { tx },
+            },
+        )])));
+        let mailer = Arc::new(Mailer {
+            workers: workers.clone(),
+            logger: test_logger(),
+        });
+        let first = Envelope::execute(object(json!({ "reply": 1 })));
+        let second = Envelope::execute(object(json!({ "reply": 2 })));
+        let third = Envelope::execute(object(json!({ "reply": 3 })));
+
+        mailer.send("worker".to_string(), first.clone());
+        mailer.send("worker".to_string(), second.clone());
+        mailer.send("worker".to_string(), third.clone());
+
+        assert_eq!(rx.try_recv().unwrap(), first);
+        assert_eq!(rx.try_recv().unwrap(), second);
+        assert_eq!(
+            timeout(Duration::from_secs(1), rx.recv()).await.unwrap(),
+            Some(third)
+        );
+        let mut handle = workers.write().remove("worker").unwrap();
+        force_stop_worker(&mut handle);
     }
 }

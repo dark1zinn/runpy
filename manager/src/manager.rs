@@ -208,7 +208,7 @@ impl Worker {
                 listener,
                 self.worker_handler.clone(),
             )
-            .await;
+            .await?;
         self.worker_id = Some(worker_id.clone());
         control_plane
             .logger()
