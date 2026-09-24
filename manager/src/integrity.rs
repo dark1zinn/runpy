@@ -96,11 +96,12 @@ impl IntegrityChecker {
                 if path.is_dir() {
                     self.walk_dir(&path, scripts);
                 } else if path.extension().and_then(|s| s.to_str()) == Some("py") {
-                    if let Some(name) = path.file_stem().and_then(|s| s.to_str()) {
-                        // Skip __init__.py and other dunder files
-                        if !name.starts_with("__") {
-                            scripts.insert(name.to_string());
-                        }
+                    let Some(name) = path.file_stem().and_then(|s| s.to_str()) else {
+                        continue;
+                    };
+                    // Skip __init__.py and other dunder files
+                    if !name.starts_with("__") {
+                        scripts.insert(name.to_string());
                     }
                 }
             }

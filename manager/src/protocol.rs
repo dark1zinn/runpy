@@ -193,13 +193,13 @@ fn validate_direction(
     allowed: &[&str],
     direction: &'static str,
 ) -> Result<(), EnvelopeError> {
-    if let Some(operation) = operation {
-        if !allowed.contains(&operation) {
-            return Err(EnvelopeError::WrongDirection {
-                operation: operation.to_string(),
-                direction,
-            });
-        }
+    if let Some(operation) = operation
+        && !allowed.contains(&operation)
+    {
+        return Err(EnvelopeError::WrongDirection {
+            operation: operation.to_string(),
+            direction,
+        });
     }
     Ok(())
 }
