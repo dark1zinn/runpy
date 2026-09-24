@@ -43,6 +43,13 @@
 //! `uv lock --script <script>.py`, is optional. When present, Runpy passes
 //! `--locked`, so stale locks fail instead of being modified at launch.
 //!
+//! ## Service ownership
+//!
+//! [`Manager`] is the sole composition root. It owns the integrity checker,
+//! logger, and one shared control plane. The control plane owns the watchdog,
+//! internal mailer, and all running workers. [`Worker`] values are lightweight
+//! facades and cannot outlive the Manager-owned services.
+//!
 //! ## Quick start
 //!
 //! ```ignore
@@ -57,7 +64,7 @@
 //! async fn main() {
 //!     let mut manager = Manager::new("./scripts");
 //!     manager.on_message(|inbound| {
-//!         println!("Received: {:?}", inbound.envelope);
+//!         inbound.reply(Envelope::execute(object(json!({"task": "process"}))));
 //!     });
 //!
 //!     let mut worker = manager.worker("my_script");
@@ -78,18 +85,13 @@ mod watchdog;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 
 use crate::integrity::IntegrityChecker;
-use crate::manager::{WorkerHandle, force_stop_worker};
-use crate::watchdog::WatchdogService;
+use crate::protocol::ControlPlane;
 
 // ── Public re-exports ──────────────────────────────────────────────────
 pub use manager::{Worker, WorkerIdentity};
-pub use protocol::{
-    ControlPlane, Data, Envelope, EnvelopeError, InboundEnvelope, Mailer, MessageHandler,
-    MessageSender, Meta,
-};
+pub use protocol::{Data, Envelope, EnvelopeError, InboundEnvelope, MessageHandler, Meta};
 pub use scribbler::{LogLevel, Scribbler};
 pub use watchdog::{ProcessState, WatchdogService as Watchdog, WorkerReport};
 
@@ -112,65 +114,42 @@ pub use watchdog::{ProcessState, WatchdogService as Watchdog, WorkerReport};
 pub struct Manager {
     integrity: Arc<IntegrityChecker>,
     logger: Arc<Scribbler>,
-    workers: Arc<RwLock<HashMap<String, WorkerHandle>>>,
+    control_plane: Arc<ControlPlane>,
     socket_dir: PathBuf,
-    global_handler: Option<MessageHandler>,
-
-    /// Watchdog service — use `manager.dog.report().await` for health reports.
-    pub dog: WatchdogService,
 }
 
 impl Manager {
     /// Create a manager using `uv` from `PATH`.
-    ///
-    /// `scripts_path` is the directory containing PEP 723 `.py` worker
-    /// scripts. Construction performs a non-fatal integrity check; spawning a
-    /// worker repeats it and returns any uv or scripts-directory error.
     pub fn new(scripts_path: &str) -> Self {
         Self::with_uv_path(scripts_path, "uv")
     }
 
     /// Create a manager using an explicit `uv` executable path.
-    ///
-    /// Use this when uv is packaged outside `PATH`. Runtime behavior is
-    /// otherwise identical to [`Manager::new`].
     pub fn with_uv_path(scripts_path: &str, uv_path: &str) -> Self {
         let logger = Arc::new(Scribbler::new());
         let integrity = Arc::new(IntegrityChecker::new(scripts_path, uv_path, logger.clone()));
-
-        // Run initial integrity check (non-fatal — logs errors)
-        if let Err(e) = integrity.perform_check() {
-            logger.error_with("Manager", &format!("Integrity check failed: {}", e));
+        if let Err(error) = integrity.perform_check() {
+            logger.error_with("Manager", &format!("Integrity check failed: {error}"));
         }
 
-        let socket_dir = PathBuf::from("/tmp/runpy");
-        let workers: Arc<RwLock<HashMap<String, WorkerHandle>>> =
-            Arc::new(RwLock::new(HashMap::new()));
-
-        let dog = WatchdogService::new(workers.clone(), logger.clone());
-
-        // Start background watchdog with a 5-second interval
-        dog.start_monitoring(5);
+        let control_plane = ControlPlane::new(logger.clone());
+        control_plane.start_monitoring(5);
 
         Self {
             integrity,
             logger,
-            workers,
-            socket_dir,
-            global_handler: None,
-            dog,
+            control_plane,
+            socket_dir: PathBuf::from("/tmp/runpy"),
         }
     }
 
-    /// Create a new `Worker` builder for the given script name (without `.py`).
+    /// Create a Worker facade for a script name without the `.py` suffix.
     pub fn worker(&self, script: &str) -> Worker {
         Worker::new(
             script,
-            self.integrity.clone(),
+            Arc::downgrade(&self.integrity),
+            Arc::downgrade(&self.control_plane),
             &self.socket_dir,
-            self.logger.clone(),
-            self.global_handler.clone(),
-            self.workers.clone(),
         )
     }
 
@@ -179,52 +158,32 @@ impl Manager {
         self.logger.clone()
     }
 
-    /// Register a **global** message handler that fires for every message from
-    /// every worker, *before* worker-specific handlers.
+    /// Return the single ControlPlane-owned watchdog.
+    pub fn watchdog(&self) -> &Watchdog {
+        self.control_plane.watchdog()
+    }
+
+    /// Register the live Manager handler dispatched before worker handlers.
     pub fn on_message<F>(&mut self, handler: F)
     where
         F: Fn(InboundEnvelope) + Send + Sync + 'static,
     {
-        self.global_handler = Some(Arc::new(handler));
+        self.control_plane.set_global_handler(Arc::new(handler));
     }
 
-    /// Re-run the full integrity check (uv, scripts dir, script index).
+    /// Re-run the full integrity check.
     pub fn check_integrity(&self) -> Result<(), String> {
         self.integrity.perform_check()
     }
 
-    /// Broadcast an envelope to all active workers.
-    /// Returns a map of worker_id -> Result indicating success or failure for each.
+    /// Broadcast an envelope to all registered workers.
     pub async fn broadcast(&self, envelope: Envelope) -> HashMap<String, Result<(), String>> {
-        let workers = self.workers.read().await;
-        let mut results = HashMap::new();
-
-        for (worker_id, handle) in workers.iter() {
-            let result = handle.sender.send(envelope.clone()).await;
-            results.insert(worker_id.clone(), result);
-        }
-
-        results
+        self.control_plane.broadcast(envelope).await
     }
 
-    /// Terminate all active workers gracefully.
-    /// Sends a reserved termination envelope, waits briefly, then force-kills survivors.
+    /// Gracefully request termination, then force-stop remaining workers.
     pub async fn terminate_all(&mut self) {
-        let _ = self.broadcast(Envelope::terminate()).await;
-
-        // Give workers time to shut down cleanly
-        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-
-        // Force-kill any remaining
-        let mut workers = self.workers.write().await;
-        for (id, mut handle) in workers.drain() {
-            force_stop_worker(&mut handle);
-            let _ = std::fs::remove_file(&handle.sock_path);
-            self.logger.info_with(
-                "Manager",
-                &format!("Terminated worker: {} ({})", handle.identity.name, id),
-            );
-        }
+        self.control_plane.terminate_all().await;
     }
 }
 
@@ -232,26 +191,7 @@ impl Drop for Manager {
     fn drop(&mut self) {
         self.logger
             .info_with("Manager", "Shutting down all workers...");
-
-        // `try_write()` is non-blocking and safe inside an async runtime
-        // (unlike `blocking_write()` which panics on a current-thread runtime).
-        match self.workers.try_write() {
-            Ok(mut workers) => {
-                for (id, mut handle) in workers.drain() {
-                    force_stop_worker(&mut handle);
-                    let _ = std::fs::remove_file(&handle.sock_path);
-                    self.logger.info_with(
-                        "Manager",
-                        &format!("Terminated worker: {} ({})", handle.identity.name, id),
-                    );
-                }
-            }
-            Err(_) => {
-                self.logger
-                    .warning_with("Manager", "Could not acquire worker lock during shutdown");
-            }
-        }
-
+        self.control_plane.shutdown_now();
         self.logger.success("All workers terminated.");
     }
 }

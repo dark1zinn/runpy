@@ -1,10 +1,9 @@
+use parking_lot::RwLock;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
-use tokio::time::{Duration, interval};
 
-use crate::manager::{WorkerHandle, force_stop_worker};
+use crate::protocol::WorkerHandle;
 use crate::scribbler::Scribbler;
 
 /// The health state of a monitored process.
@@ -27,77 +26,54 @@ pub struct WorkerReport {
 
 /// The watchdog service monitors all registered workers.
 /// It can run periodic background health checks and produce on-demand reports.
-#[derive(Clone)]
 pub struct WatchdogService {
     workers: Arc<RwLock<HashMap<String, WorkerHandle>>>,
     logger: Arc<Scribbler>,
 }
 
 impl WatchdogService {
-    pub fn new(
+    pub(crate) fn new(
         workers: Arc<RwLock<HashMap<String, WorkerHandle>>>,
         logger: Arc<Scribbler>,
     ) -> Self {
         Self { workers, logger }
     }
 
-    /// Start a background task that periodically checks every worker.
-    /// Dead workers are logged (and could be restarted in the future).
-    pub fn start_monitoring(&self, interval_secs: u64) {
-        let logger = self.logger.clone();
-        let workers = self.workers.clone();
-        tokio::spawn(async move {
-            let mut tick = interval(Duration::from_secs(interval_secs));
-            loop {
-                tick.tick().await;
-                let mut workers = workers.write().await;
-                let mut dead_ids: Vec<String> = Vec::new();
+    pub(crate) async fn dead_worker_ids(&self) -> Vec<String> {
+        let mut workers = self.workers.write();
+        let mut dead_ids = Vec::new();
 
-                for (id, handle) in workers.iter_mut() {
-                    match handle.child.try_wait() {
-                        Ok(Some(status)) => {
-                            logger.warning_with(
-                                "Watchdog",
-                                &format!(
-                                    "Worker '{}' (pid {}) exited with status: {}",
-                                    handle.identity.name,
-                                    handle.child.id(),
-                                    status
-                                ),
-                            );
-                            dead_ids.push(id.clone());
-                        }
-                        Ok(None) => {
-                            // Still running — healthy as far as OS is concerned
-                        }
-                        Err(e) => {
-                            logger.error_with(
-                                "Watchdog",
-                                &format!("Error checking worker '{}': {}", handle.identity.name, e),
-                            );
-                            dead_ids.push(id.clone());
-                        }
-                    }
+        for (id, handle) in workers.iter_mut() {
+            match handle.child.try_wait() {
+                Ok(Some(status)) => {
+                    self.logger.warning_with(
+                        "Watchdog",
+                        &format!(
+                            "Worker '{}' (pid {}) exited with status: {}",
+                            handle.identity.name,
+                            handle.child.id(),
+                            status
+                        ),
+                    );
+                    dead_ids.push(id.clone());
                 }
-
-                // Clean up dead workers
-                for id in dead_ids {
-                    if let Some(mut handle) = workers.remove(&id) {
-                        force_stop_worker(&mut handle);
-                        let _ = std::fs::remove_file(&handle.sock_path);
-                        logger.info_with(
-                            "Watchdog",
-                            &format!("Removed dead worker '{}'", handle.identity.name),
-                        );
-                    }
+                Ok(None) => {}
+                Err(error) => {
+                    self.logger.error_with(
+                        "Watchdog",
+                        &format!("Error checking worker '{}': {error}", handle.identity.name),
+                    );
+                    dead_ids.push(id.clone());
                 }
             }
-        });
+        }
+
+        dead_ids
     }
 
     /// Generate a one-shot report for **all** workers.
     pub async fn report(&self) -> Vec<WorkerReport> {
-        let workers = self.workers.read().await;
+        let workers = self.workers.read();
         let mut reports = Vec::new();
 
         for handle in workers.values() {
@@ -121,7 +97,7 @@ impl WatchdogService {
 
     /// Generate a report for a **single** worker by name.
     pub async fn report_worker(&self, worker_id: &str) -> Option<WorkerReport> {
-        let workers = self.workers.read().await;
+        let workers = self.workers.read();
         let handle = workers.get(worker_id)?;
         let pid = handle.child.id();
         let state = match Self::read_proc_status(pid) {

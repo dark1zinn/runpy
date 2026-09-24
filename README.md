@@ -31,22 +31,19 @@ Python is simple to write but limited in concurrency and reliability. Rust is fa
 ## Architecture
 
 ```text
-┌─────────────────────────────────────────────────┐
-│  Rust (Manager)                                 │
-│    ├─ IntegrityChecker   (uv & script checks)   │
-│    ├─ Scribbler          (structured logging)   │
-│    ├─ Workers[]          (builder + handle)     │
-│    │    └─ ControlPlane  (Unix socket protocol) │
-│    └─ WatchdogService    (health & resources)   │
-│                                                 │
-│         ┌─── Unix Socket (length-prefixed JSON) │
-│         ▼                                       │
-│  Python (Worker)                                │
-│    └─ runpyrs/worker.py                         │
-│         ├─ execute()         — managed execution │
-│         └─ handle_envelope() — custom messaging  │
-└─────────────────────────────────────────────────┘
+Manager
+├── IntegrityChecker
+├── Scribbler
+└── ControlPlane
+    ├── Watchdog
+    ├── Mailer
+    └── Workers
 ```
+
+`Manager` is the sole composition root. Its shared `ControlPlane` owns the
+worker registry, one watchdog, and the internal reply router. `Worker` values
+are lightweight facades into those Manager-owned services; each running worker
+still communicates over its own length-prefixed JSON Unix socket.
 
 ## Quick Start
 
@@ -104,9 +101,9 @@ async fn main() {
             .and_then(Value::as_str);
 
         match operation {
-            Some("ready") => inbound
-                .mailer
-                .send(Envelope::execute(object(json!({"url": "https://example.com"})))),
+            Some("ready") => inbound.reply(Envelope::execute(object(
+                json!({"url": "https://example.com"}),
+            ))),
             Some("done") => println!("result: {}", Value::Object(inbound.envelope.data().clone())),
             Some("error") => eprintln!("worker error: {}", Value::Object(inbound.envelope.data().clone())),
             _ => println!("custom envelope: {:?}", inbound.envelope),
@@ -300,18 +297,16 @@ runpy/
 
 ## Key Concepts
 
-| Concept               | Description                                                                                       |
-| --------------------- | ------------------------------------------------------------------------------------------------- |
-| **Manager**           | Top-level orchestrator. Creates workers, owns global handlers, and manages the watchdog.          |
-| **Worker**            | Builder before `.spawn()`, remote handle after. Sends envelopes and controls worker lifecycle.    |
-| **ControlPlane**      | Per-worker Unix socket listener using 8-byte little-endian length-prefixed JSON.                  |
-| **Envelope**          | The serialized `{meta, data}` value exchanged between Rust and Python.                            |
-| **InboundEnvelope**   | Rust-only callback context containing the received `Envelope` and a worker-bound `Mailer`.         |
-| **MessageSender**     | Channel-based sender for a running worker.                                                        |
-| **Mailer**            | Callback responder that sends an envelope to the worker associated with an inbound envelope.      |
-| **WatchdogService**   | Background process health monitor and dead-worker cleanup service.                                |
-| **IntegrityChecker**  | Validates the Python environment, socket directory, and scripts directory.                        |
-| **Scribbler**         | Environment-aware structured logger.                                                             |
+| Concept              | Description                                                                                         |
+| -------------------- | --------------------------------------------------------------------------------------------------- |
+| **Manager**          | Sole composition root. Owns integrity checking, logging, and the shared control plane.              |
+| **Worker**           | Lightweight builder and remote facade backed by Manager-owned services.                             |
+| **ControlPlane**     | Internal shared worker registry and Unix-socket router; owns the watchdog, mailer, and workers.     |
+| **Envelope**         | The serialized `{meta, data}` value exchanged between Rust and Python.                              |
+| **InboundEnvelope**  | Rust callback context with `reply` and `reply_async` methods routed to the originating worker.       |
+| **Watchdog**         | Shared process health and resource reporter, accessed through `Manager::watchdog()`.                |
+| **IntegrityChecker** | Validates the Python environment, socket directory, and scripts directory.                          |
+| **Scribbler**        | Manager-owned environment-aware logger, accessed through `Manager::logger()`.                       |
 
 ## Protocol
 

@@ -3,10 +3,7 @@
 /// Tests the watchdog's ability to inspect workers, generate reports,
 /// detect healthy/dead processes, and clean up dead entries.
 use runpy::{ProcessState, WorkerReport};
-use std::collections::HashMap;
 use std::process::{Child, Command};
-use std::sync::Arc;
-use tokio::sync::RwLock;
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
@@ -25,12 +22,9 @@ fn spawn_sleeper() -> Child {
 // ─── Construction ──────────────────────────────────────────────────────
 
 #[tokio::test]
-async fn watchdog_new_creates_empty_service() {
-    let _workers: Arc<RwLock<HashMap<String, ()>>> = Arc::new(RwLock::new(HashMap::new()));
-    // WatchdogService is Clone — just verify we can create one via Manager
+async fn manager_exposes_its_watchdog() {
     let manager = runpy::Manager::with_uv_path("/fake/scripts", "/bin/true");
-    // dog is exposed publicly
-    let _dog = &manager.dog;
+    assert!(manager.watchdog().report().await.is_empty());
 }
 
 // ─── report() on empty map ─────────────────────────────────────────────
@@ -38,7 +32,7 @@ async fn watchdog_new_creates_empty_service() {
 #[tokio::test]
 async fn report_returns_empty_vec_with_no_workers() {
     let manager = runpy::Manager::with_uv_path("/fake/scripts", "/bin/true");
-    let reports = manager.dog.report().await;
+    let reports = manager.watchdog().report().await;
     assert!(
         reports.is_empty(),
         "Expected no reports, got {:?}",
@@ -51,7 +45,7 @@ async fn report_returns_empty_vec_with_no_workers() {
 #[tokio::test]
 async fn report_worker_returns_none_for_unknown_id() {
     let manager = runpy::Manager::with_uv_path("/fake/scripts", "/bin/true");
-    let report = manager.dog.report_worker("nonexistent_id").await;
+    let report = manager.watchdog().report_worker("nonexistent_id").await;
     assert!(report.is_none());
 }
 
@@ -148,34 +142,6 @@ fn worker_report_serializes_with_all_none() {
     assert!(json.contains("\"Frozen\""));
     assert!(json.contains("\"memory_kb\":null"));
     assert!(json.contains("\"cpu_percent\":null"));
-}
-
-// ─── Watchdog clone shares the same map ────────────────────────────────
-
-#[tokio::test]
-async fn watchdog_clone_shares_underlying_state() {
-    let manager = runpy::Manager::with_uv_path("/fake/scripts", "/bin/true");
-    let dog1 = manager.dog.clone();
-    let dog2 = manager.dog.clone();
-
-    // Both clones should report the same (empty) state
-    let r1 = dog1.report().await;
-    let r2 = dog2.report().await;
-    assert_eq!(r1.len(), r2.len());
-    assert!(r1.is_empty());
-}
-
-// ─── start_monitoring does not panic ───────────────────────────────────
-
-#[tokio::test]
-async fn start_monitoring_does_not_panic_on_empty_map() {
-    let manager = runpy::Manager::with_uv_path("/fake/scripts", "/bin/true");
-    // start_monitoring is called automatically in Manager::new with 5s interval.
-    // Calling it again with a different interval should not panic.
-    manager.dog.start_monitoring(60);
-    // Let it tick once
-    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-    // No panic = success
 }
 
 // ─── Integration-style: watchdog with a real spawned process ───────────

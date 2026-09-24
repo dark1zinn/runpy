@@ -41,13 +41,11 @@ async fn main() {
         match operation {
             Some("ready") => {
                 worker_logger.info_with("Worker", "ready");
-                inbound
-                    .mailer
-                    .send(Envelope::execute(object(json!({"name": "RunPy"}))));
+                inbound.reply(Envelope::execute(object(json!({"name": "RunPy"}))));
 
                 let mut meta = Meta::new();
                 meta.insert("some_custom_meta".into(), json!(42));
-                inbound.mailer.send(
+                inbound.reply(
                     Envelope::new(meta, object(json!({"event": "custom manager message"})))
                         .expect("custom metadata must not use x_ keys"),
                 );
@@ -93,7 +91,7 @@ async fn main() {
 
     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
 
-    for report in manager.dog.report().await {
+    for report in manager.watchdog().report().await {
         logger.info_with(
             "Health",
             &format!(
