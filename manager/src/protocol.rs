@@ -3,6 +3,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::fmt;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::process::Child;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -344,8 +345,13 @@ impl WorkerOutputDispatcher {
                         WorkerOutputStream::Stderr => logger.warning(&message),
                     }
                     let current_handler = handler.read().clone();
-                    if let Some(handler) = current_handler {
-                        handler(output);
+                    if let Some(handler) = current_handler
+                        && catch_unwind(AssertUnwindSafe(|| handler(output))).is_err()
+                    {
+                        logger.error_with(
+                            "WorkerOutput",
+                            "Worker output handler panicked; continuing output dispatch",
+                        );
                     }
                 }
             })
@@ -1003,6 +1009,7 @@ mod tests {
     use serde_json::json;
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::mpsc as std_mpsc;
     use tokio::time::timeout;
 
@@ -1160,6 +1167,41 @@ mod tests {
         assert_eq!(next.line, "next");
         assert_eq!(next.dropped_lines_before, 1);
         assert_eq!(dropped, 0);
+    }
+
+    #[test]
+    fn output_dispatcher_continues_after_handler_panic() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handler_calls = calls.clone();
+        let (observed_tx, observed_rx) = std_mpsc::channel();
+        let handler: WorkerOutputHandler = Arc::new(move |output| {
+            if handler_calls.fetch_add(1, AtomicOrdering::SeqCst) == 0 {
+                panic!("intentional output handler panic");
+            }
+            observed_tx.send(output.line).unwrap();
+        });
+        let dispatcher =
+            WorkerOutputDispatcher::new(test_logger(), Arc::new(RwLock::new(Some(handler))))
+                .unwrap();
+        for line in ["first", "second"] {
+            dispatcher
+                .sender
+                .send(WorkerOutput {
+                    worker_id: "worker".to_string(),
+                    stream: WorkerOutputStream::Stdout,
+                    line: line.to_string(),
+                    truncated: false,
+                    dropped_lines_before: 0,
+                })
+                .unwrap();
+        }
+
+        assert_eq!(
+            observed_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            "second"
+        );
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 2);
+        dispatcher.close();
     }
 
     #[tokio::test]
