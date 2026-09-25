@@ -65,8 +65,10 @@ arguments. Additional `--key=value` arguments become `Worker.extra`.
   `None` for an empty result.
 - An exception or non-dictionary result becomes an `error` envelope. It does
   not automatically terminate the worker.
-- `retry` repeats the last execute payload. Retry before execute returns an
-  error envelope.
+- `retry` reuses the same mutable payload stored by `Worker._dispatch` and
+  passed to `Worker._complete_execution`. Mutations made by `execute` remain
+  present on retry; copy inputs before mutating them. Retry before execute
+  returns an error envelope.
 - `handle_envelope(envelope)` receives application messages without `x_op`.
 - `send(data, meta=...)` sends an application envelope.
 - `log(data, level=..., meta=...)` sends a structured `log` envelope.
@@ -137,8 +139,9 @@ errors do not use the fallback.
 
 The fallback deliberately contains no Python-provided worker identity. The
 Rust Manager captures stdout and adds trusted attribution. Delivery is
-at-least-once/best-effort: if a send fails after the Manager accepted a complete
-frame, it may observe both the structured log and fallback line.
+best-effort because both the socket send and fallback write can fail. If a send
+fails after the Manager accepted a complete frame, it may observe both the
+structured log and fallback line.
 
 ## More documentation
 

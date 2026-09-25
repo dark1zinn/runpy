@@ -75,6 +75,7 @@ Start it from Rust:
 ```rust
 use runpy::{Data, Envelope, Manager};
 use serde_json::{json, Value};
+use std::time::Duration;
 
 fn object(value: Value) -> Data {
     value.as_object().cloned().expect("JSON object")
@@ -116,7 +117,10 @@ async fn main() {
     let mut worker = manager.worker("my_worker");
     let worker_id = worker.spawn().await.expect("worker should start");
     println!("spawned {worker_id}");
-    finished_rx.recv().await.expect("worker should respond");
+    tokio::time::timeout(Duration::from_secs(30), finished_rx.recv())
+        .await
+        .expect("worker response timed out")
+        .expect("worker response channel closed");
     worker.terminate().await.expect("worker should stop");
 }
 ```

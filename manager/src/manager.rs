@@ -185,15 +185,17 @@ impl Worker {
 
     /// Start the configured script and register it with the Manager.
     ///
-    /// This re-runs integrity checks, requires a root-level `<script>.py`,
+    /// This re-runs integrity checks, requires the script name to be a single
+    /// path component and a root-level `<script>.py`,
     /// creates a unique socket, and launches `uv run --no-project [--locked]
     /// --script`. The returned string is the trusted worker ID. Registration
     /// owns the child process group, protocol session, and output readers.
     ///
-    /// Errors include a dropped Manager, failed integrity/path validation,
-    /// missing script, socket/spawn/pipe registration failure, shutdown in
-    /// progress, and attempting to spawn the same facade twice. Post-spawn
-    /// registration failures clean up the child process group and socket.
+    /// Errors include a dropped Manager, an invalid script name, failed
+    /// integrity/path validation, missing script, socket/spawn/pipe registration
+    /// failure, shutdown in progress, and attempting to spawn the same facade
+    /// twice. Post-spawn registration failures clean up the child process group
+    /// and socket.
     ///
     /// ```no_run
     /// # use runpy::Manager;
@@ -208,6 +210,10 @@ impl Worker {
     pub async fn spawn(&mut self) -> Result<String, String> {
         if self.worker_id.is_some() {
             return Err("Worker has already been spawned".to_string());
+        }
+        let script_name = Path::new(&self.script);
+        if script_name.file_name() != Some(script_name.as_os_str()) {
+            return Err("Worker script name must be a single path component".to_string());
         }
 
         let integrity = self

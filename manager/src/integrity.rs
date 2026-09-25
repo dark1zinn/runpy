@@ -8,8 +8,8 @@ use crate::scribbler::Scribbler;
 
 /// Private runtime validator shared by Manager and worker facades.
 ///
-/// It retains configured paths and a diagnostic index; spawn still validates
-/// the exact root-level script path before binding a socket.
+/// It retains configured paths and a diagnostic index; Worker::spawn validates
+/// script names before selecting a file.
 pub struct IntegrityChecker {
     /// Configured `uv` executable or command name.
     pub uv_path: PathBuf,
@@ -91,8 +91,7 @@ impl IntegrityChecker {
 
     /// Refresh the recursive script-stem index used for diagnostics.
     ///
-    /// Spawn separately checks the requested root-level `<name>.py`, so this
-    /// index must not be treated as authorization to launch a nested file.
+    /// This index is diagnostic and does not authorize script selection.
     fn index_scripts(&self) {
         let mut scripts = self.registry.lock().unwrap();
         scripts.clear();

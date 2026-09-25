@@ -196,6 +196,35 @@ async fn spawn_rejects_missing_worker_script_before_binding() {
     );
 }
 
+#[tokio::test]
+async fn spawn_rejects_names_that_are_not_single_path_components() {
+    let tmp = TempDir::new().unwrap();
+    let uv = fake_uv(&tmp);
+    let scripts = scripts_dir(&tmp, &["valid"]);
+    fs::write(tmp.path().join("escape.py"), "# stub").unwrap();
+    fs::create_dir(scripts.join("nested")).unwrap();
+    fs::write(scripts.join("nested/worker.py"), "# stub").unwrap();
+    let manager = manager_with_uv(&scripts, &uv);
+
+    for name in [
+        "../escape",
+        "nested/worker",
+        "./valid",
+        "valid/",
+        ".",
+        "..",
+        "",
+        "/absolute",
+    ] {
+        let mut worker = manager.worker(name);
+        assert_eq!(
+            worker.spawn().await,
+            Err("Worker script name must be a single path component".to_string()),
+            "unexpected result for {name:?}"
+        );
+    }
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn worker_output_is_attributed_and_python_is_forced_unbuffered() {

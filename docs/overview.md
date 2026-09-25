@@ -56,8 +56,9 @@ fail when the Manager has already been dropped. One facade can spawn only once.
 
 The private `IntegrityChecker` executes the configured `uv --version`, ensures
 `/tmp/runpy` exists, verifies the scripts directory, and recursively indexes
-Python file stems for diagnostics. `Worker::spawn` performs the checks again
-and resolves the requested worker as `<scripts-directory>/<name>.py`.
+Python file stems for diagnostics. `Worker::spawn` performs the checks again,
+requires the supplied name to be a single path component, and resolves it as
+`<scripts-directory>/<name>.py`.
 
 ### ControlPlane, Mailer, and Watchdog
 
