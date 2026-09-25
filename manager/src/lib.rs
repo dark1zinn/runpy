@@ -1,11 +1,31 @@
-//! # Runpy — Rust-Python Worker Manager
+//! # Runpy
 //!
-//! Runpy spawns and manages Python worker processes and exchanges bare JSON
-//! envelopes over length-prefixed Unix socket connections.
+//! Runpy is a Rust control plane for `uv`-managed Python worker scripts. It
+//! owns process groups, Unix sockets, message routing, health inspection, and
+//! attributed stdout/stderr capture. The companion `runpyrs` Python package
+//! supplies the worker receive loop.
 //!
-//! ## Envelope
+//! ## Runtime model
 //!
-//! Every payload contains exactly two JSON objects:
+//! [`Manager`] is the composition root. It validates `uv` and a scripts
+//! directory, creates lightweight [`Worker`] facades, and owns every running
+//! worker until explicit termination or Manager drop. Async spawn, messaging,
+//! reports, and graceful termination require a Tokio runtime.
+//!
+//! Each worker is a PEP 723 script launched as:
+//!
+//! ```text
+//! uv run --no-project [--locked] --script <script.py> <socket-path> <worker-id>
+//! ```
+//!
+//! An adjacent `<script.py>.lock` enables `--locked`. Runpy does not create a
+//! project virtual environment, run `uv sync`, inject Python dependencies, or
+//! mutate lockfiles.
+//!
+//! ## Envelopes
+//!
+//! Socket frames contain an 8-byte little-endian length followed by a JSON
+//! [`Envelope`] with exactly two object fields:
 //!
 //! ```json
 //! {
@@ -18,71 +38,59 @@
 //! }
 //! ```
 //!
-//! Applications own the schema and type safety of `data` and non-`x_`
-//! metadata. Runpy reserves every `x_` key for worker identity, socket
-//! identity, and lifecycle routing.
-//!
-//! ## uv-managed worker scripts
-//!
-//! [`Manager`] launches each worker with `uv run --no-project --script`.
-//! The worker's [PEP 723](https://packaging.python.org/en/latest/specifications/inline-script-metadata/)
-//! metadata declares its Python requirement and complete dependency set:
-//!
-//! ```python
-//! # /// script
-//! # requires-python = ">=3.10"
-//! # dependencies = [
-//! #   "runpyrs @ git+https://github.com/dark1zinn/runpy#subdirectory=worker",
-//! # ]
-//! # ///
-//! ```
-//!
-//! `uv` selects or downloads a compatible Python and maintains an isolated,
-//! cached environment. Runpy does not create a project `.venv` or run
-//! `uv sync`. An adjacent `<script>.py.lock`, created explicitly with
-//! `uv lock --script <script>.py`, is optional. When present, Runpy passes
-//! `--locked`, so stale locks fail instead of being modified at launch.
-//!
-//! ## Service ownership
-//!
-//! [`Manager`] is the sole composition root. It owns the integrity checker,
-//! logger, and one shared control plane. The control plane owns the watchdog,
-//! internal mailer, and all running workers. [`Worker`] values are lightweight
-//! facades and cannot outlive the Manager-owned services.
+//! Applications own [`Data`] and non-`x_` [`Meta`]. Runpy reserves the entire
+//! `x_` namespace and stamps trusted worker/socket values at transport edges.
+//! Incoming messages reach the current Manager handler before the worker's
+//! per-worker handler. Both callbacks run synchronously in the protocol task
+//! and should return promptly.
 //!
 //! ## Worker process output
 //!
-//! The control plane asynchronously captures each managed process's stdout and
-//! stderr, emits attributed records through the Manager-owned logger, and makes
-//! the same records available through [`Manager::on_worker_output`]. Output is
-//! bounded and best effort; it is separate from structured socket envelopes
-//! and never causes automatic worker termination.
+//! The control plane drains worker stdout and stderr independently and emits
+//! attributed records through [`Scribbler`] and
+//! [`Manager::on_worker_output`]. This best-effort channel is separate from
+//! structured socket messages. The observer runs on a dedicated dispatcher
+//! thread; Runpy catches and logs observer panics and never derives worker
+//! lifecycle policy from output text.
 //!
-//! ## Quick start
+//! ## Complete lifecycle
 //!
-//! ```ignore
+//! ```no_run
 //! use runpy::{Data, Envelope, Manager};
-//! use serde_json::json;
+//! use serde_json::{json, Value};
 //!
-//! fn object(value: serde_json::Value) -> Data {
+//! fn object(value: Value) -> Data {
 //!     value.as_object().cloned().expect("JSON object")
 //! }
 //!
 //! #[tokio::main]
 //! async fn main() {
-//!     let mut manager = Manager::new("./scripts");
-//!     manager.on_message(|inbound| {
-//!         inbound.reply(Envelope::execute(object(json!({"task": "process"}))));
+//!     let mut manager = Manager::new("worker");
+//!     manager.check_integrity().expect("valid runtime");
+//!     let (finished_tx, mut finished_rx) = tokio::sync::mpsc::unbounded_channel();
+//!     manager.on_message(move |inbound| {
+//!         match inbound.envelope.meta().get("x_op").and_then(Value::as_str) {
+//!             Some("ready") => inbound.reply(Envelope::execute(object(
+//!                 json!({"task": "process"}),
+//!             ))),
+//!             Some("done" | "error") => {
+//!                 println!("{:?}", inbound.envelope.data());
+//!                 let _ = finished_tx.send(());
+//!             }
+//!             _ => {}
+//!         }
 //!     });
 //!
-//!     let mut worker = manager.worker("my_script");
-//!     worker.spawn().await.unwrap();
-//!     worker
-//!         .send_message(Envelope::execute(object(json!({"task": "process"}))))
-//!         .await
-//!         .unwrap();
+//!     let mut worker = manager.worker("my_worker");
+//!     let worker_id = worker.spawn().await.expect("worker starts");
+//!     println!("spawned {worker_id}");
+//!     finished_rx.recv().await.expect("worker responds");
+//!     worker.terminate().await.expect("worker terminates");
 //! }
 //! ```
+//!
+//! Dropping [`Manager`] synchronously force-stops remaining process groups and
+//! removes their socket files.
 
 mod integrity;
 mod manager;
@@ -108,19 +116,19 @@ pub use watchdog::{ProcessState, WatchdogService as Watchdog, WorkerReport};
 
 // ── Manager ────────────────────────────────────────────────────────────
 
-/// Top-level orchestrator for uv-managed Python worker scripts.
+/// Top-level owner of Runpy services and managed worker processes.
 ///
-/// `uv` must be available on `PATH` unless [`Manager::with_uv_path`] selects
-/// an explicit executable.
+/// Construction performs an integrity check and logs any failure; use
+/// [`Manager::check_integrity`] when the caller needs a returned error. A
+/// Manager can be created outside a Tokio runtime, but asynchronous operations
+/// and worker registration require one.
 ///
-/// ```ignore
-/// let mut manager = Manager::new("path/to/scripts");
-/// manager.on_message(|env| { /* global handler */ });
+/// ```no_run
+/// use runpy::Manager;
 ///
-/// let mut worker = manager.worker("my_script");
-/// worker.env("KEY", "VALUE");
-/// worker.on_message(|env| { /* per-worker handler */ });
-/// worker.spawn().await.unwrap();
+/// let manager = Manager::new("worker");
+/// let logger = manager.logger();
+/// logger.info("manager ready");
 /// ```
 pub struct Manager {
     integrity: Arc<IntegrityChecker>,
@@ -130,12 +138,32 @@ pub struct Manager {
 }
 
 impl Manager {
-    /// Create a manager using `uv` from `PATH`.
+    /// Create a Manager that resolves `uv` from `PATH`.
+    ///
+    /// `scripts_path` is the directory containing `<worker-name>.py` files.
+    /// Integrity failures are logged and construction still succeeds.
+    ///
+    /// ```no_run
+    /// use runpy::Manager;
+    ///
+    /// let manager = Manager::new("worker");
+    /// manager.check_integrity().expect("uv and scripts are available");
+    /// ```
     pub fn new(scripts_path: &str) -> Self {
         Self::with_uv_path(scripts_path, "uv")
     }
 
-    /// Create a manager using an explicit `uv` executable path.
+    /// Create a Manager with an explicit `uv` executable.
+    ///
+    /// Relative multi-component paths are canonicalized when a worker spawns;
+    /// a single component such as `uv` is resolved by the operating system.
+    ///
+    /// ```no_run
+    /// use runpy::Manager;
+    ///
+    /// let manager = Manager::with_uv_path("worker", "/opt/runpy/bin/uv");
+    /// manager.check_integrity().expect("configured runtime is valid");
+    /// ```
     pub fn with_uv_path(scripts_path: &str, uv_path: &str) -> Self {
         let logger = Arc::new(Scribbler::new());
         let integrity = Arc::new(IntegrityChecker::new(scripts_path, uv_path, logger.clone()));
@@ -156,7 +184,18 @@ impl Manager {
         }
     }
 
-    /// Create a Worker facade for a script name without the `.py` suffix.
+    /// Create a worker facade for a root-level script name without `.py`.
+    ///
+    /// The facade is a builder before `spawn` and a remote handle afterward.
+    /// It cannot outlive the services owned by this Manager.
+    ///
+    /// ```no_run
+    /// use runpy::Manager;
+    ///
+    /// let manager = Manager::new("worker");
+    /// let mut worker = manager.worker("my_worker");
+    /// worker.env("MODE", "fast").arg("batch", "10");
+    /// ```
     pub fn worker(&self, script: &str) -> Worker {
         Worker::new(
             script,
@@ -166,17 +205,45 @@ impl Manager {
         )
     }
 
-    /// Return the Manager-owned logger shared by every Runpy service.
+    /// Return the shared Manager-owned logger.
+    ///
+    /// Every call clones the same [`Arc`], so configured severity and
+    /// environment settings are shared by Manager services and callers.
     pub fn logger(&self) -> Arc<Scribbler> {
         self.logger.clone()
     }
 
-    /// Return the single ControlPlane-owned watchdog.
+    /// Borrow the shared watchdog for one-shot process reports.
+    ///
+    /// ```no_run
+    /// use runpy::Manager;
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// let manager = Manager::new("worker");
+    /// for report in manager.watchdog().report().await {
+    ///     println!("{}: {:?}", report.worker_name, report.state);
+    /// }
+    /// # }
+    /// ```
     pub fn watchdog(&self) -> &Watchdog {
         self.control_plane.watchdog()
     }
 
-    /// Register the live Manager handler dispatched before worker handlers.
+    /// Replace the global inbound-envelope handler.
+    ///
+    /// The current global handler runs before a worker-specific handler for
+    /// every valid worker message. It executes synchronously in the protocol
+    /// task and should return promptly.
+    ///
+    /// ```no_run
+    /// use runpy::Manager;
+    ///
+    /// let mut manager = Manager::new("worker");
+    /// manager.on_message(|inbound| {
+    ///     println!("{:?}", inbound.envelope);
+    /// });
+    /// ```
     pub fn on_message<F>(&mut self, handler: F)
     where
         F: Fn(InboundEnvelope) + Send + Sync + 'static,
@@ -184,10 +251,22 @@ impl Manager {
         self.control_plane.set_global_handler(Arc::new(handler));
     }
 
-    /// Observe attributed stdout and stderr records from every managed worker.
+    /// Replace the observer for attributed worker stdout/stderr records.
     ///
-    /// The latest handler replaces the previous one. It runs on Runpy's output
-    /// dispatcher thread and should return promptly.
+    /// The observer runs on Runpy's dedicated output-dispatcher thread and
+    /// should return promptly. A panic is caught and logged so later records
+    /// continue. Output is best effort and never drives automatic termination.
+    ///
+    /// ```no_run
+    /// use runpy::{Manager, WorkerOutputStream};
+    ///
+    /// let mut manager = Manager::new("worker");
+    /// manager.on_worker_output(|output| {
+    ///     if output.stream == WorkerOutputStream::Stderr {
+    ///         eprintln!("{}: {}", output.worker_id, output.line);
+    ///     }
+    /// });
+    /// ```
     pub fn on_worker_output<F>(&mut self, handler: F)
     where
         F: Fn(WorkerOutput) + Send + Sync + 'static,
@@ -196,17 +275,56 @@ impl Manager {
             .set_worker_output_handler(Arc::new(handler));
     }
 
-    /// Re-run the full integrity check.
+    /// Re-run uv validation, socket-directory creation, and script indexing.
+    ///
+    /// Unlike Manager construction, this method returns validation failures.
+    ///
+    /// ```no_run
+    /// use runpy::Manager;
+    ///
+    /// let manager = Manager::new("worker");
+    /// manager.check_integrity().expect("runtime is ready");
+    /// ```
     pub fn check_integrity(&self) -> Result<(), String> {
         self.integrity.perform_check()
     }
 
-    /// Broadcast an envelope to all registered workers.
+    /// Send one envelope to every currently registered worker.
+    ///
+    /// The returned map is keyed by trusted worker ID and contains the result
+    /// for each bounded outbound route. An empty registry returns an empty map.
+    ///
+    /// ```no_run
+    /// use runpy::{Envelope, Manager};
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// let manager = Manager::new("worker");
+    /// let results = manager.broadcast(Envelope::retry()).await;
+    /// for (worker_id, result) in results {
+    ///     println!("{worker_id}: {result:?}");
+    /// }
+    /// # }
+    /// ```
     pub async fn broadcast(&self, envelope: Envelope) -> HashMap<String, Result<(), String>> {
         self.control_plane.broadcast(envelope).await
     }
 
-    /// Gracefully request termination, then force-stop remaining workers.
+    /// Request graceful termination for all workers, then force cleanup.
+    ///
+    /// The control plane broadcasts `terminate`, waits two seconds, kills and
+    /// reaps remaining process groups, removes sockets, and briefly drains
+    /// output readers.
+    ///
+    /// ```no_run
+    /// use runpy::Manager;
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// let mut manager = Manager::new("worker");
+    /// manager.terminate_all().await;
+    /// # }
+    /// ```
     pub async fn terminate_all(&mut self) {
         self.control_plane.terminate_all().await;
     }

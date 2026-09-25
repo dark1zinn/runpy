@@ -41,14 +41,22 @@ const MAGENTA: &str = "\x1b[35m";
 
 // ── Log Levels ─────────────────────────────────────────────────────────
 
-/// Log severity levels, ordered from most to least severe.
+/// Log severity, ordered from most restrictive to most verbose.
+///
+/// A configured level displays itself and every lower numeric severity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum LogLevel {
+    /// Disable all logger output.
     Off = 0,
+    /// Failures that require attention.
     Error = 1,
+    /// Recoverable or diagnostic concerns.
     Warning = 2,
+    /// Normal operational information and success output.
     Info = 3,
+    /// Development diagnostics.
     Debug = 4,
+    /// Highest-detail trace output.
     Verbose = 5,
 }
 
@@ -93,9 +101,19 @@ impl LogLevel {
 
 // ── Scribbler ──────────────────────────────────────────────────────────
 
-/// The main logging service for runpy.
+/// Environment-configured logger shared by a [`crate::Manager`].
 ///
-/// Provides structured, colorful logging with environment-based configuration.
+/// Output goes to stderr. `ENVIRONMENT=development|dev` enables
+/// [`LogLevel::Verbose`]; otherwise `LOG` selects `0`–`5` or a named level and
+/// defaults to `info`. Presence of `NO_COLOR` disables ANSI colors.
+///
+/// ```no_run
+/// use runpy::Manager;
+///
+/// let manager = Manager::new("worker");
+/// let logger = manager.logger();
+/// logger.info_with("Startup", "manager created");
+/// ```
 #[derive(Debug, Clone)]
 pub struct Scribbler {
     /// Maximum log level to display
@@ -174,59 +192,114 @@ impl Scribbler {
 
     // ── Public API ─────────────────────────────────────────────────────
 
-    /// Log an error message (always visible unless logging is off).
+    /// Log an untagged error unless logging is off.
+    ///
+    /// ```no_run
+    /// # let manager = runpy::Manager::new("worker");
+    /// manager.logger().error("worker launch failed");
+    /// ```
     pub fn error(&self, message: &str) {
         self.log(LogLevel::Error, None, message);
     }
 
     /// Log an error with a component tag.
+    ///
+    /// ```no_run
+    /// # let manager = runpy::Manager::new("worker");
+    /// manager.logger().error_with("Worker", "launch failed");
+    /// ```
     pub fn error_with(&self, component: &str, message: &str) {
         self.log(LogLevel::Error, Some(component), message);
     }
 
-    /// Log a warning message.
+    /// Log an untagged warning when warning output is enabled.
+    ///
+    /// ```no_run
+    /// # let manager = runpy::Manager::new("worker");
+    /// manager.logger().warning("worker stderr was non-empty");
+    /// ```
     pub fn warning(&self, message: &str) {
         self.log(LogLevel::Warning, None, message);
     }
 
     /// Log a warning with a component tag.
+    ///
+    /// ```no_run
+    /// # let manager = runpy::Manager::new("worker");
+    /// manager.logger().warning_with("Watchdog", "worker exited");
+    /// ```
     pub fn warning_with(&self, component: &str, message: &str) {
         self.log(LogLevel::Warning, Some(component), message);
     }
 
-    /// Log an informational message.
+    /// Log untagged operational information when info output is enabled.
+    ///
+    /// ```no_run
+    /// # let manager = runpy::Manager::new("worker");
+    /// manager.logger().info("worker connected");
+    /// ```
     pub fn info(&self, message: &str) {
         self.log(LogLevel::Info, None, message);
     }
 
-    /// Log an info message with a component tag.
+    /// Log operational information with a component tag.
+    ///
+    /// ```no_run
+    /// # let manager = runpy::Manager::new("worker");
+    /// manager.logger().info_with("Protocol", "worker ready");
+    /// ```
     pub fn info_with(&self, component: &str, message: &str) {
         self.log(LogLevel::Info, Some(component), message);
     }
 
-    /// Log a debug message (only visible in debug/verbose mode).
+    /// Log untagged diagnostics when debug or verbose output is enabled.
+    ///
+    /// ```no_run
+    /// # let manager = runpy::Manager::new("worker");
+    /// manager.logger().debug("indexed worker scripts");
+    /// ```
     pub fn debug(&self, message: &str) {
         self.log(LogLevel::Debug, None, message);
     }
 
-    /// Log a debug message with a component tag.
+    /// Log diagnostics with a component tag.
+    ///
+    /// ```no_run
+    /// # let manager = runpy::Manager::new("worker");
+    /// manager.logger().debug_with("Integrity", "check complete");
+    /// ```
     pub fn debug_with(&self, component: &str, message: &str) {
         self.log(LogLevel::Debug, Some(component), message);
     }
 
-    /// Log a verbose/trace message (only in verbose mode).
+    /// Log untagged trace detail only when verbose output is enabled.
+    ///
+    /// ```no_run
+    /// # let manager = runpy::Manager::new("worker");
+    /// manager.logger().verbose("received envelope");
+    /// ```
     pub fn verbose(&self, message: &str) {
         self.log(LogLevel::Verbose, None, message);
     }
 
-    /// Log a verbose message with a component tag.
+    /// Log trace detail with a component tag.
+    ///
+    /// ```no_run
+    /// # let manager = runpy::Manager::new("worker");
+    /// manager.logger().verbose_with("Protocol", "frame decoded");
+    /// ```
     pub fn verbose_with(&self, component: &str, message: &str) {
         self.log(LogLevel::Verbose, Some(component), message);
     }
 
     // ── Convenience methods for common patterns ────────────────────────
 
-    /// Log a successful operation.
+    /// Log a visually emphasized success message at info level.
+    ///
+    /// ```no_run
+    /// # let manager = runpy::Manager::new("worker");
+    /// manager.logger().success("worker spawned");
+    /// ```
     pub fn success(&self, message: &str) {
         if self.should_log(LogLevel::Info) {
             let timestamp = Local::now().format("%H:%M:%S%.3f");
@@ -241,7 +314,12 @@ impl Scribbler {
         }
     }
 
-    /// Log a step/progress indicator.
+    /// Log a numbered progress step at info level.
+    ///
+    /// ```no_run
+    /// # let manager = runpy::Manager::new("worker");
+    /// manager.logger().step(2, "starting workers");
+    /// ```
     pub fn step(&self, step: u32, message: &str) {
         if self.should_log(LogLevel::Info) {
             let timestamp = Local::now().format("%H:%M:%S%.3f");
@@ -256,7 +334,12 @@ impl Scribbler {
         }
     }
 
-    /// Log a separator line for visual grouping.
+    /// Log a visual separator when info output is enabled.
+    ///
+    /// ```no_run
+    /// # let manager = runpy::Manager::new("worker");
+    /// manager.logger().separator();
+    /// ```
     pub fn separator(&self) {
         if self.should_log(LogLevel::Info) {
             if self.use_colors {
@@ -269,12 +352,14 @@ impl Scribbler {
 
     // ── State inspection ───────────────────────────────────────────────
 
-    /// Returns true if running in development mode.
+    /// Return whether `ENVIRONMENT` selected development mode.
+    ///
+    /// Development mode bypasses `LOG` and enables verbose output.
     pub fn is_development(&self) -> bool {
         self.is_dev
     }
 
-    /// Returns the current log level.
+    /// Return the maximum visible severity selected at construction.
     pub fn level(&self) -> LogLevel {
         self.level
     }

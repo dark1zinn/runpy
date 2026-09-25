@@ -6,26 +6,37 @@ use std::sync::Arc;
 use crate::protocol::WorkerHandle;
 use crate::scribbler::Scribbler;
 
-/// The health state of a monitored process.
+/// Health state reported for a registered worker process.
 #[derive(Debug, Clone, Serialize)]
 pub enum ProcessState {
+    /// The process is currently observable.
     Healthy,
+    /// Reserved state for a stopped-but-live process; not currently detected.
     Frozen,
+    /// The process is no longer observable.
     Dead,
 }
 
-/// A snapshot report for a single worker process.
+/// One-point-in-time process report for a managed worker.
 #[derive(Debug, Clone, Serialize)]
 pub struct WorkerReport {
+    /// Trusted Manager-generated worker identity.
     pub worker_name: String,
+    /// Process ID of the stored `uv` parent.
     pub pid: u32,
+    /// Current observable process state.
     pub state: ProcessState,
+    /// Linux resident set size in KiB, or `None` when unavailable.
     pub memory_kb: Option<u64>,
+    /// CPU utilization; currently always `None` because sampling is not implemented.
     pub cpu_percent: Option<f32>,
 }
 
-/// The watchdog service monitors all registered workers.
-/// It can run periodic background health checks and produce on-demand reports.
+/// Shared process monitor owned by a [`crate::Manager`].
+///
+/// The background monitor checks child exit state every five seconds and asks
+/// the control plane to clean up dead workers. Public methods provide on-demand
+/// snapshots; they do not implement application retry or alert policy.
 pub struct WatchdogService {
     workers: Arc<RwLock<HashMap<String, WorkerHandle>>>,
     logger: Arc<Scribbler>,
@@ -71,7 +82,22 @@ impl WatchdogService {
         dead_ids
     }
 
-    /// Generate a one-shot report for **all** workers.
+    /// Generate a snapshot for every currently registered worker.
+    ///
+    /// Linux reports resident memory from `/proc/<pid>/status`; other
+    /// platforms return `None`. `cpu_percent` is currently always `None`.
+    ///
+    /// ```no_run
+    /// use runpy::Manager;
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// let manager = Manager::new("worker");
+    /// for report in manager.watchdog().report().await {
+    ///     println!("{}: {:?}", report.worker_name, report.state);
+    /// }
+    /// # }
+    /// ```
     pub async fn report(&self) -> Vec<WorkerReport> {
         let workers = self.workers.read();
         let mut reports = Vec::new();
@@ -95,7 +121,21 @@ impl WatchdogService {
         reports
     }
 
-    /// Generate a report for a **single** worker by name.
+    /// Generate a snapshot for one trusted worker ID.
+    ///
+    /// Returns `None` when the worker is not registered.
+    ///
+    /// ```no_run
+    /// use runpy::Manager;
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// let manager = Manager::new("worker");
+    /// if let Some(report) = manager.watchdog().report_worker("worker-id").await {
+    ///     println!("pid {}", report.pid);
+    /// }
+    /// # }
+    /// ```
     pub async fn report_worker(&self, worker_id: &str) -> Option<WorkerReport> {
         let workers = self.workers.read();
         let handle = workers.get(worker_id)?;

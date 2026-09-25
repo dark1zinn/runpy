@@ -1,3 +1,5 @@
+"""Command-line bootstrap used by scripts launched from the Rust Manager."""
+
 import sys
 
 from typing import Dict, Type
@@ -7,7 +9,11 @@ from .worker import Worker
 
 
 def _parse_extra_args(args: list[str]) -> Dict[str, str]:
-    """Parse --key=value arguments into a dict."""
+    """Parse ``--key=value`` arguments, ignoring every other token.
+
+    Later occurrences of the same key replace earlier values. Values may
+    contain additional ``=`` characters.
+    """
     extra: Dict[str, str] = {}
     for arg in args:
         if arg.startswith("--") and "=" in arg:
@@ -17,11 +23,27 @@ def _parse_extra_args(args: list[str]) -> Dict[str, str]:
 
 
 def RunScript(worker_class: Type[Worker]):
-    """Instantiate and run a Worker subclass.
+    """Instantiate a :class:`Worker` subclass and run its receive loop.
 
-    Reads the socket path from ``sys.argv[1]`` and the required worker ID from
-    ``sys.argv[2]``. Remaining ``--key=value`` arguments are exposed as
-    ``Worker.extra``.
+    The Rust Manager supplies the Unix socket path in ``sys.argv[1]`` and the
+    required worker identity in ``sys.argv[2]``. Remaining ``--key=value``
+    tokens populate :attr:`Worker.extra`.
+
+    ``worker_class`` must inherit :class:`Worker`. Missing arguments, an
+    invalid class, connection failure, or another initialization exception
+    prints a diagnostic and exits with status 1.
+
+    Example:
+        .. code-block:: python
+
+            from runpyrs import RunScript, Worker
+
+            class MyWorker(Worker):
+                def execute(self, data: dict) -> dict:
+                    return {"result": data}
+
+            if __name__ == "__main__":
+                RunScript(MyWorker)
     """
     try:
         if len(sys.argv) < 3:

@@ -31,8 +31,8 @@ class MyWorker(Worker):
                 "links_count": 1,
             }
         except Exception as e:
-            # It's ok to raise exceptions here, they will be caught and sent back
-            # to Rust as ERROR messages, thus terminating the worker gracefully.
+            # The Worker base class converts this exception into an error envelope.
+            # The receive loop stays alive until Rust sends terminate or the socket closes.
             raise RuntimeError(f"Error during execution: {e}")
 
 

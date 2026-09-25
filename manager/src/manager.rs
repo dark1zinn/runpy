@@ -13,15 +13,29 @@ use crate::protocol::{ControlPlane, Envelope, MessageHandler};
 
 // ── Worker Identity ────────────────────────────────────────────────────
 
-/// A unique identity for each spawned worker, composed of the script name,
-/// a timestamp, and a short random suffix.
+/// Unique identity assigned to one spawned worker process.
+///
+/// Names contain the script stem, a minute-resolution timestamp, and a
+/// four-character random suffix. Socket filenames prefix that name with
+/// `rp_` and append `.sock`.
 #[derive(Debug, Clone)]
 pub struct WorkerIdentity {
+    /// Trusted identifier stamped into protocol messages and output records.
     pub name: String,
+    /// Filename used beneath the Manager's socket directory.
     pub sock_file: String,
 }
 
 impl WorkerIdentity {
+    /// Generate a fresh identity for `script`.
+    ///
+    /// ```
+    /// use runpy::WorkerIdentity;
+    ///
+    /// let identity = WorkerIdentity::new("scraper");
+    /// assert!(identity.name.starts_with("scraper_"));
+    /// assert_eq!(identity.sock_file, format!("rp_{}.sock", identity.name));
+    /// ```
     pub fn new(script: &str) -> Self {
         let ts = Local::now().format("%d%m%Y-%H%M").to_string();
         let rnd: String = rand::thread_rng()
@@ -40,9 +54,31 @@ impl WorkerIdentity {
 
 // ── Worker (user-facing) ───────────────────────────────────────────────
 
-/// The user-facing worker object returned by `Manager::worker()`.
-/// It acts as a **builder** before `spawn()` is called, and as a
-/// **remote handle** after spawning (for sending messages, terminating, etc.).
+/// Builder and remote handle for one Python worker.
+///
+/// Configure environment, arguments, and a per-worker handler before
+/// [`Worker::spawn`]. A successful spawn stores the generated identity so the
+/// same value can call [`Worker::send_message`] and [`Worker::terminate`].
+/// The facade uses weak references to Manager-owned services and returns an
+/// error after its Manager is dropped.
+///
+/// ```no_run
+/// use runpy::{Envelope, Manager};
+///
+/// # #[tokio::main]
+/// # async fn main() {
+/// let manager = Manager::new("worker");
+/// let mut worker = manager.worker("my_worker");
+/// worker
+///     .env("MODE", "fast")
+///     .arg("batch", "10")
+///     .on_message(|inbound| println!("{:?}", inbound.envelope));
+///
+/// worker.spawn().await.expect("worker starts");
+/// worker.send_message(Envelope::retry()).await.expect("message sent");
+/// worker.terminate().await.expect("worker stopped");
+/// # }
+/// ```
 pub struct Worker {
     script: String,
     integrity: Weak<IntegrityChecker>,
@@ -74,25 +110,71 @@ impl Worker {
         }
     }
 
-    /// Set an environment variable that will be passed to the Python process.
+    /// Set or replace an environment variable passed to `uv` and Python.
+    ///
+    /// Runpy applies `PYTHONUNBUFFERED=1` after builder values, so that one key
+    /// cannot be overridden.
+    ///
+    /// ```no_run
+    /// # use runpy::Manager;
+    /// let manager = Manager::new("worker");
+    /// let mut worker = manager.worker("my_worker");
+    /// worker.env("API_BASE", "https://example.com");
+    /// ```
     pub fn env(&mut self, key: &str, value: &str) -> &mut Self {
         self.env_vars.insert(key.to_string(), value.to_string());
         self
     }
 
-    /// Add an extra `--key=value` argument for the Python process.
+    /// Set or replace one extra `--key=value` worker argument.
+    ///
+    /// Python exposes recognized arguments through `Worker.extra`.
+    ///
+    /// ```no_run
+    /// # use runpy::Manager;
+    /// let manager = Manager::new("worker");
+    /// let mut worker = manager.worker("my_worker");
+    /// worker.arg("mode", "fast");
+    /// ```
     pub fn arg(&mut self, key: &str, value: &str) -> &mut Self {
         self.extra_args.insert(key.to_string(), value.to_string());
         self
     }
 
-    /// Add multiple extra arguments at once.
+    /// Merge multiple extra worker arguments.
+    ///
+    /// Values in `args` replace existing values for matching keys.
+    ///
+    /// ```no_run
+    /// use std::collections::HashMap;
+    /// # use runpy::Manager;
+    ///
+    /// let manager = Manager::new("worker");
+    /// let mut worker = manager.worker("my_worker");
+    /// worker.args(HashMap::from([
+    ///     ("mode".to_string(), "fast".to_string()),
+    ///     ("batch".to_string(), "10".to_string()),
+    /// ]));
+    /// ```
     pub fn args(&mut self, args: HashMap<String, String>) -> &mut Self {
         self.extra_args.extend(args);
         self
     }
 
-    /// Register a per-worker handler that runs after the Manager handler.
+    /// Replace the per-worker inbound-envelope handler.
+    ///
+    /// For this worker, the current Manager-global handler runs first and this
+    /// handler runs second. The handler captured at spawn executes
+    /// synchronously in the protocol task and should return promptly.
+    ///
+    /// ```no_run
+    /// # use runpy::Manager;
+    /// let manager = Manager::new("worker");
+    /// let mut worker = manager.worker("my_worker");
+    /// worker.on_message(|inbound| {
+    ///     println!("{:?}", inbound.envelope.data());
+    /// });
+    /// ```
     pub fn on_message<F>(&mut self, handler: F) -> &mut Self
     where
         F: Fn(crate::protocol::InboundEnvelope) + Send + Sync + 'static,
@@ -101,7 +183,28 @@ impl Worker {
         self
     }
 
-    /// Spawn the Python worker and register it with the Manager control plane.
+    /// Start the configured script and register it with the Manager.
+    ///
+    /// This re-runs integrity checks, requires a root-level `<script>.py`,
+    /// creates a unique socket, and launches `uv run --no-project [--locked]
+    /// --script`. The returned string is the trusted worker ID. Registration
+    /// owns the child process group, protocol session, and output readers.
+    ///
+    /// Errors include a dropped Manager, failed integrity/path validation,
+    /// missing script, socket/spawn/pipe registration failure, shutdown in
+    /// progress, and attempting to spawn the same facade twice. Post-spawn
+    /// registration failures clean up the child process group and socket.
+    ///
+    /// ```no_run
+    /// # use runpy::Manager;
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// let manager = Manager::new("worker");
+    /// let mut worker = manager.worker("my_worker");
+    /// let worker_id = worker.spawn().await.expect("worker starts");
+    /// println!("{worker_id}");
+    /// # }
+    /// ```
     pub async fn spawn(&mut self) -> Result<String, String> {
         if self.worker_id.is_some() {
             return Err("Worker has already been spawned".to_string());
@@ -170,6 +273,8 @@ impl Worker {
             ),
         );
 
+        // Keep std::process::Child as the ownership boundary: Watchdog polls it
+        // synchronously while Tokio adapts only the detached output pipes.
         let mut cmd = std::process::Command::new(&uv_path);
         cmd.arg("run").arg("--no-project");
         if lock_file.is_file() {
@@ -192,6 +297,8 @@ impl Worker {
         cmd.env("PYTHONUNBUFFERED", "1")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        // A separate process group lets every uv/Python descendant be stopped
+        // together; piped streams are drained independently by ControlPlane.
         #[cfg(unix)]
         cmd.process_group(0);
 
@@ -220,7 +327,29 @@ impl Worker {
         Ok(worker_id)
     }
 
-    /// Send an [`Envelope`] to the spawned worker.
+    /// Send an envelope to this facade's registered worker.
+    ///
+    /// Calling before a successful spawn, after Manager drop, or after worker
+    /// removal returns an error.
+    ///
+    /// ```no_run
+    /// use runpy::{Data, Envelope, Manager};
+    /// use serde_json::{json, Value};
+    ///
+    /// # fn object(value: Value) -> Data {
+    /// #     value.as_object().cloned().unwrap()
+    /// # }
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// let manager = Manager::new("worker");
+    /// let mut worker = manager.worker("my_worker");
+    /// worker.spawn().await.unwrap();
+    /// worker
+    ///     .send_message(Envelope::execute(object(json!({"task": "parse"}))))
+    ///     .await
+    ///     .unwrap();
+    /// # }
+    /// ```
     pub async fn send_message(&self, envelope: Envelope) -> Result<(), String> {
         let worker_id = self
             .worker_id
@@ -233,7 +362,22 @@ impl Worker {
         control_plane.send(worker_id, envelope).await
     }
 
-    /// Request graceful termination, then force-stop the worker process group.
+    /// Request graceful termination, then force process-group cleanup.
+    ///
+    /// On a successful send the control plane waits two seconds before
+    /// removal. Cleanup still runs when sending fails; the send error is then
+    /// returned. Calling before spawn or after Manager drop returns an error.
+    ///
+    /// ```no_run
+    /// # use runpy::Manager;
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// let manager = Manager::new("worker");
+    /// let mut worker = manager.worker("my_worker");
+    /// worker.spawn().await.unwrap();
+    /// worker.terminate().await.unwrap();
+    /// # }
+    /// ```
     pub async fn terminate(&self) -> Result<(), String> {
         let worker_id = self
             .worker_id

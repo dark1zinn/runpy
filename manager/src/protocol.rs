@@ -21,7 +21,11 @@ use crate::manager::WorkerIdentity;
 use crate::scribbler::Scribbler;
 use crate::watchdog::WatchdogService;
 
+/// Application-owned envelope metadata.
+///
+/// Every key beginning with `x_` is reserved by Runpy.
 pub type Meta = Map<String, Value>;
+/// Application-owned envelope data.
 pub type Data = Map<String, Value>;
 
 const X_WORKER_ID: &str = "x_wid";
@@ -44,14 +48,22 @@ const OUTPUT_READ_BUFFER_SIZE: usize = 8 * 1024;
 const OUTPUT_RECORD_LIMIT: usize = 16 * 1024;
 const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 
+/// Validation failure for reserved metadata or operation direction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnvelopeError {
+    /// Application metadata supplied a key in Runpy's reserved `x_` namespace.
     ReservedMetadata(String),
+    /// A decoded wire envelope contained an unrecognized `x_` key.
     UnknownReservedMetadata(String),
+    /// A decoded reserved metadata value was not a string.
     InvalidReservedMetadata(String),
+    /// `x_op` named an operation outside Runpy's operation set.
     InvalidOperation(String),
+    /// A known operation was sent from the wrong protocol side.
     WrongDirection {
+        /// Rejected operation name.
         operation: String,
+        /// Human-readable expected message direction.
         direction: &'static str,
     },
 }
@@ -84,10 +96,26 @@ impl fmt::Display for EnvelopeError {
 
 impl std::error::Error for EnvelopeError {}
 
-/// The complete value exchanged between the Rust manager and Python workers.
+/// Complete JSON value exchanged between the Rust Manager and Python worker.
 ///
-/// Both `meta` and `data` are always JSON objects. Keys beginning with `x_`
-/// are reserved for Runpy and cannot be supplied through [`Envelope::new`].
+/// Both fields are JSON objects. [`Envelope::new`] creates application
+/// messages and rejects all `x_` metadata; operation constructors add the
+/// appropriate Manager-to-worker `x_op`. Runpy stamps trusted `x_wid` and
+/// `x_spath` values when writing a frame.
+///
+/// ```
+/// use runpy::{Data, Envelope, Meta};
+/// use serde_json::json;
+///
+/// let mut meta = Meta::new();
+/// meta.insert("correlation_id".into(), json!(42));
+/// let mut data = Data::new();
+/// data.insert("task".into(), json!("parse"));
+///
+/// let envelope = Envelope::new(meta, data).unwrap();
+/// assert_eq!(envelope.meta()["correlation_id"], 42);
+/// assert_eq!(envelope.data()["task"], "parse");
+/// ```
 #[derive(Serialize, Debug, Clone, PartialEq)]
 pub struct Envelope {
     meta: Meta,
@@ -116,7 +144,22 @@ impl<'de> Deserialize<'de> for Envelope {
 }
 
 impl Envelope {
-    /// Build an application-defined envelope.
+    /// Build an application-defined envelope with no `x_op`.
+    ///
+    /// Returns [`EnvelopeError::ReservedMetadata`] when any metadata key
+    /// begins with `x_`.
+    ///
+    /// ```
+    /// use runpy::{Data, Envelope, Meta};
+    /// use serde_json::json;
+    ///
+    /// let envelope = Envelope::new(
+    ///     Meta::from_iter([("correlation_id".into(), json!(7))]),
+    ///     Data::from_iter([("value".into(), json!("ok"))]),
+    /// )
+    /// .unwrap();
+    /// assert_eq!(envelope.data()["value"], "ok");
+    /// ```
     pub fn new(meta: Meta, data: Data) -> Result<Self, EnvelopeError> {
         if let Some(key) = meta.keys().find(|key| key.starts_with("x_")) {
             return Err(EnvelopeError::ReservedMetadata(key.clone()));
@@ -124,25 +167,50 @@ impl Envelope {
         Ok(Self { meta, data })
     }
 
-    /// Build a manager request that executes a worker payload.
+    /// Build a Manager-to-worker `execute` request.
+    ///
+    /// ```
+    /// use runpy::{Data, Envelope};
+    /// use serde_json::json;
+    ///
+    /// let envelope = Envelope::execute(Data::from_iter([("task".into(), json!("parse"))]));
+    /// assert_eq!(envelope.meta()["x_op"], "execute");
+    /// ```
     pub fn execute(data: Data) -> Self {
         Self::with_operation("execute", data)
     }
 
-    /// Build a manager request that repeats the most recent execution.
+    /// Build a Manager-to-worker `retry` request with empty data.
+    ///
+    /// ```
+    /// use runpy::Envelope;
+    ///
+    /// let envelope = Envelope::retry();
+    /// assert_eq!(envelope.meta()["x_op"], "retry");
+    /// assert!(envelope.data().is_empty());
+    /// ```
     pub fn retry() -> Self {
         Self::with_operation("retry", Data::new())
     }
 
-    /// Build a manager request that gracefully terminates a worker.
+    /// Build a Manager-to-worker graceful `terminate` request.
+    ///
+    /// ```
+    /// use runpy::Envelope;
+    ///
+    /// let envelope = Envelope::terminate();
+    /// assert_eq!(envelope.meta()["x_op"], "terminate");
+    /// ```
     pub fn terminate() -> Self {
         Self::with_operation("terminate", Data::new())
     }
 
+    /// Borrow this envelope's metadata object.
     pub fn meta(&self) -> &Meta {
         &self.meta
     }
 
+    /// Borrow this envelope's application data object.
     pub fn data(&self) -> &Data {
         &self.data
     }
@@ -224,42 +292,88 @@ fn validate_direction(
     Ok(())
 }
 
+/// Shared synchronous callback type for validated worker envelopes.
+///
+/// Handlers should return promptly because they run in the protocol task.
 pub type MessageHandler = Arc<dyn Fn(InboundEnvelope) + Send + Sync>;
 
-/// The operating-system stream that produced a worker output record.
+/// Operating-system stream that produced a [`WorkerOutput`] record.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WorkerOutputStream {
+    /// Captured process standard output; logged at info level.
     Stdout,
+    /// Captured process standard error; logged at warning level.
     Stderr,
 }
 
 /// One newline-free record captured from a managed worker process.
+///
+/// Records preserve byte order within a stream, but no total order exists
+/// between stdout, stderr, and socket envelopes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkerOutput {
+    /// Trusted Manager-generated worker identity.
     pub worker_id: String,
+    /// Source operating-system stream.
     pub stream: WorkerOutputStream,
+    /// Lossy UTF-8 text with terminal control characters escaped.
     pub line: String,
+    /// Whether the 16 KiB limit was reached before a newline.
     pub truncated: bool,
+    /// Records dropped for this worker/stream before this accepted record.
     pub dropped_lines_before: u64,
 }
 
+/// Shared callback type for attributed worker process output.
+///
+/// It runs on the dedicated output-dispatcher thread and should return
+/// promptly. Runpy catches callback panics so the dispatcher can continue.
 pub type WorkerOutputHandler = Arc<dyn Fn(WorkerOutput) + Send + Sync>;
 
-/// A received wire envelope plus a reply route to its originating worker.
+/// Validated worker envelope plus a reply route to its source.
+///
+/// The Manager overwrites `x_wid` and `x_spath` with trusted values before
+/// constructing this context.
 #[derive(Clone)]
 pub struct InboundEnvelope {
+    /// Received envelope, including trusted routing metadata.
     pub envelope: Envelope,
     worker_id: String,
     mailer: Arc<Mailer>,
 }
 
 impl InboundEnvelope {
-    /// Send a reply to the worker that produced this envelope.
+    /// Queue a best-effort reply to the originating worker.
+    ///
+    /// Queue saturation is handed to an asynchronous send and reported through
+    /// the Manager logger; use [`InboundEnvelope::reply_async`] when the caller
+    /// needs a returned delivery error.
+    ///
+    /// ```no_run
+    /// use runpy::{Envelope, Manager};
+    ///
+    /// let mut manager = Manager::new("worker");
+    /// manager.on_message(|inbound| inbound.reply(Envelope::retry()));
+    /// ```
     pub fn reply(&self, envelope: Envelope) {
         self.mailer.send(self.worker_id.clone(), envelope);
     }
 
-    /// Send a reply and observe whether it reached the worker route.
+    /// Send a reply and wait for the originating worker's bounded route.
+    ///
+    /// Returns an error when that worker is no longer registered or its route
+    /// has closed.
+    ///
+    /// ```no_run
+    /// use runpy::{Envelope, Manager};
+    ///
+    /// let mut manager = Manager::new("worker");
+    /// manager.on_message(|inbound| {
+    ///     tokio::spawn(async move {
+    ///         let _ = inbound.reply_async(Envelope::retry()).await;
+    ///     });
+    /// });
+    /// ```
     pub async fn reply_async(&self, envelope: Envelope) -> Result<(), String> {
         self.mailer.send_async(&self.worker_id, envelope).await
     }
@@ -280,6 +394,10 @@ impl MessageSender {
     }
 }
 
+/// Process and routing state retained for one registered worker.
+///
+/// The standard child remains here so Watchdog polling and synchronous
+/// process-group cleanup share one ownership boundary.
 pub(crate) struct WorkerHandle {
     pub child: Child,
     pub identity: WorkerIdentity,
@@ -288,12 +406,20 @@ pub(crate) struct WorkerHandle {
     pub process_group_id: u32,
 }
 
+/// Process-lifetime tasks removed as one unit during cleanup.
+///
+/// The socket session can reconnect; stdout/stderr readers remain singular for
+/// the lifetime of the process.
 struct WorkerTasks {
     session: JoinHandle<()>,
     stdout: JoinHandle<()>,
     stderr: JoinHandle<()>,
 }
 
+/// Bounded bridge from asynchronous pipe readers to synchronous observers.
+///
+/// Its detached standard thread owns Scribbler writes and user callbacks so
+/// neither can block a Tokio runtime worker. Callback panics are contained.
 struct WorkerOutputDispatcher {
     sender: SyncSender<WorkerOutput>,
     closed: Arc<AtomicBool>,
@@ -376,6 +502,10 @@ struct WorkerSession {
     logger: Arc<Scribbler>,
 }
 
+/// Kill the complete process group when possible, then reap the stored child.
+///
+/// Reaping is required on every registration/removal failure path to avoid
+/// leaking a zombie `uv` process.
 fn force_stop_child(child: &mut Child, process_group_id: u32) {
     #[cfg(unix)]
     {
@@ -405,6 +535,7 @@ fn cleanup_unregistered_worker(child: &mut Child, process_group_id: u32, sock_pa
     let _ = std::fs::remove_file(sock_path);
 }
 
+/// Decode worker bytes lossily and neutralize terminal control characters.
 fn sanitize_output(bytes: &[u8]) -> String {
     let decoded = String::from_utf8_lossy(bytes);
     let mut sanitized = String::with_capacity(decoded.len());
@@ -418,6 +549,8 @@ fn sanitize_output(bytes: &[u8]) -> String {
     sanitized
 }
 
+/// Submit without waiting; queue pressure drops records rather than blocking
+/// pipe drainage and reports accumulated loss on the next accepted record.
 fn enqueue_worker_output(
     sender: &SyncSender<WorkerOutput>,
     worker_id: &str,
@@ -442,6 +575,11 @@ fn enqueue_worker_output(
     }
 }
 
+/// Frame one async byte stream into bounded, newline-free output records.
+///
+/// Newline is the only delimiter, one preceding carriage return is normalized,
+/// EOF emits an unterminated fragment, and 16 KiB segments bound retained
+/// memory for newline-free output.
 async fn capture_worker_output<R>(
     reader: R,
     worker_id: String,
@@ -529,7 +667,10 @@ async fn capture_worker_output<R>(
     }
 }
 
-/// The single worker router owned by a [`crate::Manager`].
+/// Shared worker registry, router, monitoring service, and task owner.
+///
+/// Manager is the public composition root. This private service centralizes
+/// process registration so worker facades cannot outlive cleanup ownership.
 pub(crate) struct ControlPlane {
     closed: AtomicBool,
     workers: Arc<RwLock<HashMap<String, WorkerHandle>>>,
@@ -641,7 +782,9 @@ impl ControlPlane {
         let (tx, outbound_rx) = mpsc::channel::<Envelope>(64);
         let sender = MessageSender { tx };
 
-        // Keep task registration and worker insertion together with shutdown.
+        // Registration and synchronous shutdown acquire sessions before
+        // workers. Preserve that order to avoid deadlocking concurrent cleanup.
+        // Insertion of the child and all task handles stays atomic with `closed`.
         let mut sessions = self.sessions.lock();
         let mut workers = self.workers.write();
         if self.closed.load(Ordering::Acquire) {
@@ -890,6 +1033,10 @@ impl ControlPlane {
         }
     }
 
+    /// Read one little-endian length-prefixed JSON envelope.
+    ///
+    /// A malformed body or I/O failure ends only the current socket connection;
+    /// the outer session loop can accept a reconnect from the same process.
     async fn recv_envelope(logger: &Scribbler, stream: &mut UnixStream) -> Option<Envelope> {
         let mut size_buf = [0_u8; 8];
         if let Err(error) = stream.read_exact(&mut size_buf).await {
@@ -935,6 +1082,8 @@ impl ControlPlane {
         }
     }
 
+    /// Validate direction, overwrite trusted routing fields, and write one
+    /// little-endian length-prefixed JSON envelope.
     async fn write_stamped_envelope(
         worker_id: &str,
         socket_path: &str,
