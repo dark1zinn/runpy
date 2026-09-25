@@ -50,6 +50,14 @@
 //! internal mailer, and all running workers. [`Worker`] values are lightweight
 //! facades and cannot outlive the Manager-owned services.
 //!
+//! ## Worker process output
+//!
+//! The control plane asynchronously captures each managed process's stdout and
+//! stderr, emits attributed records through the Manager-owned logger, and makes
+//! the same records available through [`Manager::on_worker_output`]. Output is
+//! bounded and best effort; it is separate from structured socket envelopes
+//! and never causes automatic worker termination.
+//!
 //! ## Quick start
 //!
 //! ```ignore
@@ -91,7 +99,10 @@ use crate::protocol::ControlPlane;
 
 // ── Public re-exports ──────────────────────────────────────────────────
 pub use manager::{Worker, WorkerIdentity};
-pub use protocol::{Data, Envelope, EnvelopeError, InboundEnvelope, MessageHandler, Meta};
+pub use protocol::{
+    Data, Envelope, EnvelopeError, InboundEnvelope, MessageHandler, Meta, WorkerOutput,
+    WorkerOutputHandler, WorkerOutputStream,
+};
 pub use scribbler::{LogLevel, Scribbler};
 pub use watchdog::{ProcessState, WatchdogService as Watchdog, WorkerReport};
 
@@ -171,6 +182,18 @@ impl Manager {
         F: Fn(InboundEnvelope) + Send + Sync + 'static,
     {
         self.control_plane.set_global_handler(Arc::new(handler));
+    }
+
+    /// Observe attributed stdout and stderr records from every managed worker.
+    ///
+    /// The latest handler replaces the previous one. It runs on Runpy's output
+    /// dispatcher thread and should return promptly.
+    pub fn on_worker_output<F>(&mut self, handler: F)
+    where
+        F: Fn(WorkerOutput) + Send + Sync + 'static,
+    {
+        self.control_plane
+            .set_worker_output_handler(Arc::new(handler));
     }
 
     /// Re-run the full integrity check.

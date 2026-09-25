@@ -1,8 +1,9 @@
-use runpy::{Envelope, Manager, Worker, WorkerIdentity};
+use runpy::{Envelope, Manager, Worker, WorkerIdentity, WorkerOutputStream};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::mpsc as std_mpsc;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
@@ -193,6 +194,95 @@ async fn spawn_rejects_missing_worker_script_before_binding() {
             scripts.join("missing.py").display()
         ))
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn worker_output_is_attributed_and_python_is_forced_unbuffered() {
+    let tmp = TempDir::new().unwrap();
+    let unbuffered_file = tmp.path().join("python-unbuffered");
+    let uv = write_executable(
+        &tmp,
+        "uv",
+        r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+    exit 0
+fi
+printf '%s' "$PYTHONUNBUFFERED" > "$RUNPY_TEST_UNBUFFERED"
+printf 'startup stdout\n'
+printf 'startup stderr\n' >&2
+sleep 300
+"#,
+    );
+    let scripts = scripts_dir(&tmp, &["managed"]);
+    let mut manager = manager_with_uv(&scripts, &uv);
+    let (output_tx, output_rx) = std_mpsc::channel();
+    manager.on_worker_output(move |output| {
+        let _ = output_tx.send(output);
+    });
+    let mut worker = manager.worker("managed");
+    worker
+        .env("PYTHONUNBUFFERED", "0")
+        .env("RUNPY_TEST_UNBUFFERED", unbuffered_file.to_str().unwrap());
+
+    let worker_id = worker.spawn().await.unwrap();
+    wait_for_file(&unbuffered_file).await;
+    assert_eq!(fs::read_to_string(&unbuffered_file).unwrap(), "1");
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut outputs = Vec::new();
+    while outputs.len() < 2 {
+        while let Ok(output) = output_rx.try_recv() {
+            outputs.push(output);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for attributed worker output"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    outputs.sort_by_key(|output| match output.stream {
+        WorkerOutputStream::Stdout => 0,
+        WorkerOutputStream::Stderr => 1,
+    });
+    assert_eq!(outputs[0].worker_id, worker_id);
+    assert_eq!(outputs[0].stream, WorkerOutputStream::Stdout);
+    assert_eq!(outputs[0].line, "startup stdout");
+    assert_eq!(outputs[1].worker_id, worker_id);
+    assert_eq!(outputs[1].stream, WorkerOutputStream::Stderr);
+    assert_eq!(outputs[1].line, "startup stderr");
+
+    drop(manager);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn high_volume_worker_output_does_not_block_process_progress() {
+    let tmp = TempDir::new().unwrap();
+    let marker_file = tmp.path().join("output-complete");
+    let uv = write_executable(
+        &tmp,
+        "uv",
+        r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+    exit 0
+fi
+dd if=/dev/zero bs=131072 count=1 2>/dev/null | tr '\0' x
+dd if=/dev/zero bs=131072 count=1 2>/dev/null | tr '\0' y >&2
+printf 'done' > "$RUNPY_TEST_OUTPUT_MARKER"
+sleep 300
+"#,
+    );
+    let scripts = scripts_dir(&tmp, &["managed"]);
+    let manager = manager_with_uv(&scripts, &uv);
+    let mut worker = manager.worker("managed");
+    worker.env("RUNPY_TEST_OUTPUT_MARKER", marker_file.to_str().unwrap());
+
+    worker.spawn().await.unwrap();
+    wait_for_file(&marker_file).await;
+    assert_eq!(fs::read_to_string(&marker_file).unwrap(), "done");
+
+    drop(manager);
 }
 
 #[cfg(unix)]

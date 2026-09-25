@@ -3,15 +3,19 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::fmt;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::process::Child;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Weak};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::thread;
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::process::{ChildStderr, ChildStdout};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tokio::time::{Duration, interval};
+use tokio::time::{Duration, interval, timeout};
 
 use crate::manager::WorkerIdentity;
 use crate::scribbler::Scribbler;
@@ -34,6 +38,11 @@ const OPERATIONS: &[&str] = &[
 ];
 const MANAGER_OPERATIONS: &[&str] = &["execute", "retry", "terminate"];
 const WORKER_OPERATIONS: &[&str] = &["ready", "done", "error", "log"];
+
+const OUTPUT_QUEUE_CAPACITY: usize = 256;
+const OUTPUT_READ_BUFFER_SIZE: usize = 8 * 1024;
+const OUTPUT_RECORD_LIMIT: usize = 16 * 1024;
+const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnvelopeError {
@@ -217,6 +226,25 @@ fn validate_direction(
 
 pub type MessageHandler = Arc<dyn Fn(InboundEnvelope) + Send + Sync>;
 
+/// The operating-system stream that produced a worker output record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WorkerOutputStream {
+    Stdout,
+    Stderr,
+}
+
+/// One newline-free record captured from a managed worker process.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkerOutput {
+    pub worker_id: String,
+    pub stream: WorkerOutputStream,
+    pub line: String,
+    pub truncated: bool,
+    pub dropped_lines_before: u64,
+}
+
+pub type WorkerOutputHandler = Arc<dyn Fn(WorkerOutput) + Send + Sync>;
+
 /// A received wire envelope plus a reply route to its originating worker.
 #[derive(Clone)]
 pub struct InboundEnvelope {
@@ -260,6 +288,83 @@ pub(crate) struct WorkerHandle {
     pub process_group_id: u32,
 }
 
+struct WorkerTasks {
+    session: JoinHandle<()>,
+    stdout: JoinHandle<()>,
+    stderr: JoinHandle<()>,
+}
+
+struct WorkerOutputDispatcher {
+    sender: SyncSender<WorkerOutput>,
+    closed: Arc<AtomicBool>,
+}
+
+impl WorkerOutputStream {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Stdout => "stdout",
+            Self::Stderr => "stderr",
+        }
+    }
+}
+
+impl WorkerOutputDispatcher {
+    fn new(
+        logger: Arc<Scribbler>,
+        handler: Arc<RwLock<Option<WorkerOutputHandler>>>,
+    ) -> Result<Self, String> {
+        let (sender, receiver) = sync_channel::<WorkerOutput>(OUTPUT_QUEUE_CAPACITY);
+        let closed = Arc::new(AtomicBool::new(false));
+        let thread_closed = closed.clone();
+        thread::Builder::new()
+            .name("runpy-worker-output".to_string())
+            .spawn(move || {
+                while let Ok(output) = receiver.recv() {
+                    if thread_closed.load(Ordering::Acquire) {
+                        break;
+                    }
+
+                    let mut message = format!(
+                        "[worker:{}][{}] {}",
+                        output.worker_id,
+                        output.stream.as_str(),
+                        output.line
+                    );
+                    if output.truncated {
+                        message.push_str(" [continued]");
+                    }
+                    if output.dropped_lines_before > 0 {
+                        message.push_str(&format!(
+                            " [dropped {} prior record(s)]",
+                            output.dropped_lines_before
+                        ));
+                    }
+
+                    match output.stream {
+                        WorkerOutputStream::Stdout => logger.info(&message),
+                        WorkerOutputStream::Stderr => logger.warning(&message),
+                    }
+                    let current_handler = handler.read().clone();
+                    if let Some(handler) = current_handler
+                        && catch_unwind(AssertUnwindSafe(|| handler(output))).is_err()
+                    {
+                        logger.error_with(
+                            "WorkerOutput",
+                            "Worker output handler panicked; continuing output dispatch",
+                        );
+                    }
+                }
+            })
+            .map_err(|error| format!("Failed to start worker output dispatcher: {error}"))?;
+
+        Ok(Self { sender, closed })
+    }
+
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+    }
+}
+
 struct WorkerSession {
     control_plane: Weak<ControlPlane>,
     listener: UnixListener,
@@ -271,33 +376,167 @@ struct WorkerSession {
     logger: Arc<Scribbler>,
 }
 
-pub(crate) fn force_stop_worker(handle: &mut WorkerHandle) {
+fn force_stop_child(child: &mut Child, process_group_id: u32) {
     #[cfg(unix)]
     {
-        let result =
-            unsafe { libc::kill(-(handle.process_group_id as libc::pid_t), libc::SIGKILL) };
+        let result = unsafe { libc::kill(-(process_group_id as libc::pid_t), libc::SIGKILL) };
         if result != 0 {
             let error = std::io::Error::last_os_error();
             if error.raw_os_error() != Some(libc::ESRCH) {
-                let _ = handle.child.kill();
+                let _ = child.kill();
             }
         }
     }
 
     #[cfg(not(unix))]
     {
-        let _ = handle.child.kill();
+        let _ = child.kill();
     }
 
-    let _ = handle.child.wait();
+    let _ = child.wait();
+}
+
+pub(crate) fn force_stop_worker(handle: &mut WorkerHandle) {
+    force_stop_child(&mut handle.child, handle.process_group_id);
+}
+
+fn cleanup_unregistered_worker(child: &mut Child, process_group_id: u32, sock_path: &PathBuf) {
+    force_stop_child(child, process_group_id);
+    let _ = std::fs::remove_file(sock_path);
+}
+
+fn sanitize_output(bytes: &[u8]) -> String {
+    let decoded = String::from_utf8_lossy(bytes);
+    let mut sanitized = String::with_capacity(decoded.len());
+    for character in decoded.chars() {
+        if character == '\t' || !character.is_control() {
+            sanitized.push(character);
+        } else {
+            sanitized.extend(character.escape_default());
+        }
+    }
+    sanitized
+}
+
+fn enqueue_worker_output(
+    sender: &SyncSender<WorkerOutput>,
+    worker_id: &str,
+    stream: WorkerOutputStream,
+    bytes: &[u8],
+    truncated: bool,
+    dropped_lines: &mut u64,
+) {
+    let output = WorkerOutput {
+        worker_id: worker_id.to_string(),
+        stream,
+        line: sanitize_output(bytes),
+        truncated,
+        dropped_lines_before: *dropped_lines,
+    };
+    match sender.try_send(output) {
+        Ok(()) => *dropped_lines = 0,
+        Err(TrySendError::Full(_)) => {
+            *dropped_lines = dropped_lines.saturating_add(1);
+        }
+        Err(TrySendError::Disconnected(_)) => {}
+    }
+}
+
+async fn capture_worker_output<R>(
+    reader: R,
+    worker_id: String,
+    stream: WorkerOutputStream,
+    sender: SyncSender<WorkerOutput>,
+) where
+    R: AsyncRead + Unpin,
+{
+    let mut reader = BufReader::with_capacity(OUTPUT_READ_BUFFER_SIZE, reader);
+    let mut pending = Vec::with_capacity(OUTPUT_RECORD_LIMIT);
+    let mut dropped_lines = 0_u64;
+
+    loop {
+        let available = match reader.fill_buf().await {
+            Ok(available) => available,
+            Err(error) => {
+                let diagnostic = format!("Failed to read {} pipe: {error}", stream.as_str());
+                enqueue_worker_output(
+                    &sender,
+                    &worker_id,
+                    WorkerOutputStream::Stderr,
+                    diagnostic.as_bytes(),
+                    false,
+                    &mut dropped_lines,
+                );
+                return;
+            }
+        };
+
+        if available.is_empty() {
+            if !pending.is_empty() {
+                enqueue_worker_output(
+                    &sender,
+                    &worker_id,
+                    stream,
+                    &pending,
+                    false,
+                    &mut dropped_lines,
+                );
+            }
+            return;
+        }
+
+        let mut consumed = 0;
+        while consumed < available.len() {
+            let remaining = &available[consumed..];
+            let capacity = OUTPUT_RECORD_LIMIT - pending.len();
+            let newline = remaining.iter().position(|byte| *byte == b'\n');
+
+            if let Some(position) = newline
+                && position <= capacity
+            {
+                pending.extend_from_slice(&remaining[..position]);
+                if pending.last() == Some(&b'\r') {
+                    pending.pop();
+                }
+                enqueue_worker_output(
+                    &sender,
+                    &worker_id,
+                    stream,
+                    &pending,
+                    false,
+                    &mut dropped_lines,
+                );
+                pending.clear();
+                consumed += position + 1;
+            } else if remaining.len() >= capacity {
+                pending.extend_from_slice(&remaining[..capacity]);
+                enqueue_worker_output(
+                    &sender,
+                    &worker_id,
+                    stream,
+                    &pending,
+                    true,
+                    &mut dropped_lines,
+                );
+                pending.clear();
+                consumed += capacity;
+            } else {
+                pending.extend_from_slice(remaining);
+                consumed = available.len();
+            }
+        }
+        reader.consume(consumed);
+    }
 }
 
 /// The single worker router owned by a [`crate::Manager`].
 pub(crate) struct ControlPlane {
     closed: AtomicBool,
     workers: Arc<RwLock<HashMap<String, WorkerHandle>>>,
-    sessions: Mutex<HashMap<String, JoinHandle<()>>>,
+    sessions: Mutex<HashMap<String, WorkerTasks>>,
     global_handler: RwLock<Option<MessageHandler>>,
+    output_handler: Arc<RwLock<Option<WorkerOutputHandler>>>,
+    output_dispatcher: Mutex<Option<WorkerOutputDispatcher>>,
     watchdog: WatchdogService,
     mailer: Arc<Mailer>,
     logger: Arc<Scribbler>,
@@ -318,6 +557,8 @@ impl ControlPlane {
             workers,
             sessions: Mutex::new(HashMap::new()),
             global_handler: RwLock::new(None),
+            output_handler: Arc::new(RwLock::new(None)),
+            output_dispatcher: Mutex::new(None),
             watchdog,
             mailer,
             logger,
@@ -354,13 +595,17 @@ impl ControlPlane {
         *self.global_handler.write() = Some(handler);
     }
 
+    pub(crate) fn set_worker_output_handler(&self, handler: WorkerOutputHandler) {
+        *self.output_handler.write() = Some(handler);
+    }
+
     pub(crate) fn watchdog(&self) -> &WatchdogService {
         &self.watchdog
     }
 
     pub(crate) async fn register_worker(
         self: &Arc<Self>,
-        child: Child,
+        mut child: Child,
         identity: WorkerIdentity,
         sock_path: PathBuf,
         socket_path: String,
@@ -369,26 +614,67 @@ impl ControlPlane {
     ) -> Result<(), String> {
         let worker_id = identity.name.clone();
         let process_group_id = child.id();
+        let stdout = match child.stdout.take() {
+            Some(stdout) => ChildStdout::from_std(stdout)
+                .map_err(|error| format!("Failed to attach worker stdout to Tokio: {error}")),
+            None => Err("Worker stdout pipe was not configured".to_string()),
+        };
+        let stdout = match stdout {
+            Ok(stdout) => stdout,
+            Err(error) => {
+                cleanup_unregistered_worker(&mut child, process_group_id, &sock_path);
+                return Err(error);
+            }
+        };
+        let stderr = match child.stderr.take() {
+            Some(stderr) => ChildStderr::from_std(stderr)
+                .map_err(|error| format!("Failed to attach worker stderr to Tokio: {error}")),
+            None => Err("Worker stderr pipe was not configured".to_string()),
+        };
+        let stderr = match stderr {
+            Ok(stderr) => stderr,
+            Err(error) => {
+                cleanup_unregistered_worker(&mut child, process_group_id, &sock_path);
+                return Err(error);
+            }
+        };
         let (tx, outbound_rx) = mpsc::channel::<Envelope>(64);
         let sender = MessageSender { tx };
 
-        // Keep session registration and worker insertion together with shutdown.
+        // Keep task registration and worker insertion together with shutdown.
         let mut sessions = self.sessions.lock();
         let mut workers = self.workers.write();
         if self.closed.load(Ordering::Acquire) {
-            let mut handle = WorkerHandle {
-                child,
-                identity,
-                sock_path,
-                sender,
-                process_group_id,
-            };
             drop(workers);
             drop(sessions);
-            force_stop_worker(&mut handle);
-            let _ = std::fs::remove_file(&handle.sock_path);
+            cleanup_unregistered_worker(&mut child, process_group_id, &sock_path);
             return Err("Worker manager is shutting down".to_string());
         }
+
+        let output_sender = {
+            let mut dispatcher = self.output_dispatcher.lock();
+            if dispatcher.is_none() {
+                let new_dispatcher = match WorkerOutputDispatcher::new(
+                    self.logger.clone(),
+                    self.output_handler.clone(),
+                ) {
+                    Ok(dispatcher) => dispatcher,
+                    Err(error) => {
+                        drop(dispatcher);
+                        drop(workers);
+                        drop(sessions);
+                        cleanup_unregistered_worker(&mut child, process_group_id, &sock_path);
+                        return Err(error);
+                    }
+                };
+                *dispatcher = Some(new_dispatcher);
+            }
+            dispatcher
+                .as_ref()
+                .expect("dispatcher was initialized")
+                .sender
+                .clone()
+        };
 
         self.start_monitoring(5);
         workers.insert(
@@ -402,7 +688,7 @@ impl ControlPlane {
             },
         );
 
-        let task = tokio::spawn(Self::run_session(WorkerSession {
+        let session = tokio::spawn(Self::run_session(WorkerSession {
             control_plane: Arc::downgrade(self),
             listener,
             worker_id: worker_id.clone(),
@@ -412,7 +698,26 @@ impl ControlPlane {
             mailer: self.mailer.clone(),
             logger: self.logger.clone(),
         }));
-        sessions.insert(worker_id, task);
+        let stdout = tokio::spawn(capture_worker_output(
+            stdout,
+            worker_id.clone(),
+            WorkerOutputStream::Stdout,
+            output_sender.clone(),
+        ));
+        let stderr = tokio::spawn(capture_worker_output(
+            stderr,
+            worker_id.clone(),
+            WorkerOutputStream::Stderr,
+            output_sender,
+        ));
+        sessions.insert(
+            worker_id,
+            WorkerTasks {
+                session,
+                stdout,
+                stderr,
+            },
+        );
         Ok(())
     }
 
@@ -463,8 +768,9 @@ impl ControlPlane {
     }
 
     async fn remove_worker(&self, worker_id: &str) {
-        if let Some(task) = self.sessions.lock().remove(worker_id) {
-            task.abort();
+        let tasks = self.sessions.lock().remove(worker_id);
+        if let Some(tasks) = &tasks {
+            tasks.session.abort();
         }
 
         let handle = self.workers.write().remove(worker_id);
@@ -476,6 +782,17 @@ impl ControlPlane {
                 &format!("Removed worker '{}'", handle.identity.name),
             );
         }
+
+        if let Some(tasks) = tasks {
+            Self::finish_output_task(tasks.stdout).await;
+            Self::finish_output_task(tasks.stderr).await;
+        }
+    }
+
+    async fn finish_output_task(mut task: JoinHandle<()>) {
+        if timeout(OUTPUT_DRAIN_TIMEOUT, &mut task).await.is_err() {
+            task.abort();
+        }
     }
 
     pub(crate) fn shutdown_now(&self) {
@@ -484,11 +801,15 @@ impl ControlPlane {
             task.abort();
         }
         let mut sessions = self.sessions.lock();
-        for (_, task) in sessions.drain() {
-            task.abort();
-        }
-
         let mut workers = self.workers.write();
+        if let Some(dispatcher) = self.output_dispatcher.lock().take() {
+            dispatcher.close();
+        }
+        for (_, tasks) in sessions.drain() {
+            tasks.session.abort();
+            tasks.stdout.abort();
+            tasks.stderr.abort();
+        }
         for (_, mut handle) in workers.drain() {
             force_stop_worker(&mut handle);
             let _ = std::fs::remove_file(&handle.sock_path);
@@ -687,7 +1008,8 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::os::unix::process::CommandExt;
-    use std::process::Command;
+    use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::mpsc as std_mpsc;
     use tokio::time::timeout;
 
@@ -712,7 +1034,11 @@ mod tests {
         let listener = UnixListener::bind(&sock_path).unwrap();
         let socket_path = sock_path.to_string_lossy().into_owned();
         let mut command = Command::new("sleep");
-        command.arg("300").process_group(0);
+        command
+            .arg("300")
+            .process_group(0)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         let child = command.spawn().unwrap();
         let identity = WorkerIdentity {
             name: worker_id.to_string(),
@@ -749,6 +1075,141 @@ mod tests {
         let mut payload = vec![0_u8; u64::from_le_bytes(size) as usize];
         stream.read_exact(&mut payload).await.unwrap();
         serde_json::from_slice(&payload).unwrap()
+    }
+
+    #[tokio::test]
+    async fn output_framer_handles_split_crlf_empty_and_eof_records() {
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let (tx, rx) = sync_channel(8);
+        let task = tokio::spawn(capture_worker_output(
+            reader,
+            "worker".to_string(),
+            WorkerOutputStream::Stdout,
+            tx,
+        ));
+
+        writer.write_all(b"one\r").await.unwrap();
+        writer.write_all(b"\n\ntwo").await.unwrap();
+        drop(writer);
+        task.await.unwrap();
+
+        let records: Vec<_> = rx.try_iter().collect();
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].line, "one");
+        assert_eq!(records[1].line, "");
+        assert_eq!(records[2].line, "two");
+        assert!(records.iter().all(|record| {
+            record.worker_id == "worker"
+                && record.stream == WorkerOutputStream::Stdout
+                && !record.truncated
+        }));
+    }
+
+    #[tokio::test]
+    async fn output_framer_handles_invalid_utf8_and_caps_unterminated_records() {
+        let (mut writer, reader) = tokio::io::duplex(OUTPUT_RECORD_LIMIT * 2);
+        let (tx, rx) = sync_channel(8);
+        let task = tokio::spawn(capture_worker_output(
+            reader,
+            "worker".to_string(),
+            WorkerOutputStream::Stderr,
+            tx,
+        ));
+        let mut output = vec![b'x'; OUTPUT_RECORD_LIMIT + 3];
+        output.extend_from_slice(&[b'\n', 0xff, 0x1b, b'A']);
+
+        writer.write_all(&output).await.unwrap();
+        drop(writer);
+        task.await.unwrap();
+
+        let records: Vec<_> = rx.try_iter().collect();
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].line.len(), OUTPUT_RECORD_LIMIT);
+        assert!(records[0].truncated);
+        assert_eq!(records[1].line, "xxx");
+        assert!(!records[1].truncated);
+        assert_eq!(records[2].line, "�\\u{1b}A");
+        assert!(!records[2].truncated);
+    }
+
+    #[test]
+    fn full_output_queue_reports_drops_on_next_accepted_record() {
+        let (tx, rx) = sync_channel(1);
+        let mut dropped = 0;
+        enqueue_worker_output(
+            &tx,
+            "worker",
+            WorkerOutputStream::Stdout,
+            b"first",
+            false,
+            &mut dropped,
+        );
+        enqueue_worker_output(
+            &tx,
+            "worker",
+            WorkerOutputStream::Stdout,
+            b"dropped",
+            false,
+            &mut dropped,
+        );
+        assert_eq!(dropped, 1);
+        assert_eq!(rx.recv().unwrap().line, "first");
+
+        enqueue_worker_output(
+            &tx,
+            "worker",
+            WorkerOutputStream::Stdout,
+            b"next",
+            false,
+            &mut dropped,
+        );
+        let next = rx.recv().unwrap();
+        assert_eq!(next.line, "next");
+        assert_eq!(next.dropped_lines_before, 1);
+        assert_eq!(dropped, 0);
+    }
+
+    #[test]
+    fn output_dispatcher_continues_after_handler_panic() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handler_calls = calls.clone();
+        let (observed_tx, observed_rx) = std_mpsc::channel();
+        let handler: WorkerOutputHandler = Arc::new(move |output| {
+            if handler_calls.fetch_add(1, AtomicOrdering::SeqCst) == 0 {
+                panic!("intentional output handler panic");
+            }
+            observed_tx.send(output.line).unwrap();
+        });
+        let dispatcher =
+            WorkerOutputDispatcher::new(test_logger(), Arc::new(RwLock::new(Some(handler))))
+                .unwrap();
+        for line in ["first", "second"] {
+            dispatcher
+                .sender
+                .send(WorkerOutput {
+                    worker_id: "worker".to_string(),
+                    stream: WorkerOutputStream::Stdout,
+                    line: line.to_string(),
+                    truncated: false,
+                    dropped_lines_before: 0,
+                })
+                .unwrap();
+        }
+
+        assert_eq!(
+            observed_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            "second"
+        );
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 2);
+        dispatcher.close();
+    }
+
+    #[tokio::test]
+    async fn output_task_drain_is_bounded() {
+        let task = tokio::spawn(std::future::pending::<()>());
+        let started = tokio::time::Instant::now();
+        ControlPlane::finish_output_task(task).await;
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -866,7 +1327,11 @@ mod tests {
         let listener = UnixListener::bind(&sock_path).unwrap();
         let socket_path = sock_path.to_string_lossy().into_owned();
         let mut command = Command::new("sleep");
-        command.arg("300").process_group(0);
+        command
+            .arg("300")
+            .process_group(0)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         let child = command.spawn().unwrap();
         let pid = child.id();
 

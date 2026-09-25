@@ -164,7 +164,7 @@ def test_custom_send_preserves_numeric_metadata():
         close_worker(resources)
 
 
-def test_log_level_argument_overrides_metadata_value():
+def test_successful_log_does_not_write_stdout_fallback(capsys):
     resources = open_worker()
     try:
         _, _, connection, worker, _, _ = resources
@@ -178,6 +178,75 @@ def test_log_level_argument_overrides_metadata_value():
         assert envelope["meta"]["level"] == "warning"
         assert envelope["meta"]["correlation_id"] == 7
         assert envelope["data"] == {"message": "hello"}
+        assert capsys.readouterr().out == ""
+    finally:
+        close_worker(resources)
+
+
+def test_log_transport_failure_prints_flushed_fallback_and_reraises(monkeypatch):
+    resources = open_worker()
+    try:
+        _, _, _, worker, _, _ = resources
+        failure = BrokenPipeError("socket closed")
+        printed = []
+
+        def fail_send(*args, **kwargs):
+            raise failure
+
+        def record_print(*args, **kwargs):
+            printed.append((args, kwargs))
+
+        monkeypatch.setattr(worker, "_send_operation", fail_send)
+        monkeypatch.setattr("builtins.print", record_print)
+        with pytest.raises(BrokenPipeError) as raised:
+            worker.log({"message": "lost"}, level="warning")
+
+        assert raised.value is failure
+        assert printed == [
+            (
+                ("[runpy-log-fallback][level=warning] {'message': 'lost'}",),
+                {"flush": True},
+            )
+        ]
+    finally:
+        close_worker(resources)
+
+
+@pytest.mark.parametrize(
+    "print_error",
+    [OSError("stdout closed"), ValueError("I/O operation on closed file")],
+)
+def test_log_fallback_failure_preserves_original_transport_error(
+    monkeypatch, print_error
+):
+    resources = open_worker()
+    try:
+        _, _, _, worker, _, _ = resources
+        failure = BrokenPipeError("socket closed")
+
+        def fail_send(*args, **kwargs):
+            raise failure
+
+        def fail_print(*args, **kwargs):
+            raise print_error
+
+        monkeypatch.setattr(worker, "_send_operation", fail_send)
+        monkeypatch.setattr("builtins.print", fail_print)
+        with pytest.raises(BrokenPipeError) as raised:
+            worker.log({"message": "lost"})
+
+        assert raised.value is failure
+    finally:
+        close_worker(resources)
+
+
+def test_log_serialization_error_does_not_print_fallback(capsys):
+    resources = open_worker()
+    try:
+        _, _, _, worker, _, _ = resources
+        with pytest.raises(TypeError):
+            worker.log({"invalid": object()})
+        assert capsys.readouterr().out == ""
     finally:
         close_worker(resources)
 

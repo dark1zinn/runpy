@@ -101,6 +101,20 @@ Runpy reserves `x_wid`, `x_spath`, and `x_op`. The internal operations are
 | `Worker.handle_envelope(envelope)` | Override for custom envelopes with no `x_op`. |
 | `create_envelope(data, meta=...)` | Build a custom typed envelope and reject reserved keys. |
 
+`Worker.log(...)` normally remains a structured `x_op="log"` envelope. If its
+Unix-socket send raises `OSError`, the SDK prints one flushed stdout fallback:
+
+```text
+[runpy-log-fallback][level=<level>] <data repr>
+```
+
+The original `OSError` is re-raised, so a disconnected worker does not appear
+healthy. The Rust Manager captures stdout and adds the trusted worker ID; the
+Python fallback does not provide its own identity. Delivery is best effort and
+may be duplicated when a socket failure is reported after the Manager already
+received the complete envelope. Serialization and metadata errors do not use
+the fallback.
+
 ## License
 
 Apache-2.0
