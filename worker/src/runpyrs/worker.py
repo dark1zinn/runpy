@@ -105,7 +105,7 @@ class Worker:
                     f"[runpy-log-fallback][level={level}] {data!r}",
                     flush=True,
                 )
-            except OSError:
+            except (OSError, ValueError):
                 pass
             raise
 

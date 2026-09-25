@@ -212,7 +212,13 @@ def test_log_transport_failure_prints_flushed_fallback_and_reraises(monkeypatch)
         close_worker(resources)
 
 
-def test_log_fallback_failure_preserves_original_transport_error(monkeypatch):
+@pytest.mark.parametrize(
+    "print_error",
+    [OSError("stdout closed"), ValueError("I/O operation on closed file")],
+)
+def test_log_fallback_failure_preserves_original_transport_error(
+    monkeypatch, print_error
+):
     resources = open_worker()
     try:
         _, _, _, worker, _, _ = resources
@@ -222,7 +228,7 @@ def test_log_fallback_failure_preserves_original_transport_error(monkeypatch):
             raise failure
 
         def fail_print(*args, **kwargs):
-            raise OSError("stdout closed")
+            raise print_error
 
         monkeypatch.setattr(worker, "_send_operation", fail_send)
         monkeypatch.setattr("builtins.print", fail_print)
