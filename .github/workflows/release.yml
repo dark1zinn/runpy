@@ -6,8 +6,8 @@ on:
       - 'v[0-9]+.[0-9]+.[0-9]+'
 
 jobs:
-  build-and-release:
-    name: Build and Release
+  release:
+    name: Release
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -26,43 +26,10 @@ jobs:
           echo "TAG=$TAG" >> $GITHUB_ENV
           echo "✓ Valid release tag: $TAG"
 
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Setup uv
-        uses: astral-sh/setup-uv@v5
-        with:
-          enable-cache: true
-
-      - name: Build Rust crate
-        run: cargo package -p runpy
-
-      - name: Build Python package
-        working-directory: ./worker
-        run: uv build worker --sdist --wheel
-
-      - name: Collect artifacts
-        run: |
-          mkdir -p release-artifacts
-          
-          echo "📦 Rust crate artifacts:"
-          ls -la ./target/package/ || echo "No Rust artifacts found"
-          
-          echo "📦 Python package artifacts:"
-          ls -la ./dist/ || echo "No Python artifacts found"
-          
-          cp ./target/package/runpy-*.crate release-artifacts/
-          cp ./dist/runpyrs-* release-artifacts/
-          
-          echo "📦 Final release artifacts:"
-          ls -la release-artifacts/
-
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           name: Release ${{ env.TAG }}
           generate_release_notes: true
-          files: release-artifacts/*
-          fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
