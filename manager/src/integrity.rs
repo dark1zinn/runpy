@@ -6,9 +6,16 @@ use std::sync::{Arc, Mutex};
 
 use crate::scribbler::Scribbler;
 
+/// Private runtime validator shared by Manager and worker facades.
+///
+/// It retains configured paths and a diagnostic index; Worker::spawn validates
+/// script names before selecting a file.
 pub struct IntegrityChecker {
+    /// Configured `uv` executable or command name.
     pub uv_path: PathBuf,
+    /// Directory containing managed worker scripts.
     pub scripts_dir: PathBuf,
+    /// Recursively indexed non-dunder Python file stems.
     pub registry: Mutex<HashSet<String>>,
     logger: Arc<Scribbler>,
 }
@@ -23,11 +30,16 @@ impl IntegrityChecker {
         }
     }
 
-    /// Run all integrity checks: validate uv, ensure the socket and scripts
-    /// directories exist, and index available scripts.
+    /// Validate that uv executes successfully, ensure `/tmp/runpy` exists,
+    /// verify the scripts directory, and refresh the diagnostic script index.
+    ///
+    /// The uv check requires only a successful `--version` exit; it does not
+    /// parse or enforce a semantic version.
     pub fn perform_check(&self) -> Result<(), String> {
         self.validate_uv()?;
 
+        // Socket creation is centralized under a stable Manager-owned
+        // directory; individual Worker spawns own their socket file cleanup.
         // Ensure socket directory exists
         let sock_dir = PathBuf::from("/tmp/runpy");
         if !sock_dir.exists() {
@@ -77,8 +89,9 @@ impl IntegrityChecker {
         }
     }
 
-    /// Walk the scripts directory (recursively) and index all `.py` files by
-    /// their stem name.
+    /// Refresh the recursive script-stem index used for diagnostics.
+    ///
+    /// This index is diagnostic and does not authorize script selection.
     fn index_scripts(&self) {
         let mut scripts = self.registry.lock().unwrap();
         scripts.clear();
@@ -91,9 +104,10 @@ impl IntegrityChecker {
         );
     }
 
-    /// Add `.py` path stems from `dir` and its subdirectories to `scripts`,
-    /// excluding names starting with `__`. Skip unreadable entries and
-    /// directories, as well as stems that are not valid UTF-8.
+    /// Add readable `.py` stems recursively, excluding dunder files.
+    ///
+    /// Unreadable entries and non-UTF-8 stems are skipped so diagnostics cannot
+    /// make otherwise valid manager construction fail.
     fn walk_dir(&self, dir: &PathBuf, scripts: &mut HashSet<String>) {
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {

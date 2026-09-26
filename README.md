@@ -1,174 +1,54 @@
 ![Runpy](docs/assets/runpy_logo.png)
 
-> <p style="font-size: 12px;">This logo was generated with AI and heavily inspired on <a href="https://elysiajs.com">Elisya</a> logo</p>
+> <p style="font-size: 12px;">This logo was generated with AI and heavily inspired by the <a href="https://elysiajs.com">Elysia</a> logo.</p>
 
 ---
 
-A Rust crate for spawning, managing, and communicating with Python worker processes over Unix sockets.
+Runpy connects a Rust control plane to Python worker processes over Unix domain
+sockets. The Rust `runpy` crate owns process lifecycle, health monitoring,
+message routing, and attributed output. The Python `runpyrs` SDK turns a PEP
+723 script into a managed worker. [`uv`](https://docs.astral.sh/uv/) supplies
+the script's declared Python version and dependencies.
 
-Combine Rust's performance and robustness with Python's simplicity for writing scripts — data analysis, scraping, ML inference, whatever you need. Rust acts as the **control plane**; Python scripts are **workers**.
+Both packages are currently installed from this Git repository; they are not
+published to crates.io or PyPI.
 
-## Why?
+## Why Runpy?
 
-Python is simple to write but limited in concurrency and reliability. Rust is fast and robust but overkill for throwaway scripts.
+Use Rust for orchestration and Python for task-specific code such as scraping,
+data processing, or model inference. Runpy provides:
 
-**Runpy** lets you write your business logic in Python, while Rust handles process orchestration, health monitoring, and structured communication. For example:
+- **Managed lifecycle** — start, monitor, message, and terminate complete
+  worker process groups.
+- **PEP 723 execution** — each script declares its own Python and dependencies;
+  adjacent uv lockfiles are supported.
+- **Typed envelope APIs** — exchange application-owned JSON `meta` and `data`
+  while Runpy protects its `x_` routing namespace.
+- **Bidirectional messaging** — global and per-worker handlers, targeted sends,
+  replies, and broadcasts.
+- **Watchdog reporting** — inspect registered process state and available
+  resource data.
+- **Structured logging** — route Python `Worker.log` envelopes through the
+  application.
+- **Attributed process output** — observe bounded, nonblocking worker stdout
+  and stderr records with trusted worker IDs.
 
-- Build a web server in Rust that spawns Python scrapers on demand
-- Run data analysis pipelines where Rust manages scheduling and Python does the heavy lifting
-- Offload ML inference to Python workers while Rust handles the API layer
+## Quick start
 
-## Features
-
-- **Worker Management**: Spawn, monitor, and terminate Python workers
-- **uv-managed Runtime**: Per-script Python versions and dependencies from PEP 723 metadata
-- **Bare JSON Envelopes**: Developer-owned metadata and data with minimal Runpy routing
-- **Watchdog Service**: Automatic health monitoring and dead worker cleanup
-- **Structured Logging**: Environment-aware logging via \`Scribbler\`
-- **Unified Worker Output**: Attributed, bounded stdout/stderr capture through the Manager logger
-- **Bidirectional Communication**: Send commands and receive responses
-- **Extra Arguments**: Pass custom \`--key=value\` arguments to workers
-
-## Architecture
-
-```text
-Manager
-├── IntegrityChecker
-├── Scribbler
-└── ControlPlane
-    ├── Watchdog
-    ├── Mailer
-    ├── Output Dispatcher
-    └── Workers
-```
-
-`Manager` is the sole composition root. Its shared `ControlPlane` owns the
-worker registry, one watchdog, the internal reply router, and worker output
-capture. `Worker` values are lightweight facades into those Manager-owned
-services; each running worker still communicates over its own length-prefixed
-JSON Unix socket.
-
-## Quick Start
-
-### Prerequisites
-
-- Rust / Cargo
-- [`uv`](https://docs.astral.sh/uv/) in development and production
-
-### Setup
-
-> Note that `Runpy` isn't available in crates.io yet, nor `runpyrs` Python package in PyPi!
+### Install and create a worker
 
 ```bash
-# Create your project
-mkdir myapp && cd myapp
-cargo init
+cargo add runpy --git https://github.com/dark1zinn/runpy
+cargo add tokio --features full
+cargo add serde_json
 
-# Add '--branch dev' to get the latest commits
-cargo add --git https://github.com/dark1zinn/runpy -p runpy
-cargo add tokio serde_json
-
-# Create a self-contained worker script
-mkdir worker
-uv init --script worker/my_script.py --python 3.10
-uv add --script worker/my_script.py \
+mkdir -p worker
+uv init --script worker/my_worker.py --python 3.10
+uv add --script worker/my_worker.py \
   "runpyrs @ git+https://github.com/dark1zinn/runpy#subdirectory=worker"
-
-# Optional but recommended for reproducible deployments
-uv lock --script worker/my_script.py
 ```
 
-For a better understanding on how to add the crate/package to your project see [this instalation guide](docs/instalation.md)
-
-You can take a look in the [examples folder](examples) for a suggested project folder structure
-
-### Usage
-
-```rust
-use runpy::{Data, Envelope, Manager, Meta};
-use serde_json::{json, Value};
-
-fn object(value: Value) -> Data {
-    value.as_object().cloned().expect("JSON object")
-}
-
-#[tokio::main]
-async fn main() {
-    let mut manager = Manager::new("path/to/scripts");
-
-    manager.on_message(|inbound| {
-        let operation = inbound
-            .envelope
-            .meta()
-            .get("x_op")
-            .and_then(Value::as_str);
-
-        match operation {
-            Some("ready") => inbound.reply(Envelope::execute(object(
-                json!({"url": "https://example.com"}),
-            ))),
-            Some("done") => println!("result: {}", Value::Object(inbound.envelope.data().clone())),
-            Some("error") => eprintln!("worker error: {}", Value::Object(inbound.envelope.data().clone())),
-            _ => println!("custom envelope: {:?}", inbound.envelope),
-        }
-    });
-
-    let mut worker = manager.worker("my_script");
-    worker.spawn().await.expect("Failed to spawn worker");
-
-    let mut meta = Meta::new();
-    meta.insert("some_custom_meta".into(), json!(42));
-    worker
-        .send_message(
-            Envelope::new(meta, object(json!({"some": "data"})))
-                .expect("application metadata cannot use x_ keys"),
-        )
-        .await
-        .unwrap();
-}
-```
-
-### Python side
-
-```python
-from runpyrs import Envelope, Worker, RunScript
-
-
-class MyWorker(Worker):
-    def execute(self, data: dict) -> dict:
-        return {
-            "status": "ok",
-            "url": data.get("url", ""),
-            "links": 42,
-        }
-
-    def handle_envelope(self, envelope: Envelope) -> None:
-        self.log(
-            {"message": "received custom data", "data": envelope["data"]},
-            level="debug",
-        )
-        self.send(
-            {"accepted": True},
-            meta={"correlation_id": envelope["meta"].get("correlation_id")},
-        )
-
-
-if __name__ == "__main__":
-    RunScript(MyWorker)
-```
-
-Developers define and validate the schema of their own `meta` and `data`
-objects. Runpy only owns metadata keys beginning with `x_`.
-
-### uv-managed workers
-
-Runpy launches workers with:
-
-```text
-uv run --no-project --script <worker.py> <socket-path> <worker-id>
-```
-
-Every managed worker declares its own Python and dependency requirements:
+Create `worker/my_worker.py`:
 
 ```python
 # /// script
@@ -177,246 +57,171 @@ Every managed worker declares its own Python and dependency requirements:
 #   "runpyrs @ git+https://github.com/dark1zinn/runpy#subdirectory=worker",
 # ]
 # ///
+
+from runpyrs import RunScript, Worker
+
+
+class MyWorker(Worker):
+    def execute(self, data: dict) -> dict:
+        return {"status": "ok", "input": data}
+
+
+if __name__ == "__main__":
+    RunScript(MyWorker)
 ```
 
-`uv` selects or downloads a compatible Python and creates an isolated cached
-environment for that script. Runpy does not create a `.venv`, run `uv sync`,
-or inject `runpyrs`; the script metadata is authoritative. Ambient
-`pyproject.toml` dependencies are ignored.
-
-`Manager::new("path/to/scripts")` resolves `uv` from `PATH`. Packaged
-deployments can select another executable:
+Start it from Rust:
 
 ```rust
-let manager = Manager::with_uv_path("path/to/scripts", "/opt/runpy/bin/uv");
+use runpy::{Data, Envelope, Manager};
+use serde_json::{json, Value};
+use std::time::Duration;
+
+fn object(value: Value) -> Data {
+    value.as_object().cloned().expect("JSON object")
+}
+
+#[tokio::main]
+async fn main() {
+    let mut manager = Manager::new("worker");
+    let (finished_tx, mut finished_rx) = tokio::sync::mpsc::unbounded_channel();
+    manager.on_message(move |inbound| {
+        let operation = inbound
+            .envelope
+            .meta()
+            .get("x_op")
+            .and_then(Value::as_str);
+
+        match operation {
+            Some("ready") => inbound.reply(Envelope::execute(object(
+                json!({"task": "example"}),
+            ))),
+            Some("done") => {
+                println!(
+                    "result: {}",
+                    Value::Object(inbound.envelope.data().clone())
+                );
+                let _ = finished_tx.send(());
+            }
+            Some("error") => {
+                eprintln!(
+                    "worker error: {}",
+                    Value::Object(inbound.envelope.data().clone())
+                );
+                let _ = finished_tx.send(());
+            }
+            _ => {}
+        }
+    });
+
+    let mut worker = manager.worker("my_worker");
+    let worker_id = worker.spawn().await.expect("worker should start");
+    println!("spawned {worker_id}");
+    tokio::time::timeout(Duration::from_secs(30), finished_rx.recv())
+        .await
+        .expect("worker response timed out")
+        .expect("worker response channel closed");
+    worker.terminate().await.expect("worker should stop");
+}
 ```
 
-An adjacent lockfile is optional:
+Runpy starts:
 
-```bash
-uv lock --script worker/my_script.py
+```text
+uv run --no-project [--locked] --script <worker.py> <socket-path> <worker-id>
 ```
 
-Commit `<worker>.py.lock` for reproducible deployments. When it exists,
-Runpy passes `--locked`, so a stale lock fails the worker launch instead of
-being modified. Scripts without a lock continue to resolve normally. For
-dependency resolution bounded by publication time, add an RFC 3339 cutoff to
-the inline metadata:
+The worker sends `ready`, Rust replies with `execute`, and the Python return
+value arrives as `done`. Runpy owns trusted worker/socket metadata and cleans up
+the process group and socket when the worker terminates or the Manager drops.
 
-```python
-# [tool.uv]
-# exclude-newer = "2025-01-01T00:00:00Z"
+## Observe worker output
+
+Process output is separate from structured socket envelopes:
+
+```rust
+use runpy::{Manager, WorkerOutputStream};
+
+let mut manager = Manager::new("worker");
+manager.on_worker_output(|output| match output.stream {
+    WorkerOutputStream::Stdout => {
+        println!("{}: {}", output.worker_id, output.line);
+    }
+    WorkerOutputStream::Stderr => {
+        eprintln!("{}: {}", output.worker_id, output.line);
+    }
+});
 ```
 
-### Development checks
+The callback runs on Runpy's dedicated output-dispatcher thread and should
+return promptly. Capture is bounded and best effort. Runpy never treats stderr
+or output text as an automatic termination signal; applications own that
+policy.
 
-Enable the repository's pre-commit hook once per clone:
+## Documentation
+
+- [Project overview](docs/overview.md) — architecture, lifecycle, protocol,
+  output guarantees, Python execution model, and operations.
+- [Installation and worker setup](docs/installation.md) — Git dependencies,
+  PEP 723 scripts, uv lockfiles, and Manager configuration.
+- [Python SDK guide](worker/README.md) — `runpyrs` setup and API.
+- [Playground](examples/playground/) — executable Rust/Python integration.
+- Rust API reference — generate locally with
+  `cargo doc -p runpy --no-deps --open`.
+
+## Configuration
+
+The Manager-owned `Scribbler` reads logging settings at construction:
+
+| Variable | Values | Description |
+| --- | --- | --- |
+| `ENVIRONMENT` | `development`, `dev` | Enables maximum verbosity. |
+| `LOG` | `0`–`5`, `off`, `error`, `warning`, `info`, `debug`, `verbose` | Selects the maximum visible level. |
+| `NO_COLOR` | any value | Disables ANSI color output. |
+
+Managed workers always receive `PYTHONUNBUFFERED=1` so captured Python output
+is prompt.
+
+## Development
+
+Enable the pre-commit hook once per clone:
 
 ```bash
 git config --local core.hooksPath .githooks
 ```
 
-The hook checks only languages affected by staged files. It verifies formatting
-and linting without rewriting files.
-
-Run the complete Rust checks from the repository root:
+Run Rust checks:
 
 ```bash
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --all-features --locked -- --test-threads=1
+cargo test --doc -p runpy --locked
 ```
 
-Run the complete Python checks from the repository root:
+Run Python checks:
 
 ```bash
-uv run --frozen ruff format --check worker/src/runpyrs worker/tests examples/playground/worker/my_script.py
-uv run --frozen ruff check worker/src/runpyrs worker/tests examples/playground/worker/my_script.py
-uv run --frozen --package runpyrs --extra dev pytest worker/tests
+uv run --frozen --python 3.10 ruff format --check worker/src/runpyrs worker/tests examples/playground/worker/my_script.py
+uv run --frozen --python 3.10 ruff check worker/src/runpyrs worker/tests examples/playground/worker/my_script.py
+uv run --frozen --python 3.10 --package runpyrs --extra dev pytest worker/tests
 ```
 
-To apply formatting intentionally before re-staging files, run:
+Run the integration playground:
 
 ```bash
-cargo fmt --all
-uv run ruff format worker/src/runpyrs worker/tests examples/playground/worker/my_script.py
+cargo run -p playground
 ```
-
-
-## Environment Variables
-
-The Manager-owned `Scribbler` returned by `Manager::logger()` respects these environment variables:
-
-| Variable      | Values                                                         | Description                   |
-| ------------- | -------------------------------------------------------------- | ----------------------------- |
-| `ENVIRONMENT` | `development`, `dev`                                           | Enables maximum log verbosity |
-| `LOG`         | `0`-`5`, `off`, `error`, `warning`, `info`, `debug`, `verbose` | Sets log level                |
-| `NO_COLOR`    | (any value)                                                    | Disables ANSI color output    |
-
-Example environment variables:
-
-```bash
-# So far nothing really usefull for production
-ENVIRONMENT=development
-LOG=debug
-```
-
-### Worker process output
-
-Runpy pipes each managed `uv` process's stdout and stderr, including output
-inherited by Python and its descendants. Records are emitted through the
-Manager-owned `Scribbler` with trusted attribution:
-
-```text
-[worker:<worker-id>][stdout] <line>
-[worker:<worker-id>][stderr] <line>
-```
-
-Stdout uses the `info` level and stderr uses `warning`; the `LOG` setting can
-therefore filter captured output, but both pipes are always drained. Register a
-live observer when application policy needs the raw attributed record:
-
-```rust
-manager.on_worker_output(|output| {
-    println!(
-        "{} {:?}: {}",
-        output.worker_id, output.stream, output.line
-    );
-});
-```
-
-The observer runs on Runpy's output-dispatcher thread and must return promptly.
-Runpy does not infer failure or terminate workers from stderr or message text.
-Applications can send observer decisions to their own async control path.
-
-Capture is bounded and best effort. Records preserve order within one stream,
-but stdout, stderr, and socket envelopes have no total ordering. A logical line
-longer than 16 KiB is emitted in continuation records; invalid UTF-8 is decoded
-lossily and terminal control characters are escaped. A shared 256-record queue
-drops output rather than blocking a noisy worker, and the next delivered record
-reports prior loss when possible. Final output during immediate Manager drop is
-not guaranteed.
-
-Piped streams are not TTYs. Runpy forces `PYTHONUNBUFFERED=1` after worker
-environment configuration so Python output remains prompt; this trades some
-throughput for real-time visibility.
-
-## Project Structure
-
-```text
-runpy/
-├── manager/                   # Rust crate (the library)
-│   ├── src/
-│   │   ├── lib.rs             # Manager — top-level orchestrator
-│   │   ├── manager.rs         # Worker builder + handle
-│   │   ├── protocol.rs        # Bare envelope transport and ControlPlane
-│   │   ├── integrity.rs       # uv availability & script validation
-│   │   ├── scribbler.rs       # Structured logging service
-│   │   └── watchdog.rs        # Health monitoring & /proc stats
-│   └── tests/
-│       ├── unit.rs            # Unit test harness
-│       ├── unit/              # Per-module unit tests
-│       └── manager_test.rs    # Integration tests
-├── worker/                    # Python worker package (runpyrs)
-│   ├── src/
-│   │   └── runpyrs/
-│   │       ├── __init__.py    # Package exports
-│   │       ├── worker.py      # Worker base class
-│   │       ├── runScript.py   # RunScript helper
-│   │       ├── utils.py       # Envelope types and application builder
-│   │       └── py.typed       # PEP 561 marker
-│   └── pyproject.toml
-├── examples/
-│   └── playground/            # Development/testing playground
-├── docs/
-│   ├── assets/                # Logo and images
-│   └── instalation.md         # Installation guide
-├── Cargo.toml                 # Workspace root
-├── pyproject.toml             # Root Python uv workspace config
-├── flake.nix                  # Nix development environment
-├── .env.example               # Example environment variables
-└── LICENSE
-```
-
-## Key Concepts
-
-| Concept              | Description                                                                                         |
-| -------------------- | --------------------------------------------------------------------------------------------------- |
-| **Manager**          | Sole composition root. Owns integrity checking, logging, and the shared control plane.              |
-| **Worker**           | Lightweight builder and remote facade backed by Manager-owned services.                             |
-| **ControlPlane**     | Internal shared worker registry and Unix-socket router; owns the watchdog, mailer, and workers.     |
-| **Envelope**         | The serialized `{meta, data}` value exchanged between Rust and Python.                              |
-| **InboundEnvelope**  | Rust callback context with `reply` and `reply_async` methods routed to the originating worker.       |
-| **Watchdog**         | Shared process health and resource reporter, accessed through `Manager::watchdog()`.                |
-| **IntegrityChecker** | Validates the Python environment, socket directory, and scripts directory.                          |
-| **Scribbler**        | Manager-owned environment-aware logger, accessed through `Manager::logger()`.                       |
-
-## Protocol
-
-Every wire payload is a JSON object with exactly two required object fields:
-
-```json
-{
-    "meta": {
-        "x_wid": "my_script_29032026-1200_Ax4f",
-        "x_spath": "/tmp/runpy/rp_my_script.sock",
-        "some_custom_meta": 42
-    },
-    "data": {
-        "some": "data"
-    }
-}
-```
-
-`data` belongs entirely to the application. `meta` accepts application metadata
-with arbitrary JSON values, but every key beginning with `x_` is reserved by
-Runpy. Public builders reject application attempts to create reserved keys.
-
-### Reserved metadata
-
-| Key       | Description                                                                  |
-| --------- | ---------------------------------------------------------------------------- |
-| `x_wid`   | Manager-generated worker identity; stamped by Runpy at each transport edge.  |
-| `x_spath` | Manager-bound Unix socket path; stamped by Runpy at each transport edge.     |
-| `x_op`    | Optional Runpy lifecycle operation. Its absence means a custom envelope.      |
-
-Runpy uses these lower-case `x_op` values:
-
-| Operation   | Direction     | Meaning                                      |
-| ----------- | ------------- | -------------------------------------------- |
-| `ready`     | Python → Rust | Worker connected and is ready.               |
-| `execute`   | Rust → Python | Pass `data` to `Worker.execute`.              |
-| `retry`     | Rust → Python | Repeat the most recent execution.             |
-| `terminate` | Rust → Python | Gracefully close the worker.                  |
-| `done`      | Python → Rust | `data` is the direct execution result.        |
-| `error`     | Python → Rust | `data.message` describes a worker failure.    |
-| `log`       | Python → Rust | `data` contains developer-selected log data.  |
-
-The structured `log` operation is separate from process stdout/stderr.
-Successful `Worker.log(...)` calls remain application-routed envelopes with the
-normal reply-capable callback context. Captured process output is an attributed
-observability record with no envelope reply route and no automatic lifecycle
-policy.
-
-Applications build their own higher-level routing, schemas, validation, and
-type safety with non-`x_` metadata and the `data` object. Old
-`method`/`headers`/`body` payloads are not accepted.
-
-## Found a bug?
-
-- Open an issue.
-- Include your OS, architecture, and Python/Rust versions.
-- Include the output you got (screenshot or gist).
-- Describe the steps to reproduce.
 
 ## Contributing
 
-Feel free to fork and open PRs.
-PRs that improve stability, reliability, and test coverage are prioritized.
+Open an issue with reproduction steps, operating system, architecture, and
+Rust/Python/uv versions. Pull requests that improve stability, reliability,
+documentation, and useful behavior coverage are welcome.
 
 ## License
 
-Apache-2.0 License — see [LICENSE](LICENSE) for details.
+Apache-2.0 — see [LICENSE](LICENSE).
 
 ---
 
