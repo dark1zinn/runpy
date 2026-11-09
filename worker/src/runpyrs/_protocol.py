@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import select
 import socket
 import struct
@@ -125,32 +126,30 @@ def _reject_duplicates(pairs: list) -> dict:
     return result
 
 
+#: A complete JSON string (escapes included) or one container bracket.
+_DEPTH_TOKEN = re.compile(rb'"[^"\\]*(?:\\.[^"\\]*)*"|[\[\]{}]')
+
+
 def check_depth(payload: bytes) -> None:
     """Reject bodies nested deeper than :data:`MAX_JSON_DEPTH` in one scan.
 
     Brackets inside strings, including escaped quotes, are ignored, so the
-    check runs before any recursive parsing.
+    check runs before any recursive parsing. String contents are skipped by
+    the regular expression engine rather than byte by byte in Python.
     """
+    # Fast path at memchr speed: too few openers to exceed the limit at all.
+    if payload.count(b"[") + payload.count(b"{") <= MAX_JSON_DEPTH:
+        return
     depth = 0
-    in_string = False
-    escaped = False
-    for byte in payload:
-        if in_string:
-            if escaped:
-                escaped = False
-            elif byte == 0x5C:  # backslash
-                escaped = True
-            elif byte == 0x22:  # quote
-                in_string = False
-        elif byte == 0x22:
-            in_string = True
-        elif byte in (0x7B, 0x5B):  # { [
+    for token in _DEPTH_TOKEN.finditer(payload):
+        first = payload[token.start()]
+        if first in (0x7B, 0x5B):  # { [
             depth += 1
             if depth > MAX_JSON_DEPTH:
                 raise ValueError(
                     f"JSON nesting exceeds the maximum depth of {MAX_JSON_DEPTH}"
                 )
-        elif byte in (0x7D, 0x5D):  # } ]
+        elif first in (0x7D, 0x5D):  # } ]
             depth = max(depth - 1, 0)
 
 
