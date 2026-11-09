@@ -64,7 +64,7 @@ requires the supplied name to be a single path component, and resolves it as
 
 The private `ControlPlane` owns the worker registry and the lifecycle tasks for
 each process. A protocol session accepts reconnects on the worker's socket. The
-Mailer routes replies to the originating worker's bounded outbound channel.
+Mailer resolves replies to the originating worker's bounded outbound route.
 The single shared Watchdog polls registered child processes and removes process
 groups whose `uv` parent has exited.
 
@@ -155,10 +155,27 @@ overwritten with trusted Manager values. The current global handler runs first;
 the worker-specific handler captured at spawn runs second. These synchronous
 callbacks execute in the protocol task and should return promptly.
 
-`InboundEnvelope::reply` queues a best-effort response to the originating
-worker. `reply_async` waits for the bounded route and returns an error if the
-worker is no longer registered. `Worker::send_message` targets one worker;
-`Manager::broadcast` returns a result for every registered worker.
+Every outbound send is bounded. The envelope is validated, trust-stamped, and
+encoded first, so direction and frame-size errors return to the caller
+immediately. Admission then reserves a slot on the worker's route (64 frames)
+and bytes from a Manager-wide budget (16 MiB) shared by all workers. The
+writer releases both when the frame is written or discarded, so queued memory
+never exceeds the budget and no detached task ever waits on a full queue.
+
+- `Worker::send_message` and `InboundEnvelope::reply_async` wait for capacity
+  and then for the write. Both share one send deadline (5 seconds). Success
+  means the frame was completely written to the socket, not that the worker
+  processed it.
+- `Worker::try_send_message` and `InboundEnvelope::reply` admit immediately
+  or fail with `RunpyError::QueueFull`. The returned `SendReceipt` reports the
+  write outcome; dropping it does not cancel the send.
+- `Manager::broadcast` returns each registered worker's write outcome.
+
+Admitted frames are written in admission order. A deadline produces
+`RunpyError::Timeout` with a stage: `Admission` (nothing was queued), `Queued`
+(admitted, discarded unwritten), or `Write` (interrupted mid-frame). A `Write`
+timeout leaves delivery unknown, so Runpy closes that connection instead of
+risking a corrupted stream; it never resends a frame.
 
 ### 6. Execute Python business logic
 

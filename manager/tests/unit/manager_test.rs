@@ -1,4 +1,6 @@
-use runpy::{Envelope, Manager, Worker, WorkerIdentity, WorkerOutputStream};
+use runpy::{
+    Envelope, Manager, RunpyError, TimeoutStage, Worker, WorkerIdentity, WorkerOutputStream,
+};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -157,10 +159,10 @@ async fn send_and_terminate_before_spawn_return_errors() {
         .send_message(Envelope::terminate())
         .await
         .unwrap_err();
-    assert!(send_error.contains("not been spawned"));
+    assert!(matches!(send_error, RunpyError::InvalidConfig(_)));
 
     let terminate_error = worker.terminate().await.unwrap_err();
-    assert!(terminate_error.contains("not been spawned"));
+    assert!(matches!(terminate_error, RunpyError::InvalidConfig(_)));
 }
 
 #[tokio::test]
@@ -372,7 +374,12 @@ wait "$descendant"
     assert!(process_exists(uv_pid));
     assert!(process_exists(descendant_pid));
 
-    worker.terminate().await.unwrap();
+    // The fake runner never connects, so the terminate frame cannot be
+    // written; cleanup still stops the whole process group.
+    assert!(matches!(
+        worker.terminate().await,
+        Err(RunpyError::Timeout(TimeoutStage::Queued))
+    ));
     wait_for_process_exit(uv_pid).await;
     wait_for_process_exit(descendant_pid).await;
 }

@@ -41,14 +41,20 @@ async fn main() {
         match operation {
             Some("ready") => {
                 worker_logger.info_with("Worker", "ready");
-                inbound.reply(Envelope::execute(object(json!({"name": "RunPy"}))));
+                let execute = Envelope::execute(object(json!({"name": "RunPy"})));
+                if let Err(error) = inbound.reply(execute) {
+                    worker_logger.error_with("Worker", &format!("execute not sent: {error}"));
+                }
 
                 let mut meta = Meta::new();
                 meta.insert("some_custom_meta".into(), json!(42));
-                inbound.reply(
+                let custom =
                     Envelope::new(meta, object(json!({"event": "custom manager message"})))
-                        .expect("custom metadata must not use x_ keys"),
-                );
+                        .expect("custom metadata must not use x_ keys");
+                if let Err(error) = inbound.reply(custom) {
+                    worker_logger
+                        .error_with("Worker", &format!("custom message not sent: {error}"));
+                }
             }
             Some("log") => {
                 let level = inbound

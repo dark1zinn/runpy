@@ -12,6 +12,37 @@ pub(crate) const ENV_MAX_FRAME_BYTES: &str = "RUNPY_MAX_FRAME_BYTES";
 /// Environment variable carrying the partial-frame deadline to workers.
 pub(crate) const ENV_FRAME_TIMEOUT_MS: &str = "RUNPY_FRAME_TIMEOUT_MS";
 
+/// Largest supported body so a whole frame fits one byte-budget reservation.
+const MAX_FRAME_BYTES_CEILING: usize = u32::MAX as usize - 8;
+
+/// Default bound on admitted outbound frames per worker connection.
+pub(crate) const DEFAULT_OUTBOUND_CAPACITY: usize = 64;
+/// Default Manager-wide bound on encoded outbound bytes awaiting a write.
+pub(crate) const DEFAULT_QUEUED_BYTES: usize = 16 * 1024 * 1024;
+/// Default deadline covering outbound admission and the socket write.
+pub(crate) const DEFAULT_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Bounds on outbound memory and time shared by every worker route.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct QueueLimits {
+    /// Admitted frames per worker that may wait for the writer.
+    pub outbound_capacity: usize,
+    /// Encoded bytes, across all workers, admitted but not yet written.
+    pub queued_bytes: usize,
+    /// Deadline from the start of a send until its write completes.
+    pub send_timeout: Duration,
+}
+
+impl Default for QueueLimits {
+    fn default() -> Self {
+        Self {
+            outbound_capacity: DEFAULT_OUTBOUND_CAPACITY,
+            queued_bytes: DEFAULT_QUEUED_BYTES,
+            send_timeout: DEFAULT_SEND_TIMEOUT,
+        }
+    }
+}
+
 /// Frame size and partial-frame deadline enforced in both directions.
 ///
 /// The Manager rejects an oversized length header before allocating, refuses
@@ -37,11 +68,17 @@ pub struct ProtocolLimits {
 impl ProtocolLimits {
     /// Validate and build limits.
     ///
-    /// Returns an error when either value is zero or the timeout is shorter
-    /// than one millisecond, which workers could not represent.
+    /// Returns an error when either value is zero, the frame size exceeds
+    /// `u32::MAX - 8` bytes, or the timeout is shorter than one millisecond,
+    /// which workers could not represent.
     pub fn new(max_frame_bytes: usize, frame_timeout: Duration) -> Result<Self, String> {
         if max_frame_bytes == 0 {
             return Err("max_frame_bytes must be greater than zero".to_string());
+        }
+        if max_frame_bytes > MAX_FRAME_BYTES_CEILING {
+            return Err(format!(
+                "max_frame_bytes must not exceed {MAX_FRAME_BYTES_CEILING}"
+            ));
         }
         if frame_timeout.as_millis() == 0 {
             return Err("frame_timeout must be at least one millisecond".to_string());

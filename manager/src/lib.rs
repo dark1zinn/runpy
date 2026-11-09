@@ -71,9 +71,12 @@
 //!     let (finished_tx, mut finished_rx) = tokio::sync::mpsc::unbounded_channel();
 //!     manager.on_message(move |inbound| {
 //!         match inbound.envelope.meta().get("x_op").and_then(Value::as_str) {
-//!             Some("ready") => inbound.reply(Envelope::execute(object(
-//!                 json!({"task": "process"}),
-//!             ))),
+//!             Some("ready") => {
+//!                 let execute = Envelope::execute(object(json!({"task": "process"})));
+//!                 if let Err(error) = inbound.reply(execute) {
+//!                     eprintln!("execute not admitted: {error}");
+//!                 }
+//!             }
 //!             Some("done" | "error") => {
 //!                 println!("{:?}", inbound.envelope.data());
 //!                 let _ = finished_tx.send(());
@@ -97,6 +100,7 @@
 //! removes their socket files.
 
 mod config;
+mod error;
 mod integrity;
 mod manager;
 mod protocol;
@@ -107,15 +111,17 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::config::QueueLimits;
 use crate::integrity::IntegrityChecker;
 use crate::protocol::ControlPlane;
 
 // ── Public re-exports ──────────────────────────────────────────────────
 pub use config::{DEFAULT_FRAME_TIMEOUT, DEFAULT_MAX_FRAME_BYTES, ProtocolLimits};
+pub use error::{RunpyError, TimeoutStage};
 pub use manager::{Worker, WorkerIdentity};
 pub use protocol::{
-    Data, Envelope, EnvelopeError, InboundEnvelope, MessageHandler, Meta, WorkerOutput,
-    WorkerOutputHandler, WorkerOutputStream,
+    Data, Envelope, EnvelopeError, InboundEnvelope, MessageHandler, Meta, SendReceipt,
+    WorkerOutput, WorkerOutputHandler, WorkerOutputStream,
 };
 pub use scribbler::{LogLevel, Scribbler};
 pub use watchdog::{ProcessState, WatchdogService as Watchdog, WorkerReport};
@@ -193,7 +199,7 @@ impl Manager {
             logger.error_with("Manager", &format!("Integrity check failed: {error}"));
         }
 
-        let control_plane = ControlPlane::new(logger.clone(), limits);
+        let control_plane = ControlPlane::new(logger.clone(), limits, QueueLimits::default());
         if tokio::runtime::Handle::try_current().is_ok() {
             control_plane.start_monitoring(5);
         }
@@ -313,8 +319,8 @@ impl Manager {
 
     /// Send one envelope to every currently registered worker.
     ///
-    /// The returned map is keyed by trusted worker ID and contains the result
-    /// for each bounded outbound route. An empty registry returns an empty map.
+    /// The returned map is keyed by trusted worker ID and contains each
+    /// worker's write outcome. An empty registry returns an empty map.
     ///
     /// ```no_run
     /// use runpy::{Envelope, Manager};
@@ -328,7 +334,7 @@ impl Manager {
     /// }
     /// # }
     /// ```
-    pub async fn broadcast(&self, envelope: Envelope) -> HashMap<String, Result<(), String>> {
+    pub async fn broadcast(&self, envelope: Envelope) -> HashMap<String, Result<(), RunpyError>> {
         self.control_plane.broadcast(envelope).await
     }
 

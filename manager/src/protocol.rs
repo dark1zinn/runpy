@@ -13,11 +13,12 @@ use std::thread;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::process::{ChildStderr, ChildStdout};
-use tokio::sync::mpsc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError, mpsc, oneshot};
 use tokio::task::JoinHandle;
-use tokio::time::{Duration, interval, timeout};
+use tokio::time::{Duration, Instant, interval, timeout, timeout_at};
 
-use crate::config::ProtocolLimits;
+use crate::config::{ProtocolLimits, QueueLimits};
+use crate::error::{RunpyError, TimeoutStage};
 use crate::manager::WorkerIdentity;
 use crate::scribbler::Scribbler;
 use crate::watchdog::WatchdogService;
@@ -355,54 +356,197 @@ pub struct InboundEnvelope {
 }
 
 impl InboundEnvelope {
-    /// Queue a best-effort reply to the originating worker.
+    /// Admit a reply to the originating worker without waiting.
     ///
-    /// Queue saturation is handed to an asynchronous send and reported through
-    /// the Manager logger; use [`InboundEnvelope::reply_async`] when the caller
-    /// needs a returned delivery error.
+    /// Returns [`RunpyError::QueueFull`] when the worker's route or the
+    /// Manager's outbound byte budget is exhausted; nothing is buffered
+    /// outside those bounds. The returned [`SendReceipt`] reports whether the
+    /// frame was written; dropping it is fine for fire-and-forget replies.
     ///
     /// ```no_run
-    /// use runpy::{Envelope, Manager};
+    /// use runpy::{Data, Envelope, Manager, Meta};
     ///
     /// let mut manager = Manager::new("worker");
-    /// manager.on_message(|inbound| inbound.reply(Envelope::retry()));
+    /// manager.on_message(|inbound| {
+    ///     let reply = Envelope::new(Meta::new(), Data::new()).unwrap();
+    ///     if let Err(error) = inbound.reply(reply) {
+    ///         eprintln!("reply not admitted: {error}");
+    ///     }
+    /// });
     /// ```
-    pub fn reply(&self, envelope: Envelope) {
-        self.mailer.send(self.worker_id.clone(), envelope);
+    pub fn reply(&self, envelope: Envelope) -> Result<SendReceipt, RunpyError> {
+        self.mailer.route(&self.worker_id)?.try_send(envelope)
     }
 
-    /// Send a reply and wait for the originating worker's bounded route.
+    /// Send a reply and wait until it is completely written to the socket.
     ///
-    /// Returns an error when that worker is no longer registered or its route
-    /// has closed.
+    /// Success means the frame reached the socket, not that the worker
+    /// processed it. Waiting for capacity and the write share the Manager's
+    /// send deadline.
     ///
     /// ```no_run
-    /// use runpy::{Envelope, Manager};
+    /// use runpy::{Data, Envelope, Manager, Meta};
     ///
     /// let mut manager = Manager::new("worker");
     /// manager.on_message(|inbound| {
     ///     tokio::spawn(async move {
-    ///         let _ = inbound.reply_async(Envelope::retry()).await;
+    ///         let reply = Envelope::new(Meta::new(), Data::new()).unwrap();
+    ///         let _ = inbound.reply_async(reply).await;
     ///     });
     /// });
     /// ```
-    pub async fn reply_async(&self, envelope: Envelope) -> Result<(), String> {
-        self.mailer.send_async(&self.worker_id, envelope).await
+    pub async fn reply_async(&self, envelope: Envelope) -> Result<(), RunpyError> {
+        self.mailer.route(&self.worker_id)?.send(envelope).await
     }
 }
 
-/// A channel-based sender for one registered worker.
+/// Extra time a receipt waits past its deadline for a writer that is already
+/// enforcing the same deadline to report its own outcome.
+const RECEIPT_GRACE: Duration = Duration::from_millis(100);
+
+/// Write outcome of an admitted outbound envelope.
+///
+/// Admission already reserved queue capacity. [`SendReceipt::wait`] resolves
+/// once the frame is completely written, expires unwritten, or its connection
+/// fails, and never later than shortly after the send deadline. A successful
+/// write does not mean the worker processed the envelope.
+#[must_use = "dropping a receipt discards the write outcome, not the send"]
+pub struct SendReceipt {
+    worker_id: String,
+    deadline: Instant,
+    outcome: oneshot::Receiver<Result<(), RunpyError>>,
+}
+
+impl SendReceipt {
+    /// Wait for the write outcome.
+    ///
+    /// Returns [`TimeoutStage::Queued`] when no writer picked the frame up
+    /// before the deadline (for example because the worker never connected);
+    /// such a frame is later discarded unwritten.
+    pub async fn wait(self) -> Result<(), RunpyError> {
+        match timeout_at(self.deadline + RECEIPT_GRACE, self.outcome).await {
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(_)) => Err(RunpyError::WorkerExited {
+                worker_id: self.worker_id,
+            }),
+            Err(_) => Err(RunpyError::Timeout(TimeoutStage::Queued)),
+        }
+    }
+}
+
+/// One encoded frame admitted to a worker route.
+///
+/// The byte-budget permit is released when the frame is written or dropped,
+/// so queued memory never exceeds the Manager's budget.
+pub(crate) struct OutboundFrame {
+    frame: Vec<u8>,
+    deadline: Instant,
+    ack: oneshot::Sender<Result<(), RunpyError>>,
+    _budget: OwnedSemaphorePermit,
+}
+
+/// Bounded outbound route to one registered worker.
+///
+/// Envelopes are validated, trust-stamped, and encoded before admission so
+/// errors return to the caller and the byte budget reflects real frame size.
 #[derive(Clone)]
 pub(crate) struct MessageSender {
-    tx: mpsc::Sender<Envelope>,
+    tx: mpsc::Sender<OutboundFrame>,
+    worker_id: String,
+    socket_path: String,
+    budget: Arc<Semaphore>,
+    limits: ProtocolLimits,
+    send_timeout: Duration,
 }
 
 impl MessageSender {
-    async fn send(&self, envelope: Envelope) -> Result<(), String> {
-        self.tx
-            .send(envelope)
+    fn encode(&self, mut envelope: Envelope) -> Result<(Vec<u8>, u32), RunpyError> {
+        envelope.validate_manager_to_worker()?;
+        envelope.stamp_trusted(&self.worker_id, &self.socket_path);
+        let frame =
+            encode_frame(&envelope, self.limits.max_frame_bytes()).map_err(
+                |error| match error {
+                    FrameError::TooLarge { size, limit } => {
+                        RunpyError::FrameTooLarge { size, limit }
+                    }
+                    FrameError::Encode(error) => RunpyError::Encode(error),
+                    other => RunpyError::Io(std::io::Error::other(other.to_string())),
+                },
+            )?;
+        // ProtocolLimits caps frames below u32::MAX, so this never truncates.
+        let cost = frame.len() as u32;
+        Ok((frame, cost))
+    }
+
+    fn exited(&self) -> RunpyError {
+        RunpyError::WorkerExited {
+            worker_id: self.worker_id.clone(),
+        }
+    }
+
+    fn receipt(
+        &self,
+        frame: Vec<u8>,
+        budget: OwnedSemaphorePermit,
+        deadline: Instant,
+    ) -> (OutboundFrame, SendReceipt) {
+        let (ack, outcome) = oneshot::channel();
+        (
+            OutboundFrame {
+                frame,
+                deadline,
+                ack,
+                _budget: budget,
+            },
+            SendReceipt {
+                worker_id: self.worker_id.clone(),
+                deadline,
+                outcome,
+            },
+        )
+    }
+
+    /// Admit within the send deadline, waiting for byte budget and a slot.
+    async fn admit(&self, envelope: Envelope) -> Result<SendReceipt, RunpyError> {
+        let deadline = Instant::now() + self.send_timeout;
+        let (frame, cost) = self.encode(envelope)?;
+        let budget = timeout_at(deadline, self.budget.clone().acquire_many_owned(cost))
             .await
-            .map_err(|error| format!("Failed to send envelope to worker: {error}"))
+            .map_err(|_| RunpyError::Timeout(TimeoutStage::Admission))?
+            .map_err(|_| RunpyError::ManagerClosed)?;
+        let slot = timeout_at(deadline, self.tx.reserve())
+            .await
+            .map_err(|_| RunpyError::Timeout(TimeoutStage::Admission))?
+            .map_err(|_| self.exited())?;
+        let (entry, receipt) = self.receipt(frame, budget, deadline);
+        slot.send(entry);
+        Ok(receipt)
+    }
+
+    /// Admit immediately or fail with [`RunpyError::QueueFull`].
+    pub(crate) fn try_send(&self, envelope: Envelope) -> Result<SendReceipt, RunpyError> {
+        let deadline = Instant::now() + self.send_timeout;
+        let (frame, cost) = self.encode(envelope)?;
+        let budget =
+            self.budget
+                .clone()
+                .try_acquire_many_owned(cost)
+                .map_err(|error| match error {
+                    TryAcquireError::NoPermits => RunpyError::QueueFull,
+                    TryAcquireError::Closed => RunpyError::ManagerClosed,
+                })?;
+        let slot = self.tx.try_reserve().map_err(|error| match error {
+            mpsc::error::TrySendError::Full(()) => RunpyError::QueueFull,
+            mpsc::error::TrySendError::Closed(()) => self.exited(),
+        })?;
+        let (entry, receipt) = self.receipt(frame, budget, deadline);
+        slot.send(entry);
+        Ok(receipt)
+    }
+
+    /// Admit and wait until the frame is completely written.
+    pub(crate) async fn send(&self, envelope: Envelope) -> Result<(), RunpyError> {
+        self.admit(envelope).await?.wait().await
     }
 }
 
@@ -509,7 +653,7 @@ struct WorkerSession {
     worker_id: String,
     socket_path: String,
     worker_handler: Option<MessageHandler>,
-    outbound_rx: mpsc::Receiver<Envelope>,
+    outbound_rx: mpsc::Receiver<OutboundFrame>,
     mailer: Arc<Mailer>,
     logger: Arc<Scribbler>,
     limits: ProtocolLimits,
@@ -696,15 +840,21 @@ pub(crate) struct ControlPlane {
     logger: Arc<Scribbler>,
     monitor: Mutex<Option<JoinHandle<()>>>,
     limits: ProtocolLimits,
+    queue: QueueLimits,
+    /// Manager-wide byte budget for admitted, unwritten outbound frames.
+    budget: Arc<Semaphore>,
 }
 
 impl ControlPlane {
-    pub(crate) fn new(logger: Arc<Scribbler>, limits: ProtocolLimits) -> Arc<Self> {
+    pub(crate) fn new(
+        logger: Arc<Scribbler>,
+        limits: ProtocolLimits,
+        queue: QueueLimits,
+    ) -> Arc<Self> {
         let workers = Arc::new(RwLock::new(HashMap::new()));
         let watchdog = WatchdogService::new(workers.clone(), logger.clone());
         let mailer = Arc::new(Mailer {
             workers: workers.clone(),
-            logger: logger.clone(),
         });
 
         Arc::new(Self {
@@ -719,6 +869,8 @@ impl ControlPlane {
             logger,
             monitor: Mutex::new(None),
             limits,
+            queue,
+            budget: Arc::new(Semaphore::new(queue.queued_bytes)),
         })
     }
 
@@ -798,8 +950,15 @@ impl ControlPlane {
                 return Err(error);
             }
         };
-        let (tx, outbound_rx) = mpsc::channel::<Envelope>(SESSION_QUEUE_CAPACITY);
-        let sender = MessageSender { tx };
+        let (tx, outbound_rx) = mpsc::channel::<OutboundFrame>(self.queue.outbound_capacity);
+        let sender = MessageSender {
+            tx,
+            worker_id: worker_id.clone(),
+            socket_path: socket_path.clone(),
+            budget: self.budget.clone(),
+            limits: self.limits,
+            send_timeout: self.queue.send_timeout,
+        };
 
         // Registration and synchronous shutdown acquire sessions before
         // workers. Preserve that order to avoid deadlocking concurrent cleanup.
@@ -884,20 +1043,22 @@ impl ControlPlane {
         Ok(())
     }
 
-    pub(crate) async fn send(&self, worker_id: &str, envelope: Envelope) -> Result<(), String> {
-        let sender = self
-            .workers
-            .read()
-            .get(worker_id)
-            .map(|handle| handle.sender.clone())
-            .ok_or_else(|| format!("Worker '{worker_id}' is not registered"))?;
-        sender.send(envelope).await
+    pub(crate) async fn send(&self, worker_id: &str, envelope: Envelope) -> Result<(), RunpyError> {
+        self.mailer.route(worker_id)?.send(envelope).await
+    }
+
+    pub(crate) fn try_send(
+        &self,
+        worker_id: &str,
+        envelope: Envelope,
+    ) -> Result<SendReceipt, RunpyError> {
+        self.mailer.route(worker_id)?.try_send(envelope)
     }
 
     pub(crate) async fn broadcast(
         &self,
         envelope: Envelope,
-    ) -> HashMap<String, Result<(), String>> {
+    ) -> HashMap<String, Result<(), RunpyError>> {
         let routes: Vec<_> = self
             .workers
             .read()
@@ -911,7 +1072,7 @@ impl ControlPlane {
         results
     }
 
-    pub(crate) async fn terminate_worker(&self, worker_id: &str) -> Result<(), String> {
+    pub(crate) async fn terminate_worker(&self, worker_id: &str) -> Result<(), RunpyError> {
         let send_result = self.send(worker_id, Envelope::terminate()).await;
         if send_result.is_ok() {
             tokio::time::sleep(Duration::from_secs(2)).await;
@@ -1027,10 +1188,8 @@ impl ControlPlane {
             // retried: either task ending tears down the whole connection.
             let writer = tokio::spawn(Self::run_writer(
                 worker_id.clone(),
-                socket_path.clone(),
                 write_half,
                 outbound_rx.clone(),
-                limits,
                 logger.clone(),
             ));
             let mut writer = AbortOnDrop(writer);
@@ -1070,37 +1229,48 @@ impl ControlPlane {
         }
     }
 
-    /// Write queued envelopes until the route closes or a write fails.
+    /// Write admitted frames in order until the route closes or a write fails.
     ///
     /// The shared receiver is held only while this connection's writer runs;
-    /// aborting the writer releases it for a later connection. An envelope
-    /// that cannot be encoded within the frame limit is rejected without
-    /// touching the socket, so the connection stays usable.
+    /// aborting the writer releases it for a later connection. A frame whose
+    /// deadline passed while queued is discarded unwritten. A deadline that
+    /// interrupts a write leaves delivery unknown, so the connection closes
+    /// rather than continue on a possibly corrupted stream.
     async fn run_writer(
         worker_id: String,
-        socket_path: String,
         mut write_half: tokio::net::unix::OwnedWriteHalf,
-        outbound_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<Envelope>>>,
-        limits: ProtocolLimits,
+        outbound_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<OutboundFrame>>>,
         logger: Arc<Scribbler>,
     ) {
         let mut outbound_rx = outbound_rx.lock().await;
-        while let Some(mut envelope) = outbound_rx.recv().await {
-            if let Err(error) = envelope.validate_manager_to_worker() {
-                logger.error_with("ControlPlane", &format!("{worker_id} Send error: {error}"));
+        while let Some(entry) = outbound_rx.recv().await {
+            let OutboundFrame {
+                frame,
+                deadline,
+                ack,
+                _budget,
+            } = entry;
+            if Instant::now() >= deadline {
+                let _ = ack.send(Err(RunpyError::Timeout(TimeoutStage::Queued)));
                 continue;
             }
-            envelope.stamp_trusted(&worker_id, &socket_path);
-            let frame = match encode_frame(&envelope, limits.max_frame_bytes()) {
-                Ok(frame) => frame,
-                Err(error) => {
-                    logger.error_with("ControlPlane", &format!("{worker_id} Send error: {error}"));
-                    continue;
+            match timeout_at(deadline, write_frame(&mut write_half, &frame)).await {
+                Ok(Ok(())) => {
+                    let _ = ack.send(Ok(()));
                 }
-            };
-            if let Err(error) = write_frame(&mut write_half, &frame).await {
-                logger.error_with("ControlPlane", &format!("{worker_id} Send error: {error}"));
-                return;
+                Ok(Err(error)) => {
+                    logger.error_with("ControlPlane", &format!("{worker_id} Send error: {error}"));
+                    let _ = ack.send(Err(RunpyError::Io(error)));
+                    return;
+                }
+                Err(_) => {
+                    logger.error_with(
+                        "ControlPlane",
+                        &format!("{worker_id} Send error: write deadline expired mid-frame"),
+                    );
+                    let _ = ack.send(Err(RunpyError::Timeout(TimeoutStage::Write)));
+                    return;
+                }
             }
         }
         // Every sender is gone, so the worker is being removed; keep the
@@ -1291,61 +1461,28 @@ fn encode_frame(envelope: &Envelope, limit: usize) -> Result<Vec<u8>, FrameError
 }
 
 /// Write one pre-encoded frame with a single buffered write.
-async fn write_frame<W>(stream: &mut W, frame: &[u8]) -> Result<(), FrameError>
+async fn write_frame<W>(stream: &mut W, frame: &[u8]) -> std::io::Result<()>
 where
     W: AsyncWrite + Unpin,
 {
-    stream.write_all(frame).await.map_err(FrameError::Io)?;
-    stream.flush().await.map_err(FrameError::Io)
+    stream.write_all(frame).await?;
+    stream.flush().await
 }
 
+/// Resolves trusted worker IDs to their bounded outbound routes.
 struct Mailer {
     workers: Arc<RwLock<HashMap<String, WorkerHandle>>>,
-    logger: Arc<Scribbler>,
 }
 
 impl Mailer {
-    fn send(self: &Arc<Self>, worker_id: String, envelope: Envelope) {
-        let sender = self
-            .workers
-            .read()
-            .get(&worker_id)
-            .map(|handle| handle.sender.clone());
-        let Some(sender) = sender else {
-            self.logger.error_with(
-                "Mailer",
-                &format!("Failed to send envelope: Worker '{worker_id}' is not registered"),
-            );
-            return;
-        };
-
-        match sender.tx.try_send(envelope) {
-            Ok(()) => {}
-            Err(mpsc::error::TrySendError::Closed(_)) => self.logger.error_with(
-                "Mailer",
-                "Failed to send envelope: worker channel is closed",
-            ),
-            Err(mpsc::error::TrySendError::Full(envelope)) => {
-                let mailer = self.clone();
-                tokio::spawn(async move {
-                    if let Err(error) = sender.send(envelope).await {
-                        mailer
-                            .logger
-                            .error_with("Mailer", &format!("Failed to send envelope: {error}"));
-                    }
-                });
-            }
-        }
-    }
-
-    async fn send_async(&self, worker_id: &str, envelope: Envelope) -> Result<(), String> {
-        let sender = self
-            .workers
+    fn route(&self, worker_id: &str) -> Result<MessageSender, RunpyError> {
+        self.workers
             .read()
             .get(worker_id)
             .map(|handle| handle.sender.clone())
-            .ok_or_else(|| format!("Worker '{worker_id}' is not registered"))?;
-        sender.send(envelope).await
+            .ok_or_else(|| RunpyError::WorkerExited {
+                worker_id: worker_id.to_string(),
+            })
     }
 }
 
@@ -1369,6 +1506,10 @@ mod tests {
 
     fn test_logger() -> Arc<Scribbler> {
         Arc::new(Scribbler::new())
+    }
+
+    fn test_control_plane(limits: ProtocolLimits) -> Arc<ControlPlane> {
+        ControlPlane::new(test_logger(), limits, QueueLimits::default())
     }
 
     async fn register_worker(
@@ -1595,13 +1736,16 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn oversized_outbound_envelope_is_rejected_without_closing_the_connection() {
         let directory = tempfile::TempDir::new().unwrap();
-        let control_plane = ControlPlane::new(test_logger(), limits(256, Duration::from_secs(5)));
+        let control_plane = test_control_plane(limits(256, Duration::from_secs(5)));
         let mut stream = register_worker(&control_plane, directory.path(), "worker", None).await;
 
         let oversized =
             Envelope::new(Meta::new(), object(json!({ "blob": "x".repeat(1024) }))).unwrap();
         let small = Envelope::new(Meta::new(), object(json!({ "ok": true }))).unwrap();
-        control_plane.send("worker", oversized).await.unwrap();
+        assert!(matches!(
+            control_plane.send("worker", oversized).await,
+            Err(RunpyError::FrameTooLarge { limit: 256, .. })
+        ));
         control_plane.send("worker", small).await.unwrap();
 
         let received = timeout(Duration::from_secs(1), read_envelope(&mut stream))
@@ -1614,7 +1758,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn oversized_inbound_header_closes_the_connection_without_dispatch() {
         let directory = tempfile::TempDir::new().unwrap();
-        let control_plane = ControlPlane::new(test_logger(), limits(256, Duration::from_secs(5)));
+        let control_plane = test_control_plane(limits(256, Duration::from_secs(5)));
         let (called_tx, called_rx) = std_mpsc::channel();
         let handler: MessageHandler = Arc::new(move |_| {
             called_tx.send(()).unwrap();
@@ -1716,7 +1860,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn shared_router_uses_live_handler_and_replies_to_originating_workers() {
         let directory = tempfile::TempDir::new().unwrap();
-        let control_plane = ControlPlane::new(test_logger(), ProtocolLimits::default());
+        let control_plane = test_control_plane(ProtocolLimits::default());
         let mut first = register_worker(&control_plane, directory.path(), "worker-a", None).await;
         let mut second = register_worker(&control_plane, directory.path(), "worker-b", None).await;
         let (observed_tx, observed_rx) = std_mpsc::channel();
@@ -1724,7 +1868,9 @@ mod tests {
         control_plane.set_global_handler(Arc::new(move |inbound| {
             observed_tx.send(inbound.envelope.clone()).unwrap();
             let source = inbound.envelope.data()["source"].clone();
-            inbound.reply(Envelope::execute(object(json!({ "source": source }))));
+            let _ = inbound
+                .reply(Envelope::execute(object(json!({ "source": source }))))
+                .unwrap();
         }));
 
         for (stream, source) in [(&mut first, "first"), (&mut second, "second")] {
@@ -1774,7 +1920,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn wrong_direction_closes_connection_without_dispatch() {
         let directory = tempfile::TempDir::new().unwrap();
-        let control_plane = ControlPlane::new(test_logger(), ProtocolLimits::default());
+        let control_plane = test_control_plane(ProtocolLimits::default());
         let (called_tx, called_rx) = std_mpsc::channel();
         let handler: MessageHandler = Arc::new(move |_| {
             called_tx.send(()).unwrap();
@@ -1798,7 +1944,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn outbound_activity_preserves_partially_received_frames() {
         let directory = tempfile::TempDir::new().unwrap();
-        let control_plane = ControlPlane::new(test_logger(), ProtocolLimits::default());
+        let control_plane = test_control_plane(ProtocolLimits::default());
         let (observed_tx, observed_rx) = std_mpsc::channel();
         let handler: MessageHandler = Arc::new(move |inbound| {
             observed_tx.send(inbound.envelope.data().clone()).unwrap();
@@ -1860,7 +2006,7 @@ mod tests {
     async fn blocked_outbound_write_keeps_draining_inbound_frames() {
         const INBOUND_FRAMES: usize = 400;
         let directory = tempfile::TempDir::new().unwrap();
-        let control_plane = ControlPlane::new(test_logger(), ProtocolLimits::default());
+        let control_plane = test_control_plane(ProtocolLimits::default());
         let received = Arc::new(AtomicUsize::new(0));
         let handler_received = received.clone();
         let handler: MessageHandler = Arc::new(move |_| {
@@ -1892,7 +2038,8 @@ mod tests {
             object(json!({ "blob": "b".repeat(4 * 1024 * 1024) })),
         )
         .unwrap();
-        control_plane.send("worker", large).await.unwrap();
+        // Admission only: the write cannot finish until the peer reads.
+        let receipt = control_plane.try_send("worker", large).unwrap();
 
         let _write_half = timeout(Duration::from_secs(10), peer_writes)
             .await
@@ -1913,6 +2060,7 @@ mod tests {
             outbound.data()["blob"].as_str().unwrap().len(),
             4 * 1024 * 1024
         );
+        receipt.wait().await.unwrap();
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while received.load(AtomicOrdering::SeqCst) < INBOUND_FRAMES {
@@ -1922,20 +2070,14 @@ mod tests {
         control_plane.shutdown_now();
     }
 
-    #[tokio::test]
-    async fn sender_reports_dropped_receiver() {
-        let (tx, rx) = mpsc::channel(1);
-        let sender = MessageSender { tx };
-        drop(rx);
-
-        let error = sender.send(Envelope::terminate()).await.unwrap_err();
-        assert!(error.contains("Failed to send envelope"));
-    }
-
     #[test]
     fn registration_starts_monitoring_after_synchronous_construction() {
         let directory = tempfile::TempDir::new().unwrap();
-        let control_plane = ControlPlane::new(test_logger(), ProtocolLimits::default());
+        let control_plane = ControlPlane::new(
+            test_logger(),
+            ProtocolLimits::default(),
+            QueueLimits::default(),
+        );
         assert!(control_plane.monitor.lock().is_none());
 
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1952,7 +2094,11 @@ mod tests {
     #[tokio::test]
     async fn registration_after_shutdown_stops_child_and_removes_socket() {
         let directory = tempfile::TempDir::new().unwrap();
-        let control_plane = ControlPlane::new(test_logger(), ProtocolLimits::default());
+        let control_plane = ControlPlane::new(
+            test_logger(),
+            ProtocolLimits::default(),
+            QueueLimits::default(),
+        );
         let sock_path = directory.path().join("worker.sock");
         let listener = UnixListener::bind(&sock_path).unwrap();
         let socket_path = sock_path.to_string_lossy().into_owned();
@@ -1989,44 +2135,184 @@ mod tests {
         assert_eq!(unsafe { libc::kill(pid as libc::pid_t, 0) }, -1);
     }
 
+    fn test_sender(
+        capacity: usize,
+        budget_bytes: usize,
+        send_timeout: Duration,
+    ) -> (MessageSender, mpsc::Receiver<OutboundFrame>) {
+        let (tx, rx) = mpsc::channel(capacity);
+        let sender = MessageSender {
+            tx,
+            worker_id: "worker".to_string(),
+            socket_path: "/tmp/worker.sock".to_string(),
+            budget: Arc::new(Semaphore::new(budget_bytes)),
+            limits: ProtocolLimits::default(),
+            send_timeout,
+        };
+        (sender, rx)
+    }
+
+    fn numbered(sequence: u64) -> Envelope {
+        Envelope::new(Meta::new(), object(json!({ "sequence": sequence }))).unwrap()
+    }
+
+    fn decoded_sequence(entry: &OutboundFrame) -> u64 {
+        let envelope: Envelope = serde_json::from_slice(&entry.frame[8..]).unwrap();
+        assert_eq!(envelope.meta()["x_wid"], "worker");
+        envelope.data()["sequence"].as_u64().unwrap()
+    }
+
     #[tokio::test]
-    async fn mailer_queues_replies_in_call_order_and_waits_when_full() {
-        let (tx, mut rx) = mpsc::channel(2);
-        let mut command = Command::new("sleep");
-        command.arg("300").process_group(0);
-        let child = command.spawn().unwrap();
-        let workers = Arc::new(RwLock::new(HashMap::from([(
-            "worker".to_string(),
-            WorkerHandle {
-                process_group_id: child.id(),
-                child,
-                identity: WorkerIdentity {
-                    name: "worker".to_string(),
-                    sock_file: "worker.sock".to_string(),
-                },
-                sock_path: PathBuf::from("worker.sock"),
-                sender: MessageSender { tx },
-            },
-        )])));
-        let mailer = Arc::new(Mailer {
-            workers: workers.clone(),
-            logger: test_logger(),
-        });
-        let first = Envelope::execute(object(json!({ "reply": 1 })));
-        let second = Envelope::execute(object(json!({ "reply": 2 })));
-        let third = Envelope::execute(object(json!({ "reply": 3 })));
+    async fn full_route_rejects_nonblocking_sends_without_buffering() {
+        let (sender, mut rx) = test_sender(2, 1 << 20, Duration::from_secs(5));
+        let _first = sender.try_send(numbered(1)).unwrap();
+        let _second = sender.try_send(numbered(2)).unwrap();
+        assert!(matches!(
+            sender.try_send(numbered(3)),
+            Err(RunpyError::QueueFull)
+        ));
 
-        mailer.send("worker".to_string(), first.clone());
-        mailer.send("worker".to_string(), second.clone());
-        mailer.send("worker".to_string(), third.clone());
-
-        assert_eq!(rx.try_recv().unwrap(), first);
-        assert_eq!(rx.try_recv().unwrap(), second);
-        assert_eq!(
-            timeout(Duration::from_secs(1), rx.recv()).await.unwrap(),
-            Some(third)
+        assert_eq!(decoded_sequence(&rx.try_recv().unwrap()), 1);
+        assert_eq!(decoded_sequence(&rx.try_recv().unwrap()), 2);
+        assert!(
+            rx.try_recv().is_err(),
+            "the rejected send must not be queued"
         );
-        let mut handle = workers.write().remove("worker").unwrap();
-        force_stop_worker(&mut handle);
+    }
+
+    #[tokio::test]
+    async fn byte_budget_bounds_queued_frames_and_releases_on_drop() {
+        let (probe, _probe_rx) = test_sender(1, 1, Duration::from_secs(5));
+        let (_, cost) = probe.encode(numbered(1)).unwrap();
+        let (sender, mut rx) = test_sender(64, cost as usize, Duration::from_secs(5));
+        let _first = sender.try_send(numbered(1)).unwrap();
+        assert!(matches!(
+            sender.try_send(numbered(2)),
+            Err(RunpyError::QueueFull)
+        ));
+
+        drop(rx.try_recv().unwrap());
+        let _third = sender.try_send(numbered(3)).unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn blocking_send_times_out_at_admission_when_capacity_never_frees() {
+        let (sender, _rx) = test_sender(1, 1 << 20, Duration::from_secs(5));
+        let _first = sender.try_send(numbered(1)).unwrap();
+        let error = sender.send(numbered(2)).await.unwrap_err();
+        assert!(matches!(
+            error,
+            RunpyError::Timeout(TimeoutStage::Admission)
+        ));
+    }
+
+    #[tokio::test]
+    async fn waiting_sends_are_admitted_in_arrival_order() {
+        let (sender, mut rx) = test_sender(1, 1 << 20, Duration::from_secs(5));
+        let _first = sender.try_send(numbered(1)).unwrap();
+        let mut waiting = Vec::new();
+        for sequence in 2..=4 {
+            let sender = sender.clone();
+            waiting.push(tokio::spawn(async move {
+                sender.admit(numbered(sequence)).await.unwrap()
+            }));
+            // Let each sender register as a waiter before the next starts.
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        let mut order = Vec::new();
+        for _ in 1..=4 {
+            let entry = timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            order.push(decoded_sequence(&entry));
+        }
+        assert_eq!(order, [1, 2, 3, 4]);
+        for task in waiting {
+            let _ = task.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn wrong_direction_and_oversized_envelopes_fail_before_admission() {
+        let (mut sender, mut rx) = test_sender(4, 1 << 20, Duration::from_secs(5));
+        sender.limits = limits(64, Duration::from_secs(1));
+        let ready: Envelope =
+            serde_json::from_value(json!({"meta": {"x_op": "ready"}, "data": {}})).unwrap();
+        assert!(matches!(
+            sender.try_send(ready),
+            Err(RunpyError::InvalidEnvelope(_))
+        ));
+        let oversized =
+            Envelope::new(Meta::new(), object(json!({ "blob": "x".repeat(128) }))).unwrap();
+        assert!(matches!(
+            sender.try_send(oversized),
+            Err(RunpyError::FrameTooLarge { limit: 64, .. })
+        ));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn closed_route_reports_worker_exited() {
+        let (sender, rx) = test_sender(1, 1 << 20, Duration::from_secs(5));
+        drop(rx);
+        assert!(matches!(
+            sender.send(numbered(1)).await,
+            Err(RunpyError::WorkerExited { .. })
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn send_resolves_after_the_frame_is_written() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let control_plane = ControlPlane::new(
+            test_logger(),
+            ProtocolLimits::default(),
+            QueueLimits::default(),
+        );
+        let stream = register_worker(&control_plane, directory.path(), "worker", None).await;
+
+        control_plane.send("worker", numbered(7)).await.unwrap();
+        // The write already completed, so the whole frame is readable at once.
+        timeout(Duration::from_secs(1), stream.readable())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut header = [0_u8; 8];
+        assert_eq!(stream.try_read(&mut header).unwrap(), 8);
+        control_plane.shutdown_now();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn interrupted_write_times_out_and_closes_the_connection() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let queue = QueueLimits {
+            send_timeout: Duration::from_millis(300),
+            ..QueueLimits::default()
+        };
+        let control_plane = ControlPlane::new(test_logger(), ProtocolLimits::default(), queue);
+        let mut stream = register_worker(&control_plane, directory.path(), "worker", None).await;
+
+        // The peer never reads, so a frame far larger than the socket
+        // buffers cannot finish before the deadline.
+        let large = Envelope::new(
+            Meta::new(),
+            object(json!({ "blob": "b".repeat(4 * 1024 * 1024) })),
+        )
+        .unwrap();
+        let error = control_plane.send("worker", large).await.unwrap_err();
+        assert!(matches!(error, RunpyError::Timeout(TimeoutStage::Write)));
+
+        // Draining what was written ends in EOF: the stream is not reused.
+        let mut sink = Vec::new();
+        timeout(Duration::from_secs(5), stream.read_to_end(&mut sink))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(sink.len() < 4 * 1024 * 1024);
+        control_plane.shutdown_now();
     }
 }

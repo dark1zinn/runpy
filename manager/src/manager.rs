@@ -8,8 +8,9 @@ use std::process::Stdio;
 use std::sync::{Arc, Weak};
 use tokio::net::UnixListener;
 
+use crate::error::RunpyError;
 use crate::integrity::IntegrityChecker;
-use crate::protocol::{ControlPlane, Envelope, MessageHandler};
+use crate::protocol::{ControlPlane, Envelope, MessageHandler, SendReceipt};
 
 // ── Worker Identity ────────────────────────────────────────────────────
 
@@ -338,10 +339,12 @@ impl Worker {
         Ok(worker_id)
     }
 
-    /// Send an envelope to this facade's registered worker.
+    /// Send an envelope and wait until it is completely written.
     ///
-    /// Calling before a successful spawn, after Manager drop, or after worker
-    /// removal returns an error.
+    /// Waiting for outbound capacity and the socket write share the
+    /// Manager's send deadline. Success means the frame reached the socket,
+    /// not that the worker processed it. Calling before a successful spawn,
+    /// after Manager drop, or after worker removal returns an error.
     ///
     /// ```no_run
     /// use runpy::{Data, Envelope, Manager};
@@ -361,16 +364,34 @@ impl Worker {
     ///     .unwrap();
     /// # }
     /// ```
-    pub async fn send_message(&self, envelope: Envelope) -> Result<(), String> {
-        let worker_id = self
-            .worker_id
-            .as_deref()
-            .ok_or_else(|| "Worker has not been spawned yet".to_string())?;
-        let control_plane = self
-            .control_plane
-            .upgrade()
-            .ok_or_else(|| "Worker manager is no longer available".to_string())?;
+    pub async fn send_message(&self, envelope: Envelope) -> Result<(), RunpyError> {
+        let (control_plane, worker_id) = self.route()?;
         control_plane.send(worker_id, envelope).await
+    }
+
+    /// Admit an envelope without waiting, or fail with
+    /// [`RunpyError::QueueFull`].
+    ///
+    /// The returned [`SendReceipt`] resolves when the frame is written or
+    /// fails. Dropping the receipt does not cancel the send.
+    ///
+    /// ```no_run
+    /// use runpy::{Data, Envelope, Manager, Meta};
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// let manager = Manager::new("worker");
+    /// let mut worker = manager.worker("my_worker");
+    /// worker.spawn().await.unwrap();
+    /// let receipt = worker
+    ///     .try_send_message(Envelope::new(Meta::new(), Data::new()).unwrap())
+    ///     .expect("capacity available");
+    /// receipt.wait().await.expect("frame written");
+    /// # }
+    /// ```
+    pub fn try_send_message(&self, envelope: Envelope) -> Result<SendReceipt, RunpyError> {
+        let (control_plane, worker_id) = self.route()?;
+        control_plane.try_send(worker_id, envelope)
     }
 
     /// Request graceful termination, then force process-group cleanup.
@@ -389,15 +410,19 @@ impl Worker {
     /// worker.terminate().await.unwrap();
     /// # }
     /// ```
-    pub async fn terminate(&self) -> Result<(), String> {
-        let worker_id = self
-            .worker_id
-            .as_deref()
-            .ok_or_else(|| "Worker has not been spawned yet".to_string())?;
+    pub async fn terminate(&self) -> Result<(), RunpyError> {
+        let (control_plane, worker_id) = self.route()?;
+        control_plane.terminate_worker(worker_id).await
+    }
+
+    fn route(&self) -> Result<(Arc<ControlPlane>, &str), RunpyError> {
+        let worker_id = self.worker_id.as_deref().ok_or_else(|| {
+            RunpyError::InvalidConfig("worker has not been spawned yet".to_string())
+        })?;
         let control_plane = self
             .control_plane
             .upgrade()
-            .ok_or_else(|| "Worker manager is no longer available".to_string())?;
-        control_plane.terminate_worker(worker_id).await
+            .ok_or(RunpyError::ManagerClosed)?;
+        Ok((control_plane, worker_id))
     }
 }

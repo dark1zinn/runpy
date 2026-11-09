@@ -93,9 +93,12 @@ async fn main() {
             .and_then(Value::as_str);
 
         match operation {
-            Some("ready") => inbound.reply(Envelope::execute(object(
-                json!({"task": "example"}),
-            ))),
+            Some("ready") => {
+                let execute = Envelope::execute(object(json!({"task": "example"})));
+                if let Err(error) = inbound.reply(execute) {
+                    eprintln!("execute not sent: {error}");
+                }
+            }
             Some("done") => {
                 println!(
                     "result: {}",
