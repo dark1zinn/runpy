@@ -1,0 +1,78 @@
+name: Benchmarks
+
+# Measurements only: reports are kept as workflow artifacts (never release
+# assets), and possible regressions are flagged for review instead of failing
+# the run, because shared runners are noisy.
+on:
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: benchmarks
+  cancel-in-progress: false
+
+jobs:
+  benchmark:
+    name: Benchmarks
+    runs-on: ubuntu-latest
+    env:
+      LOG: "off"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Build runner
+        run: cargo build --release --locked -p performance
+
+      - name: Run real-uv runner three times
+        run: |
+          mkdir -p reports
+          for run in 1 2 3; do
+            ./target/release/performance run --output "reports/run-$run.json"
+          done
+
+      - name: Run Criterion transport benchmarks
+        run: cargo bench --locked -p runpy --bench transport
+
+      # The baseline is the latest successful run of this workflow on main,
+      # which ran on the same runner image class and pinned toolchain.
+      - name: Download baseline reports
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          run_id=$(gh run list --workflow benchmark.yml --branch main --status success \
+            --limit 1 --json databaseId --jq '.[0].databaseId')
+          if [ -n "$run_id" ]; then
+            gh run download "$run_id" --name benchmark-reports --dir baseline
+          fi
+
+      - name: Flag median regressions over 20%
+        run: |
+          if ls baseline/reports/run-*.json >/dev/null 2>&1; then
+            ./target/release/performance compare \
+              --baseline baseline/reports/run-*.json \
+              --current reports/run-*.json | tee reports/comparison.txt
+          else
+            echo "No baseline yet; this run becomes the baseline." | tee reports/comparison.txt
+          fi
+
+      - name: Upload reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-reports
+          retention-days: 90
+          path: |
+            reports/
+            target/criterion/

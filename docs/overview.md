@@ -744,6 +744,8 @@ runpy/
 │   └── tests/                 # Rust integration tests
 ├── worker/                     # Python runpyrs package and tests
 ├── examples/playground/        # End-to-end Rust/Python example
+├── examples/performance/       # Real-uv performance runner
+├── tests/protocol_vectors.json # Wire vectors shared by both suites
 ├── docs/                       # Installation and canonical overview
 ├── Cargo.toml                  # Rust workspace
 └── pyproject.toml              # Python uv workspace and Ruff settings
@@ -804,3 +806,40 @@ Exercise the complete system with:
 ```bash
 cargo run -p playground
 ```
+
+### Performance measurements
+
+Two tools measure performance; neither is a functional test, and functional
+tests never assert latency. Concurrency and bounds are checked with barriers
+and counters instead.
+
+```bash
+# Criterion: transport through the public API and the local SDK, with a uv
+# shim that runs python3 directly (no dependency resolution).
+LOG=off cargo bench -p runpy --bench transport
+
+# Real uv: startup and steady-state requests, reported as JSON.
+LOG=off cargo run --release -p performance -- run --output report.json
+cargo run --release -p performance -- compare \
+  --baseline old-1.json old-2.json old-3.json \
+  --current report-1.json report-2.json report-3.json
+```
+
+Criterion covers 1 KiB, 64 KiB, and 1 MiB request round trips on one reused
+worker, a spawn-request-terminate cycle, and fixed 12-request batches on
+reusable pools of widths 1 to 3. The `performance` runner stages a PEP 723
+echo worker on this checkout's SDK and reports, separately, the first spawn
+(which includes uv resolving the script environment), later cold spawns,
+one-shot requests, reused-worker latency and throughput per payload size, and
+pool batches at widths 1 to 3: median, p95, and p99 latency, requests and MiB
+per second, plus the runner's peak RSS (`VmHWM` on Linux) and peak open
+descriptors. Payloads come from a fixed seed. `compare` takes each metric's
+median across runs and flags medians more than 20% slower; it never fails.
+
+Limits: measurements are only comparable on the same machine class,
+toolchain, Python, and uv version; the first spawn depends on uv's cache
+state; worker RSS is not included; `ENVIRONMENT=development` forces verbose
+logging and distorts results. The scheduled **Benchmarks** workflow runs the
+runner three times and the Criterion suite, compares against the latest
+successful run on `main`, and keeps reports as workflow artifacts for 90 days.
+They are never attached to releases.
