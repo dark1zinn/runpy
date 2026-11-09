@@ -39,6 +39,9 @@ jobs:
               - '.clippy.toml'
               - '.githooks/pre-commit'
               - '.github/workflows/rust-quality.yml'
+              - 'worker/src/**'
+              - 'worker/pyproject.toml'
+              - 'tests/protocol_vectors.json'
 
   quality:
     name: Rust quality
@@ -53,6 +56,10 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+
+      # End-to-end tests run real uv workers on the local Python SDK.
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v5
 
       - name: Check formatting
         run: cargo fmt --all -- --check

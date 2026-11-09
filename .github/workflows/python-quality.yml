@@ -38,6 +38,7 @@ jobs:
               - '**/.ruff.toml'
               - '.githooks/pre-commit'
               - '.github/workflows/python-quality.yml'
+              - 'tests/protocol_vectors.json'
 
   quality:
     name: Python quality
