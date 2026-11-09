@@ -202,8 +202,8 @@ SDK, so `uv` must be on `PATH`.
 Run Python checks:
 
 ```bash
-uv run --frozen ruff format --check worker/src/runpyrs worker/tests tests examples/playground/worker/my_script.py
-uv run --frozen ruff check worker/src/runpyrs worker/tests tests examples/playground/worker/my_script.py
+uv run --frozen ruff format --check worker/src/runpyrs worker/tests tests scripts examples/playground/worker/my_script.py
+uv run --frozen ruff check worker/src/runpyrs worker/tests tests scripts examples/playground/worker/my_script.py
 uv run --frozen mypy
 uv run --frozen --all-packages pytest worker/tests tests/docs tests/hooks --doctest-modules worker/src/runpyrs
 # Against the minimum Python without replacing .venv:

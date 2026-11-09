@@ -1,0 +1,9 @@
+# pip-audit suppressions for the locked Python tooling (see deny.toml for
+# Rust). Each entry needs the vulnerability `id` and a `reason` ending with
+# "(expires YYYY-MM-DD)"; scripts/check-suppressions.py rejects anything else
+# and fails once an entry expires. Example:
+#
+# [[ignore]]
+# id = "GHSA-xxxx-xxxx-xxxx"
+# reason = "Only affects the CLI, which we never invoke (expires 2026-12-31)"
+ignore = []

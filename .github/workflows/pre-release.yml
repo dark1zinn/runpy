@@ -6,6 +6,10 @@ on:
       - 'v[0-9]+.[0-9]+.[0-9]+-dev'
       - 'v[0-9]+.[0-9]+.[0-9]+-dev.[0-9]+'
 
+# Read-only by default; only the release job may write.
+permissions:
+  contents: read
+
 jobs:
   pre-release:
     name: Pre-Release
@@ -15,7 +19,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Validate tag format (must be vX.X.X-dev or vX.X.X-dev.X)
         run: |
@@ -28,7 +32,7 @@ jobs:
           echo "✓ Valid pre-release tag: $TAG"
 
       - name: Create GitHub Pre-Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           name: Pre-Release ${{ env.TAG }}
           prerelease: true

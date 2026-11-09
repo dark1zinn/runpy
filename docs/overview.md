@@ -793,8 +793,8 @@ Applications install pinned Git revisions instead (see the
 Run Python validation from the repository root:
 
 ```bash
-uv run --frozen ruff format --check worker/src/runpyrs worker/tests tests examples/playground/worker/my_script.py
-uv run --frozen ruff check worker/src/runpyrs worker/tests tests examples/playground/worker/my_script.py
+uv run --frozen ruff format --check worker/src/runpyrs worker/tests tests scripts examples/playground/worker/my_script.py
+uv run --frozen ruff check worker/src/runpyrs worker/tests tests scripts examples/playground/worker/my_script.py
 uv run --frozen mypy
 uv run --frozen --all-packages pytest worker/tests tests/docs tests/hooks --doctest-modules worker/src/runpyrs
 # Against the minimum Python without replacing .venv:
@@ -821,10 +821,54 @@ unless all gates succeeded, so skipped or cancelled gates cannot pass.
 | Ruff, mypy strict, pytest, doctests, Markdown, hook tests | Linux × Python 3.10–3.14 |
 | `scripts/package-smoke.sh` | Linux |
 | actionlint | Linux |
+| cargo-deny licenses, bans, sources; suppression validity | Linux |
 
 The declared minimum Rust is `rust-version = "1.93"`. The development shell
-job (`dev-shell.yml`) and the scheduled benchmarks are separate and not
-required.
+job (`dev-shell.yml`), the scheduled benchmarks, and the advisory audit are
+separate and not required.
+
+### Supply chain
+
+Following GitHub's
+[security hardening guide](https://docs.github.com/actions/security-guides/security-hardening-for-github-actions):
+
+- Every third-party action is pinned to a full commit SHA resolved from the
+  upstream tag, with the version in a trailing comment. Tools downloaded in
+  CI (actionlint, cargo-deny) are checked against release SHA-256 sums.
+- Workflows default to `contents: read`; only release creation gets
+  `contents: write`. Pull requests run with `pull_request`, never
+  `pull_request_target`, so untrusted code receives no secrets.
+- Dependabot proposes weekly grouped updates for Cargo, uv (`pyproject.toml`
+  with `uv.lock`), and the pinned actions.
+- `deny.toml` allows only Apache-2.0, MIT, BSD-2/3-Clause, ISC, Unicode-3.0,
+  and Apache-2.0 WITH LLVM-exception licenses (multi-licensed crates such as
+  `r-efi` qualify through MIT), denies yanked crates, wildcard versions, and
+  any registry or Git source other than crates.io. The required gate checks
+  licenses, bans, and sources; `audit.yml` checks RustSec advisories daily and
+  when a lockfile changes.
+- `audit.yml` runs pip-audit on the hashed export of `uv.lock` (all locked
+  development and build tooling; `runpyrs` itself has no runtime
+  dependencies).
+
+Suppressions live only in `deny.toml` (`[advisories] ignore`) and
+`audit-suppressions.toml`. Each needs the advisory ID and a reason ending in
+`(expires YYYY-MM-DD)`; `scripts/check-suppressions.py` fails on bare IDs,
+missing reasons, and expired entries. Nothing is ignored by default.
+
+To remediate a finding, update the affected package and its lock, then rerun
+the audit:
+
+```bash
+cargo update -p <crate>            # Rust; may need related crates together
+uv lock --upgrade-package <name>   # Python
+cargo deny --locked check
+uv export --frozen --all-packages --group dev --no-emit-workspace --format requirements-txt -o /tmp/req.txt
+uv run --frozen pip-audit --disable-pip --require-hashes -r /tmp/req.txt
+```
+
+Raise the minimum in the manifest when an old version is vulnerable. Suppress
+only when no fixed version exists and the code path is unreachable, with a
+short expiry.
 
 `tests/protocol_vectors.json` holds wire vectors that both languages must
 agree on: frame bodies (Unicode, reserved fields, direction, malformed JSON,

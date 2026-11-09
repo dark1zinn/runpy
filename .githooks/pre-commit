@@ -94,11 +94,13 @@ if [ "$check_python" = true ]; then
         worker/src/runpyrs \
         worker/tests \
         tests \
+        scripts \
         examples/playground/worker/my_script.py
     printf '%s\n' 'Checking Python lints...'
     uv run --frozen --python 3.10 ruff check \
         worker/src/runpyrs \
         worker/tests \
         tests \
+        scripts \
         examples/playground/worker/my_script.py
 fi
