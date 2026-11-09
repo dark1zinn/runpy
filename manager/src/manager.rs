@@ -396,9 +396,11 @@ impl Worker {
 
     /// Request graceful termination, then force process-group cleanup.
     ///
-    /// On a successful send the control plane waits two seconds before
-    /// removal. Cleanup still runs when sending fails; the send error is then
-    /// returned. Calling before spawn or after Manager drop returns an error.
+    /// New sends to this worker are refused at once. The worker is removed
+    /// when its process exits, and at the latest two seconds after the call
+    /// started, even if `terminate` could not be written. Cleanup always runs;
+    /// the result reports whether `terminate` was written. Calling before
+    /// spawn or after Manager drop returns an error.
     ///
     /// ```no_run
     /// # use runpy::Manager;

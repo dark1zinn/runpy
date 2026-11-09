@@ -193,20 +193,33 @@ can reply with `Worker.send` or emit a structured `Worker.log` envelope.
 
 ### 7. Terminate and clean up
 
-`Worker::terminate` sends `terminate`. When the send succeeds, Rust allows two
-seconds for graceful handling, then removes the worker and force-stops the
-process group. `Manager::terminate_all` broadcasts the same operation, waits
-two seconds, and removes every worker. Watchdog cleanup and session end use the
-same removal path. Removal happens once: concurrent watchdog, session,
-termination, and shutdown attempts are idempotent, and the first records the
-reason (`process exited`, `disconnected`, `protocol violation`, `terminated`,
-or `manager shutdown`) in the removal log.
+`Worker::terminate` starts a two-second shutdown grace. It immediately refuses
+new sends to that worker, then tries to deliver `terminate` within the grace.
+The worker is removed as soon as its process exits, and at the latest when the
+grace ends, even if `terminate` is stuck behind a saturated queue or could not
+be written. The returned result only reports whether `terminate` was written.
+`Manager::terminate_all` does the same for every worker under one shared
+deadline, delivering the requests concurrently so one stuck worker cannot delay
+the others. `Manager::broadcast` likewise sends to all workers concurrently.
 
-Removal aborts the protocol task, kills and reaps the process group, removes the
-socket, then permits each output reader up to 250 ms to drain final bytes.
+Watchdog cleanup and session end use the same removal path. Removal happens
+once: concurrent watchdog, session, termination, and shutdown attempts are
+idempotent, and the first records the reason (`process exited`,
+`disconnected`, `protocol violation`, `terminated`, or `manager shutdown`) in
+the removal log. A worker whose termination was requested is recorded as
+terminated even if it exits or disconnects first.
+
+Removal aborts the protocol task, kills and reaps the process group on a
+blocking thread outside the async runtime workers, removes the socket, then
+permits each output reader up to 250 ms to drain final bytes. Termination is
+therefore bounded by the grace plus kill-and-reap and the output drain; a
+process stuck in an uninterruptible kernel state can still delay its reap.
+
 Manager drop is synchronous: it closes the output dispatcher, aborts all tasks,
-and immediately kills/reaps all registered groups. Final buffered output is
-therefore best effort.
+and immediately kills and reaps all registered groups on the dropping thread,
+so it can block briefly and does not give workers a grace period. Final
+buffered output is therefore best effort; call `terminate_all` first for a
+graceful shutdown.
 
 ## Protocol reference
 

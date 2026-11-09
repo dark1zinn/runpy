@@ -340,9 +340,11 @@ impl Manager {
 
     /// Request graceful termination for all workers, then force cleanup.
     ///
-    /// The control plane broadcasts `terminate`, waits two seconds, kills and
-    /// reaps remaining process groups, removes sockets, and briefly drains
-    /// output readers.
+    /// New sends are refused at once. `terminate` requests are delivered
+    /// concurrently, and every process group is killed and reaped as soon as
+    /// it exits or at the latest two seconds after the call started, even when
+    /// a worker's queue is saturated. Sockets are removed and output readers
+    /// drain briefly.
     ///
     /// ```no_run
     /// use runpy::Manager;

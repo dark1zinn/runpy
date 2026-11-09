@@ -14,7 +14,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWrite
 use tokio::net::UnixListener;
 use tokio::process::{ChildStderr, ChildStdout};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError, mpsc, oneshot};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{Duration, Instant, interval, timeout, timeout_at};
 
 use crate::config::{ProtocolLimits, QueueLimits};
@@ -51,6 +51,8 @@ const OUTPUT_RECORD_LIMIT: usize = 16 * 1024;
 const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 /// Complete envelopes buffered between a session and its socket I/O tasks.
 const SESSION_QUEUE_CAPACITY: usize = 64;
+/// How often termination checks whether a worker already exited.
+const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 /// Abort an owned helper task when its owning scope ends or is cancelled.
 struct AbortOnDrop<T>(JoinHandle<T>);
@@ -457,6 +459,8 @@ pub(crate) struct MessageSender {
     budget: Arc<Semaphore>,
     limits: ProtocolLimits,
     send_timeout: Duration,
+    /// Set once termination starts; new application sends are refused.
+    closing: Arc<AtomicBool>,
 }
 
 impl MessageSender {
@@ -506,9 +510,20 @@ impl MessageSender {
         )
     }
 
-    /// Admit within the send deadline, waiting for byte budget and a slot.
-    async fn admit(&self, envelope: Envelope) -> Result<SendReceipt, RunpyError> {
-        let deadline = Instant::now() + self.send_timeout;
+    fn accepting(&self) -> Result<(), RunpyError> {
+        if self.closing.load(Ordering::Acquire) {
+            Err(self.exited())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Admit before `deadline`, waiting for byte budget and a slot.
+    async fn admit_until(
+        &self,
+        envelope: Envelope,
+        deadline: Instant,
+    ) -> Result<SendReceipt, RunpyError> {
         let (frame, cost) = self.encode(envelope)?;
         let budget = timeout_at(deadline, self.budget.clone().acquire_many_owned(cost))
             .await
@@ -523,8 +538,16 @@ impl MessageSender {
         Ok(receipt)
     }
 
+    /// Admit within the send deadline, waiting for byte budget and a slot.
+    async fn admit(&self, envelope: Envelope) -> Result<SendReceipt, RunpyError> {
+        self.accepting()?;
+        self.admit_until(envelope, Instant::now() + self.send_timeout)
+            .await
+    }
+
     /// Admit immediately or fail with [`RunpyError::QueueFull`].
     pub(crate) fn try_send(&self, envelope: Envelope) -> Result<SendReceipt, RunpyError> {
+        self.accepting()?;
         let deadline = Instant::now() + self.send_timeout;
         let (frame, cost) = self.encode(envelope)?;
         let budget =
@@ -547,6 +570,17 @@ impl MessageSender {
     /// Admit and wait until the frame is completely written.
     pub(crate) async fn send(&self, envelope: Envelope) -> Result<(), RunpyError> {
         self.admit(envelope).await?.wait().await
+    }
+
+    /// Stop accepting application sends, then try to deliver `terminate`
+    /// before `deadline`. The result only reports whether the request was
+    /// written; the caller enforces the deadline by stopping the process.
+    async fn request_termination(&self, deadline: Instant) -> Result<(), RunpyError> {
+        self.closing.store(true, Ordering::Release);
+        self.admit_until(Envelope::terminate(), deadline)
+            .await?
+            .wait()
+            .await
     }
 }
 
@@ -1011,6 +1045,7 @@ impl ControlPlane {
             budget: self.budget.clone(),
             limits: self.limits,
             send_timeout: self.queue.send_timeout,
+            closing: Arc::new(AtomicBool::new(false)),
         };
 
         // Registration and synchronous shutdown acquire sessions before
@@ -1109,6 +1144,10 @@ impl ControlPlane {
         self.mailer.route(worker_id)?.try_send(envelope)
     }
 
+    /// Send to every registered worker concurrently and collect each result.
+    ///
+    /// One stuck route delays only its own entry. Concurrency is bounded by
+    /// the number of registered workers.
     pub(crate) async fn broadcast(
         &self,
         envelope: Envelope,
@@ -1119,29 +1158,75 @@ impl ControlPlane {
             .iter()
             .map(|(worker_id, handle)| (worker_id.clone(), handle.sender.clone()))
             .collect();
-        let mut results = HashMap::with_capacity(routes.len());
+        let mut sends = JoinSet::new();
         for (worker_id, sender) in routes {
-            results.insert(worker_id, sender.send(envelope.clone()).await);
+            let envelope = envelope.clone();
+            sends.spawn(async move { (worker_id, sender.send(envelope).await) });
+        }
+        let mut results = HashMap::with_capacity(sends.len());
+        while let Some(joined) = sends.join_next().await {
+            if let Ok((worker_id, result)) = joined {
+                results.insert(worker_id, result);
+            }
         }
         results
     }
 
+    /// Request graceful termination, then stop the process group no later
+    /// than the shutdown grace after this call started.
+    ///
+    /// New application sends are refused immediately. The process is killed
+    /// at the deadline even when the `terminate` frame is stuck behind a
+    /// saturated route or could not be written; an earlier exit ends the
+    /// wait early. The result reports only whether `terminate` was written.
     pub(crate) async fn terminate_worker(&self, worker_id: &str) -> Result<(), RunpyError> {
-        let send_result = self.send(worker_id, Envelope::terminate()).await;
-        if send_result.is_ok() {
-            tokio::time::sleep(Duration::from_secs(2)).await;
-        }
+        let deadline = Instant::now() + self.queue.shutdown_grace;
+        let sender = self.mailer.route(worker_id)?;
+        let request = sender.request_termination(deadline).await;
+        self.wait_for_exit(worker_id, deadline).await;
         self.remove_worker(worker_id, ExitReason::Terminated).await;
-        send_result
+        request
     }
 
+    /// Terminate every registered worker under one shared grace deadline.
     pub(crate) async fn terminate_all(&self) {
-        let _ = self.broadcast(Envelope::terminate()).await;
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        let deadline = Instant::now() + self.queue.shutdown_grace;
+        let routes: Vec<_> = self
+            .workers
+            .read()
+            .iter()
+            .map(|(worker_id, handle)| (worker_id.clone(), handle.sender.clone()))
+            .collect();
+        let mut requests = JoinSet::new();
+        for (_, sender) in &routes {
+            let sender = sender.clone();
+            requests.spawn(async move {
+                let _ = sender.request_termination(deadline).await;
+            });
+        }
+        while requests.join_next().await.is_some() {}
 
-        let worker_ids: Vec<_> = self.workers.read().keys().cloned().collect();
-        for worker_id in worker_ids {
-            self.remove_worker(&worker_id, ExitReason::Terminated).await;
+        for (worker_id, _) in &routes {
+            self.wait_for_exit(worker_id, deadline).await;
+        }
+        for (worker_id, _) in &routes {
+            self.remove_worker(worker_id, ExitReason::Terminated).await;
+        }
+    }
+
+    /// Wait until the worker's process exits, it is removed, or `deadline`.
+    ///
+    /// Polls `try_wait` without holding the registry lock across a sleep.
+    async fn wait_for_exit(&self, worker_id: &str, deadline: Instant) {
+        loop {
+            let exited = match self.workers.write().get_mut(worker_id) {
+                None => true,
+                Some(handle) => !matches!(handle.child.try_wait(), Ok(None)),
+            };
+            if exited || Instant::now() >= deadline {
+                return;
+            }
+            tokio::time::sleep_until((Instant::now() + EXIT_POLL_INTERVAL).min(deadline)).await;
         }
     }
 
@@ -1150,7 +1235,9 @@ impl ControlPlane {
     ///
     /// Watchdog, session end, termination, and shutdown can race to remove
     /// the same worker; the first caller wins and records the reason, later
-    /// callers return `false`.
+    /// callers return `false`. A worker whose termination was requested is
+    /// recorded as terminated even if it exited or disconnected first. The
+    /// blocking kill-and-reap runs off the async runtime threads.
     async fn remove_worker(&self, worker_id: &str, reason: ExitReason) -> bool {
         let tasks = self.sessions.lock().remove(worker_id);
         if let Some(tasks) = &tasks {
@@ -1160,15 +1247,28 @@ impl ControlPlane {
         let handle = self.workers.write().remove(worker_id);
         let removed = handle.is_some();
         if let Some(mut handle) = handle {
-            force_stop_worker(&mut handle);
-            let _ = std::fs::remove_file(&handle.sock_path);
+            let reason = if reason != ExitReason::ManagerShutdown
+                && handle.sender.closing.load(Ordering::Acquire)
+            {
+                ExitReason::Terminated
+            } else {
+                reason
+            };
+            let name = handle.identity.name.clone();
+            let stopped = tokio::task::spawn_blocking(move || {
+                force_stop_worker(&mut handle);
+                let _ = std::fs::remove_file(&handle.sock_path);
+            })
+            .await;
+            if let Err(error) = stopped {
+                self.logger.error_with(
+                    "ControlPlane",
+                    &format!("Failed to stop worker '{name}': {error}"),
+                );
+            }
             self.logger.info_with(
                 "ControlPlane",
-                &format!(
-                    "Removed worker '{}' ({})",
-                    handle.identity.name,
-                    reason.as_str()
-                ),
+                &format!("Removed worker '{name}' ({})", reason.as_str()),
             );
         }
 
@@ -2211,6 +2311,18 @@ mod tests {
         assert_eq!(unsafe { libc::kill(pid as libc::pid_t, 0) }, -1);
     }
 
+    /// Poll `check` until it holds or a few seconds pass.
+    async fn eventually(mut check: impl FnMut() -> bool, what: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while !check() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{what} did not happen"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     /// Wait until the monitor has removed `worker_id`.
     async fn wait_for_removal(control_plane: &Arc<ControlPlane>, worker_id: &str) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
@@ -2255,8 +2367,7 @@ mod tests {
             assert!(result.is_err());
         }
         wait_for_removal(&control_plane, "worker").await;
-        assert!(!sock_path.exists());
-        assert!(!process_alive(pid));
+        eventually(|| !sock_path.exists() && !process_alive(pid), "cleanup").await;
         assert!(matches!(
             control_plane.send("worker", numbered(1)).await,
             Err(RunpyError::WorkerExited { .. })
@@ -2275,7 +2386,7 @@ mod tests {
         stream.write_all(b"not json!").await.unwrap();
 
         wait_for_removal(&control_plane, "worker").await;
-        assert!(!process_alive(pid));
+        eventually(|| !process_alive(pid), "process group stop").await;
         control_plane.shutdown_now();
     }
 
@@ -2298,6 +2409,131 @@ mod tests {
         control_plane.shutdown_now();
     }
 
+    fn short_limits(send_timeout: Duration, shutdown_grace: Duration) -> QueueLimits {
+        QueueLimits {
+            outbound_capacity: 1,
+            send_timeout,
+            shutdown_grace,
+            ..QueueLimits::default()
+        }
+    }
+
+    /// Fill a route whose peer never reads: one large frame blocks the writer
+    /// and a second occupies the only queue slot. Their own deadline is far
+    /// away so the blocked write does not close the connection meanwhile.
+    async fn saturate(control_plane: &Arc<ControlPlane>, worker_id: &str) -> Vec<SendReceipt> {
+        let large = Envelope::new(
+            Meta::new(),
+            object(json!({ "blob": "b".repeat(2 * 1024 * 1024) })),
+        )
+        .unwrap();
+        let sender = control_plane.mailer.route(worker_id).unwrap();
+        let far = Instant::now() + Duration::from_secs(60);
+        let mut receipts = Vec::new();
+        while let Ok(admitted) = timeout(
+            Duration::from_millis(200),
+            sender.admit_until(large.clone(), far),
+        )
+        .await
+        {
+            receipts.push(admitted.unwrap());
+        }
+        assert!(receipts.len() >= 2, "route never saturated");
+        receipts
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn saturated_route_cannot_delay_termination_past_the_grace() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let grace = Duration::from_millis(400);
+        let control_plane = ControlPlane::new(
+            test_logger(),
+            ProtocolLimits::default(),
+            short_limits(Duration::from_secs(30), grace),
+        );
+        let _stuck = register_worker(&control_plane, directory.path(), "stuck", None).await;
+        let _healthy = register_worker(&control_plane, directory.path(), "healthy", None).await;
+        let stuck_pid = control_plane.workers.read()["stuck"].child.id();
+        let healthy_pid = control_plane.workers.read()["healthy"].child.id();
+        let _receipts = saturate(&control_plane, "stuck").await;
+
+        let started = tokio::time::Instant::now();
+        control_plane.terminate_all().await;
+        assert!(
+            started.elapsed() < grace + Duration::from_secs(1),
+            "termination took {:?}",
+            started.elapsed()
+        );
+        assert!(!process_alive(stuck_pid));
+        assert!(!process_alive(healthy_pid));
+        assert!(control_plane.workers.read().is_empty());
+        control_plane.shutdown_now();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn early_exit_ends_the_termination_wait_and_new_sends_are_refused() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let control_plane = ControlPlane::new(
+            test_logger(),
+            ProtocolLimits::default(),
+            short_limits(Duration::from_secs(5), Duration::from_secs(10)),
+        );
+        let mut stream = register_worker(&control_plane, directory.path(), "worker", None).await;
+        let pid = control_plane.workers.read()["worker"].child.id();
+
+        let started = tokio::time::Instant::now();
+        let terminating = {
+            let control_plane = control_plane.clone();
+            tokio::spawn(async move { control_plane.terminate_worker("worker").await })
+        };
+        let request = timeout(Duration::from_secs(1), read_envelope(&mut stream))
+            .await
+            .unwrap();
+        assert_eq!(request.meta()["x_op"], "terminate");
+        assert!(matches!(
+            control_plane.send("worker", numbered(1)).await,
+            Err(RunpyError::WorkerExited { .. })
+        ));
+
+        // The worker honours the request by exiting.
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+        terminating.await.unwrap().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(!process_alive(pid));
+        control_plane.shutdown_now();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn broadcast_waits_for_stuck_routes_concurrently() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let send_timeout = Duration::from_millis(500);
+        let control_plane = ControlPlane::new(
+            test_logger(),
+            ProtocolLimits::default(),
+            short_limits(send_timeout, Duration::from_secs(2)),
+        );
+        let _first = register_worker(&control_plane, directory.path(), "first", None).await;
+        let _second = register_worker(&control_plane, directory.path(), "second", None).await;
+        let mut healthy = register_worker(&control_plane, directory.path(), "healthy", None).await;
+        let _first_receipts = saturate(&control_plane, "first").await;
+        let _second_receipts = saturate(&control_plane, "second").await;
+
+        let started = tokio::time::Instant::now();
+        let results = control_plane.broadcast(numbered(9)).await;
+        let elapsed = started.elapsed();
+
+        assert!(matches!(results["first"], Err(RunpyError::Timeout(_))));
+        assert!(matches!(results["second"], Err(RunpyError::Timeout(_))));
+        assert!(results["healthy"].is_ok());
+        assert!(
+            elapsed < send_timeout * 3 / 2,
+            "stuck routes were awaited sequentially: {elapsed:?}"
+        );
+        let delivered = read_envelope(&mut healthy).await;
+        assert_eq!(delivered.data()["sequence"], 9);
+        control_plane.shutdown_now();
+    }
+
     fn test_sender(
         capacity: usize,
         budget_bytes: usize,
@@ -2311,6 +2547,7 @@ mod tests {
             budget: Arc::new(Semaphore::new(budget_bytes)),
             limits: ProtocolLimits::default(),
             send_timeout,
+            closing: Arc::new(AtomicBool::new(false)),
         };
         (sender, rx)
     }

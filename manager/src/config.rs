@@ -21,6 +21,8 @@ pub(crate) const DEFAULT_OUTBOUND_CAPACITY: usize = 64;
 pub(crate) const DEFAULT_QUEUED_BYTES: usize = 16 * 1024 * 1024;
 /// Default deadline covering outbound admission and the socket write.
 pub(crate) const DEFAULT_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+/// Default time a worker gets to exit after termination starts.
+pub(crate) const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
 /// Bounds on outbound memory and time shared by every worker route.
 #[derive(Clone, Copy, Debug)]
@@ -31,6 +33,8 @@ pub(crate) struct QueueLimits {
     pub queued_bytes: usize,
     /// Deadline from the start of a send until its write completes.
     pub send_timeout: Duration,
+    /// Deadline from the start of termination until the group is killed.
+    pub shutdown_grace: Duration,
 }
 
 impl Default for QueueLimits {
@@ -39,6 +43,7 @@ impl Default for QueueLimits {
             outbound_capacity: DEFAULT_OUTBOUND_CAPACITY,
             queued_bytes: DEFAULT_QUEUED_BYTES,
             send_timeout: DEFAULT_SEND_TIMEOUT,
+            shutdown_grace: DEFAULT_SHUTDOWN_GRACE,
         }
     }
 }
