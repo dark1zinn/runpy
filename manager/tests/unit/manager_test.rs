@@ -1,6 +1,5 @@
 use runpy::{
-    InvalidScriptReason, Manager, RunpyError, StdinMode, TimeoutStage, WorkerIdentity,
-    WorkerOutputStream,
+    InvalidScriptReason, Manager, RunpyError, StdinMode, TimeoutStage, WorkerOutputStream,
 };
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -96,22 +95,93 @@ async fn wait_for_process_exit(pid: u32) {
     }
 }
 
-#[test]
-fn worker_identity_contains_script_name() {
-    let id = WorkerIdentity::new("my_script");
-    assert!(id.name.starts_with("my_script_"));
-    assert!(id.sock_file.starts_with("rp_"));
-    assert!(id.sock_file.ends_with(".sock"));
+#[cfg(unix)]
+#[tokio::test]
+async fn each_manager_owns_a_private_socket_directory_removed_on_drop() {
+    let tmp = TempDir::new().unwrap();
+    let uv = recording_uv(&tmp, "exec sleep 300");
+    let scripts = scripts_dir(&tmp, &["same"]);
+    let first = manager_with_uv(&scripts, &uv).await;
+    let second = manager_with_uv(&scripts, &uv).await;
+    assert_ne!(first.socket_dir(), second.socket_dir());
+
+    let mode = fs::metadata(first.socket_dir())
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o700);
+
+    // The same script runs in both Managers without any socket conflict.
+    first.worker("same").spawn().await.unwrap();
+    second.worker("same").spawn().await.unwrap();
+    for manager in [&first, &second] {
+        let sockets: Vec<_> = fs::read_dir(manager.socket_dir()).unwrap().collect();
+        assert_eq!(sockets.len(), 1);
+    }
+
+    let first_dir = first.socket_dir().to_path_buf();
+    drop(first);
+    assert!(!first_dir.exists());
+    assert!(second.socket_dir().exists());
 }
 
-#[test]
-fn worker_identity_is_unique() {
-    let first = WorkerIdentity::new("same");
-    let second = WorkerIdentity::new("same");
-    assert_ne!(first.name, second.name);
-    assert_ne!(first.sock_file, second.sock_file);
+#[tokio::test]
+async fn socket_parent_gets_a_fresh_child_and_is_never_adopted() {
+    let tmp = TempDir::new().unwrap();
+    let uv = fake_uv(&tmp);
+    let scripts = scripts_dir(&tmp, &[]);
+    let parent = tmp.path().join("sockets");
+    fs::create_dir(&parent).unwrap();
+    fs::write(parent.join("existing"), "keep me").unwrap();
+
+    let manager = Manager::builder(&scripts)
+        .uv_path(&uv)
+        .socket_parent(&parent)
+        .build()
+        .await
+        .unwrap();
+    let socket_dir = manager.socket_dir().to_path_buf();
+    assert_eq!(socket_dir.parent().unwrap(), parent);
+    drop(manager);
+
+    assert!(!socket_dir.exists());
+    assert_eq!(
+        fs::read_to_string(parent.join("existing")).unwrap(),
+        "keep me"
+    );
 }
 
+#[tokio::test]
+async fn unusable_socket_parents_are_rejected() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let tmp = TempDir::new().unwrap();
+    let uv = fake_uv(&tmp);
+    let scripts = scripts_dir(&tmp, &[]);
+
+    let long = tmp.path().join("p".repeat(120));
+    fs::create_dir(&long).unwrap();
+    assert!(matches!(
+        Manager::builder(&scripts).uv_path(&uv).socket_parent(&long).build().await,
+        Err(RunpyError::InvalidConfig(message)) if message.contains("too long")
+    ));
+
+    let non_utf8 = tmp.path().join(std::ffi::OsStr::from_bytes(b"bad-\xff"));
+    fs::create_dir(&non_utf8).unwrap();
+    assert!(matches!(
+        Manager::builder(&scripts).uv_path(&uv).socket_parent(&non_utf8).build().await,
+        Err(RunpyError::InvalidConfig(message)) if message.contains("UTF-8")
+    ));
+
+    assert!(matches!(
+        Manager::builder(&scripts)
+            .uv_path(&uv)
+            .socket_parent(tmp.path().join("missing"))
+            .build()
+            .await,
+        Err(RunpyError::Io(_))
+    ));
+}
 #[test]
 fn build_outside_a_tokio_runtime_is_rejected() {
     let tmp = TempDir::new().unwrap();
@@ -440,7 +510,10 @@ wait "$descendant""#,
             .to_str()
             .unwrap()
     );
-    assert!(arguments[4].starts_with("/tmp/runpy/rp_managed_"));
+    assert_eq!(
+        Path::new(&arguments[4]).parent().unwrap(),
+        manager.socket_dir()
+    );
     assert_eq!(arguments[5], worker.id());
     assert_eq!(arguments[6], "--mode=test");
 
@@ -509,7 +582,10 @@ async fn relative_runtime_paths_are_absolutized_and_adjacent_lock_is_enforced() 
             .to_str()
             .unwrap()
     );
-    assert!(arguments[5].starts_with("/tmp/runpy/rp_managed_"));
+    assert_eq!(
+        Path::new(&arguments[5]).parent().unwrap(),
+        manager.socket_dir()
+    );
     assert_eq!(arguments[6], worker.id());
 }
 
@@ -535,7 +611,12 @@ exit 0"#,
         .spawn()
         .await
         .unwrap();
-    let socket_path = PathBuf::from(format!("/tmp/runpy/rp_{}.sock", worker.id()));
+    let socket_path = fs::read_dir(manager.socket_dir())
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
     wait_for_file(&descendant_file).await;
     let descendant_pid: u32 = fs::read_to_string(&descendant_file)
         .unwrap()

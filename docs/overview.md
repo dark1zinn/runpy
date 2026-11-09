@@ -59,11 +59,32 @@ dropped they return `RunpyError::ManagerClosed`.
 
 ### IntegrityChecker
 
-The private `IntegrityChecker` executes the configured `uv --version`, ensures
-`/tmp/runpy` exists, verifies the scripts directory, and recursively indexes
-Python file stems for diagnostics. `Worker::spawn` performs the checks again,
-requires the supplied name to be a single path component, and resolves it as
+The private `IntegrityChecker` executes the configured `uv --version`,
+verifies the scripts directory, and recursively indexes Python file stems for
+diagnostics. `WorkerBuilder::spawn` performs the checks again, requires the
+supplied name to be a single path component, and resolves it as
 `<scripts-directory>/<name>.py`.
+
+### Socket directory and identities
+
+Each Manager creates its own socket directory, `runpy-<random>`, with mode
+`0700` in the platform temporary directory or in `socket_parent`. The name is
+unpredictable and created atomically; Runpy then verifies that the directory
+is owned by the current user and private, and rejects a path that is not
+UTF-8 or would make socket paths exceed the Unix limit (about 100 bytes).
+`Manager::socket_dir()` returns it, and dropping the Manager removes it after
+its workers stop. Runpy never adopts or deletes a directory it did not create.
+
+A worker ID is the script name plus a 128-bit random suffix, so it is unique
+across Managers and restarts. Its socket file has a short, independent random
+name, so long script names cannot exceed the socket path limit. Runpy never
+unlinks an existing path: if a socket name is taken it picks another, up to
+eight attempts. Registering an ID that is already in use fails and stops only
+the new process.
+
+These measures keep other users and other Managers away from a worker's
+socket. They are not a sandbox: worker scripts and other processes of the same
+user are trusted.
 
 ### ControlPlane, Mailer, and Watchdog
 
@@ -110,6 +131,7 @@ the runtime checks later. The Watchdog monitor starts during `build`.
 
 | Setter | Default | Meaning |
 | --- | --- | --- |
+| `socket_parent` | temp dir | Where the private `runpy-*` socket directory is created. |
 | `uv_path` | `uv` | Executable that launches workers. |
 | `max_frame_bytes` | 8 MiB | Maximum JSON body per frame, both directions. |
 | `frame_timeout` | 30 s | Time to finish a frame after its first byte. |
@@ -137,7 +159,7 @@ Manager's stdin, which is otherwise the null device.
 
 `WorkerBuilder::spawn` revalidates `uv` and the scripts directory,
 canonicalizes runtime paths, verifies the root-level script file, creates a
-unique identity and socket under `/tmp/runpy`, and starts:
+unique identity and socket in the Manager's socket directory, and starts:
 
 ```text
 uv run --no-project [--locked] --script <script.py> <socket-path> <worker-id> [--key=value ...]
@@ -287,8 +309,8 @@ The JSON value must contain exactly two fields, both objects:
 {
   "meta": {
     "x_op": "execute",
-    "x_wid": "my_worker_25092026-1200_A1b2",
-    "x_spath": "/tmp/runpy/rp_my_worker_25092026-1200_A1b2.sock",
+    "x_wid": "my_worker-3f2a9c1e0d7b4e6a8c5f1b2d3e4a5b6c",
+    "x_spath": "/tmp/runpy-Xk3p9Q/w8f3c2a1b0e9d7c6a.sock",
     "correlation_id": 42
   },
   "data": {

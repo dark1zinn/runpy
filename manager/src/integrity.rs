@@ -31,20 +31,13 @@ impl IntegrityChecker {
         }
     }
 
-    /// Validate that uv executes successfully, ensure `/tmp/runpy` exists,
-    /// verify the scripts directory, and refresh the diagnostic script index.
+    /// Validate that uv executes successfully, verify the scripts directory,
+    /// and refresh the diagnostic script index.
     ///
     /// The uv check requires only a successful `--version` exit; it does not
     /// parse or enforce a semantic version.
     pub fn perform_check(&self) -> Result<(), RunpyError> {
         self.validate_uv()?;
-
-        // Socket creation is centralized under a stable Manager-owned
-        // directory; individual Worker spawns own their socket file cleanup.
-        let sock_dir = PathBuf::from("/tmp/runpy");
-        if !sock_dir.exists() {
-            std::fs::create_dir_all(&sock_dir).map_err(RunpyError::Io)?;
-        }
 
         match std::fs::metadata(&self.scripts_dir) {
             Ok(metadata) if metadata.is_dir() => {}

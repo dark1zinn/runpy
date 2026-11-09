@@ -1,5 +1,4 @@
-use chrono::Local;
-use rand::{Rng, distributions::Alphanumeric};
+use rand::random;
 use std::collections::HashMap;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
@@ -16,9 +15,10 @@ use crate::protocol::{ControlPlane, Envelope, InboundEnvelope, MessageHandler, S
 
 /// Unique identity assigned to one spawned worker process.
 ///
-/// Names contain the script stem, a minute-resolution timestamp, and a
-/// four-character random suffix. Socket filenames prefix that name with
-/// `rp_` and append `.sock`.
+/// The name is the script stem followed by a 128-bit random suffix, so it is
+/// unique across Managers and restarts. The socket filename is a short,
+/// independent random name, so long script names cannot push the socket
+/// path past the operating system's limit.
 #[derive(Debug, Clone)]
 pub struct WorkerIdentity {
     /// Trusted identifier stamped into protocol messages and output records.
@@ -34,23 +34,41 @@ impl WorkerIdentity {
     /// use runpy::WorkerIdentity;
     ///
     /// let identity = WorkerIdentity::new("scraper");
-    /// assert!(identity.name.starts_with("scraper_"));
-    /// assert_eq!(identity.sock_file, format!("rp_{}.sock", identity.name));
+    /// assert!(identity.name.starts_with("scraper-"));
+    /// assert!(identity.sock_file.ends_with(".sock"));
     /// ```
     pub fn new(script: &str) -> Self {
-        let ts = Local::now().format("%d%m%Y-%H%M").to_string();
-        let rnd: String = rand::thread_rng()
-            .sample_iter(&Alphanumeric)
-            .take(4)
-            .map(char::from)
-            .collect();
-        let name = format!("{}_{}_{}", script, ts, rnd);
-
         Self {
-            sock_file: format!("rp_{}.sock", name),
-            name,
+            name: format!("{script}-{:032x}", random::<u128>()),
+            sock_file: format!("w{:016x}.sock", random::<u64>()),
         }
     }
+}
+
+/// Attempts to find an unused socket name before giving up.
+const SOCKET_BIND_ATTEMPTS: usize = 8;
+
+/// Bind a listener at a fresh path in `dir`, never removing an existing file.
+///
+/// A path that already exists is someone else's: Runpy regenerates the
+/// identity instead of unlinking it, up to [`SOCKET_BIND_ATTEMPTS`] times.
+pub(crate) fn bind_unique(
+    dir: &Path,
+    mut identity: impl FnMut() -> WorkerIdentity,
+) -> Result<(WorkerIdentity, PathBuf, UnixListener), RunpyError> {
+    for _ in 0..SOCKET_BIND_ATTEMPTS {
+        let candidate = identity();
+        let path = dir.join(&candidate.sock_file);
+        match UnixListener::bind(&path) {
+            Ok(listener) => return Ok((candidate, path, listener)),
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => continue,
+            Err(error) => return Err(RunpyError::Io(error)),
+        }
+    }
+    Err(RunpyError::Io(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!("no unused socket name after {SOCKET_BIND_ATTEMPTS} attempts"),
+    )))
 }
 
 // ── Worker configuration ───────────────────────────────────────────────
@@ -235,18 +253,11 @@ impl WorkerBuilder {
             };
         let lock_file = script_file.with_extension("py.lock");
 
-        let identity = WorkerIdentity::new(&self.script);
+        let (identity, sock_path, listener) =
+            bind_unique(&self.socket_dir, || WorkerIdentity::new(&self.script))?;
         let worker_id = identity.name.clone();
-        let sock_path = self.socket_dir.join(&identity.sock_file);
-        let _ = std::fs::remove_file(&sock_path);
-        let listener = UnixListener::bind(&sock_path).map_err(RunpyError::Io)?;
-        let Some(socket_path) = sock_path.to_str().map(str::to_owned) else {
-            let _ = std::fs::remove_file(&sock_path);
-            return Err(RunpyError::InvalidConfig(format!(
-                "socket path is not valid UTF-8: {}",
-                sock_path.display()
-            )));
-        };
+        // The Manager verified at build that its socket directory is UTF-8.
+        let socket_path = sock_path.to_string_lossy().into_owned();
 
         control_plane.logger().debug_with(
             "Worker",
@@ -396,5 +407,63 @@ impl Worker {
         self.control_plane
             .upgrade()
             .ok_or(RunpyError::ManagerClosed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn identity(sock_file: &str) -> WorkerIdentity {
+        WorkerIdentity {
+            name: format!("worker-{sock_file}"),
+            sock_file: sock_file.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn existing_paths_are_skipped_not_unlinked() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let taken = dir.path().join("taken.sock");
+        std::fs::write(&taken, "someone else's file").unwrap();
+
+        let mut names = ["taken.sock", "fresh.sock"].into_iter();
+        let (bound, path, _listener) =
+            bind_unique(dir.path(), || identity(names.next().unwrap())).unwrap();
+
+        assert_eq!(bound.sock_file, "fresh.sock");
+        assert_eq!(path, dir.path().join("fresh.sock"));
+        assert_eq!(
+            std::fs::read_to_string(&taken).unwrap(),
+            "someone else's file"
+        );
+    }
+
+    #[tokio::test]
+    async fn binding_gives_up_after_bounded_attempts() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("taken.sock"), "").unwrap();
+        let mut attempts = 0;
+        let result = bind_unique(dir.path(), || {
+            attempts += 1;
+            identity("taken.sock")
+        });
+
+        assert!(matches!(
+            result,
+            Err(RunpyError::Io(ref error)) if error.kind() == std::io::ErrorKind::AlreadyExists
+        ));
+        assert_eq!(attempts, SOCKET_BIND_ATTEMPTS);
+    }
+
+    #[test]
+    fn identities_are_random_and_socket_names_are_short() {
+        let long_script = "s".repeat(200);
+        let first = WorkerIdentity::new(&long_script);
+        let second = WorkerIdentity::new(&long_script);
+        assert_ne!(first.name, second.name);
+        assert_ne!(first.sock_file, second.sock_file);
+        assert!(first.name.starts_with(&format!("{long_script}-")));
+        assert_eq!(first.sock_file.len(), "w0123456789abcdef.sock".len());
     }
 }

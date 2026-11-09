@@ -108,7 +108,7 @@ Every message is exactly two objects:
 {
   "meta": {
     "x_wid": "manager-generated-worker-id",
-    "x_spath": "/tmp/runpy/rp_worker.sock",
+    "x_spath": "/tmp/runpy-Xk3p9Q/w8f3c2a1b0e9d7c6a.sock",
     "correlation_id": 42
   },
   "data": {

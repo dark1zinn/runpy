@@ -1067,6 +1067,17 @@ impl ControlPlane {
             cleanup_unregistered_worker(&mut child, process_group_id, &sock_path);
             return Err(RunpyError::ManagerClosed);
         }
+        // An identity already in use belongs to a live worker; never replace
+        // it. Only the new, unregistered child is stopped.
+        if workers.contains_key(&worker_id) || sessions.contains_key(&worker_id) {
+            drop(workers);
+            drop(sessions);
+            cleanup_unregistered_worker(&mut child, process_group_id, &sock_path);
+            return Err(RunpyError::Io(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("worker identity '{worker_id}' is already registered"),
+            )));
+        }
 
         let output_sender = {
             let mut dispatcher = self.output_dispatcher.lock();
@@ -2347,6 +2358,52 @@ mod tests {
             assert!(control_plane.monitor.lock().is_some());
             control_plane.shutdown_now();
         });
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn colliding_identity_is_rejected_without_touching_the_live_worker() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let control_plane = test_control_plane(ProtocolLimits::default());
+        let mut live = register_worker(&control_plane, directory.path(), "worker", None).await;
+        let live_pid = control_plane.workers.read()["worker"].child.id();
+
+        let sock_path = directory.path().join("other.sock");
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        let mut command = Command::new("sleep");
+        command
+            .arg("300")
+            .process_group(0)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let child = command.spawn().unwrap();
+        let new_pid = child.id();
+        let error = control_plane
+            .register_worker(
+                child,
+                WorkerIdentity {
+                    name: "worker".to_string(),
+                    sock_file: "other.sock".to_string(),
+                },
+                sock_path.clone(),
+                sock_path.to_string_lossy().into_owned(),
+                listener,
+                None,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, RunpyError::Io(ref io) if io.kind() == std::io::ErrorKind::AlreadyExists)
+        );
+        assert!(
+            !process_alive(new_pid),
+            "the unregistered child must be stopped"
+        );
+        assert!(!sock_path.exists());
+        assert!(process_alive(live_pid), "the live worker must be untouched");
+        control_plane.send("worker", numbered(1)).await.unwrap();
+        assert_eq!(read_envelope(&mut live).await.data()["sequence"], 1);
+        control_plane.shutdown_now();
     }
 
     #[tokio::test]

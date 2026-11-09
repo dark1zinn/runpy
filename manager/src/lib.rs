@@ -31,7 +31,7 @@
 //! {
 //!   "meta": {
 //!     "x_wid": "worker-id",
-//!     "x_spath": "/tmp/runpy/rp_worker.sock",
+//!     "x_spath": "/tmp/runpy-Xk3p9Q/w8f3c2a1b0e9d7c6a.sock",
 //!     "correlation_id": 42
 //!   },
 //!   "data": { "task": "process" }
@@ -109,7 +109,8 @@ mod scribbler;
 mod watchdog;
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -158,6 +159,7 @@ pub use watchdog::{ProcessState, WatchdogService as Watchdog, WorkerReport};
 pub struct ManagerBuilder {
     scripts: PathBuf,
     uv_path: PathBuf,
+    socket_parent: Option<PathBuf>,
     max_frame_bytes: usize,
     frame_timeout: Duration,
     queue: QueueLimits,
@@ -170,6 +172,18 @@ impl ManagerBuilder {
     /// a single component such as `uv` is resolved by the operating system.
     pub fn uv_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.uv_path = path.into();
+        self
+    }
+
+    /// Directory in which the Manager creates its private socket directory;
+    /// defaults to the platform temporary directory.
+    ///
+    /// Runpy always creates a fresh `runpy-*` child with mode `0700` and
+    /// removes it when the Manager drops; it never adopts or deletes the
+    /// given directory itself. Keep the path short: Unix socket paths are
+    /// limited to about 100 bytes.
+    pub fn socket_parent(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.socket_parent = Some(dir.into());
         self
     }
 
@@ -244,15 +258,17 @@ impl ManagerBuilder {
         Ok(limits)
     }
 
-    /// Validate the configuration, check `uv` and the scripts directory, and
-    /// start the Manager's services.
+    /// Validate the configuration, check `uv` and the scripts directory,
+    /// create the private socket directory, and start the Manager's services.
     ///
     /// # Errors
     ///
-    /// [`RunpyError::InvalidConfig`] for an invalid value or when called
-    /// outside a Tokio runtime, [`RunpyError::UvUnavailable`] when `uv`
-    /// cannot run, and [`RunpyError::ScriptsDirectory`] when the scripts
-    /// directory is missing or not a directory.
+    /// [`RunpyError::InvalidConfig`] for an invalid value, when called outside
+    /// a Tokio runtime, or when the socket directory would be unsafe, non-UTF-8,
+    /// or too long; [`RunpyError::UvUnavailable`] when `uv` cannot run;
+    /// [`RunpyError::ScriptsDirectory`] when the scripts directory is missing
+    /// or not a directory; [`RunpyError::Io`] when the socket directory
+    /// cannot be created.
     pub async fn build(self) -> Result<Manager, RunpyError> {
         let limits = self.validate()?;
         if tokio::runtime::Handle::try_current().is_err() {
@@ -268,6 +284,7 @@ impl ManagerBuilder {
             logger.clone(),
         ));
         integrity.perform_check()?;
+        let socket_dir = create_socket_dir(self.socket_parent.as_deref())?;
 
         let control_plane = ControlPlane::new(logger.clone(), limits, self.queue);
         control_plane.start_monitoring(5);
@@ -276,9 +293,59 @@ impl ManagerBuilder {
             integrity,
             logger,
             control_plane,
-            socket_dir: PathBuf::from("/tmp/runpy"),
+            socket_dir,
         })
     }
+}
+
+/// Longest socket path, excluding the terminating NUL, every supported
+/// platform accepts (`sun_path` is 104 bytes on macOS, 108 on Linux).
+const MAX_SOCKET_PATH: usize = 103;
+
+/// Create the Manager-owned socket directory and verify it is private.
+///
+/// The directory is created atomically with an unpredictable name and mode
+/// `0700` (the umask can only remove bits). The check afterwards guards
+/// against an unexpected filesystem and rejects a directory not owned by this
+/// process's effective user.
+fn create_socket_dir(parent: Option<&Path>) -> Result<tempfile::TempDir, RunpyError> {
+    let mut builder = tempfile::Builder::new();
+    builder
+        .prefix("runpy-")
+        .permissions(std::fs::Permissions::from_mode(0o700));
+    let dir = match parent {
+        Some(parent) => builder.tempdir_in(parent),
+        None => builder.tempdir(),
+    }
+    .map_err(RunpyError::Io)?;
+
+    let metadata = std::fs::symlink_metadata(dir.path()).map_err(RunpyError::Io)?;
+    let effective_uid = unsafe { libc::geteuid() };
+    if !metadata.is_dir()
+        || metadata.uid() != effective_uid
+        || metadata.permissions().mode() & 0o077 != 0
+    {
+        return Err(RunpyError::InvalidConfig(format!(
+            "socket directory '{}' is not a private directory owned by this user",
+            dir.path().display()
+        )));
+    }
+
+    let Some(path) = dir.path().to_str() else {
+        return Err(RunpyError::InvalidConfig(format!(
+            "socket directory '{}' is not valid UTF-8",
+            dir.path().display()
+        )));
+    };
+    // `/` plus a socket name such as `w0123456789abcdef.sock`.
+    let longest = path.len() + 1 + "w0123456789abcdef.sock".len();
+    if longest > MAX_SOCKET_PATH {
+        return Err(RunpyError::InvalidConfig(format!(
+            "socket directory '{path}' is too long: socket paths would reach {longest} \
+             bytes, above the {MAX_SOCKET_PATH}-byte limit; choose a shorter socket_parent"
+        )));
+    }
+    Ok(dir)
 }
 
 // ── Manager ────────────────────────────────────────────────────────────
@@ -303,7 +370,8 @@ pub struct Manager {
     integrity: Arc<IntegrityChecker>,
     logger: Arc<Scribbler>,
     control_plane: Arc<ControlPlane>,
-    socket_dir: PathBuf,
+    /// Removed when the Manager drops, after every worker has been stopped.
+    socket_dir: tempfile::TempDir,
 }
 
 impl Manager {
@@ -313,10 +381,16 @@ impl Manager {
         ManagerBuilder {
             scripts: scripts.into(),
             uv_path: PathBuf::from("uv"),
+            socket_parent: None,
             max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
             frame_timeout: DEFAULT_FRAME_TIMEOUT,
             queue: QueueLimits::default(),
         }
+    }
+
+    /// Private directory holding this Manager's worker sockets.
+    pub fn socket_dir(&self) -> &Path {
+        self.socket_dir.path()
     }
 
     /// Start configuring a worker for a root-level script name without `.py`.
@@ -328,7 +402,7 @@ impl Manager {
             script,
             Arc::downgrade(&self.integrity),
             Arc::downgrade(&self.control_plane),
-            &self.socket_dir,
+            self.socket_dir.path(),
         )
     }
 
