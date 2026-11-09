@@ -73,54 +73,24 @@ if __name__ == "__main__":
 Start it from Rust:
 
 ```rust
-use runpy::{Data, Envelope, Manager};
-use serde_json::{json, Value};
+use runpy::{Data, Manager};
+use serde_json::json;
 use std::time::Duration;
-
-fn object(value: Value) -> Data {
-    value.as_object().cloned().expect("JSON object")
-}
 
 #[tokio::main]
 async fn main() -> Result<(), runpy::RunpyError> {
     let manager = Manager::builder("worker").build().await?;
-    let (finished_tx, mut finished_rx) = tokio::sync::mpsc::unbounded_channel();
-    manager.on_message(move |inbound| {
-        let operation = inbound
-            .envelope
-            .meta()
-            .get("x_op")
-            .and_then(Value::as_str);
-
-        match operation {
-            Some("done") => {
-                println!(
-                    "result: {}",
-                    Value::Object(inbound.envelope.data().clone())
-                );
-                let _ = finished_tx.send(());
-            }
-            Some("error") => {
-                eprintln!(
-                    "worker error: {}",
-                    Value::Object(inbound.envelope.data().clone())
-                );
-                let _ = finished_tx.send(());
-            }
-            _ => {}
-        }
-    });
 
     // `spawn` returns once the worker reported `ready`.
     let worker = manager.worker("my_worker").spawn().await?;
     println!("spawned {}", worker.id());
-    worker
-        .send_message(Envelope::execute(object(json!({"task": "example"}))))
-        .await?;
-    tokio::time::timeout(Duration::from_secs(30), finished_rx.recv())
-        .await
-        .expect("worker response timed out")
-        .expect("worker response channel closed");
+
+    let input = Data::from_iter([("task".into(), json!("example"))]);
+    match worker.execute(input, Duration::from_secs(30)).await {
+        Ok(output) => println!("result: {output:?}"),
+        Err(error) => eprintln!("request failed: {error}"),
+    }
+
     let exit = worker.terminate().await?;
     println!("worker stopped: {:?}", exit.reason);
     Ok(())
@@ -133,10 +103,11 @@ Runpy starts:
 uv run --no-project [--locked] --script <worker.py> <socket-path> <worker-id>
 ```
 
-The worker sends a versioned `ready`, `spawn` returns, Rust sends `execute`,
-and the Python return value arrives as `done`. Runpy owns trusted worker/socket
-metadata and cleans up the process group and socket when the worker terminates
-or the Manager drops.
+The worker sends a versioned `ready` and `spawn` returns. `execute` sends a
+request with its own ID; the worker runs one request at a time, and the Python
+return value comes back as that request's result. Runpy owns trusted
+worker/socket metadata and cleans up the process group and socket when the
+worker terminates or the Manager drops.
 
 ## Observe worker output
 

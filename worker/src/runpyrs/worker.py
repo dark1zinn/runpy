@@ -23,11 +23,11 @@ from .utils import (
 )
 
 
-_RUNPY_OPERATIONS = frozenset(
-    {"ready", "execute", "retry", "terminate", "done", "error", "log"}
-)
-_MANAGER_OPERATIONS = frozenset({"execute", "retry", "terminate"})
-_RESERVED_KEYS = frozenset({"x_wid", "x_spath", "x_op"})
+_RUNPY_OPERATIONS = frozenset({"ready", "execute", "terminate", "done", "error", "log"})
+_MANAGER_OPERATIONS = frozenset({"execute", "terminate"})
+_RESERVED_KEYS = frozenset({"x_wid", "x_spath", "x_op", "x_req"})
+#: Capabilities this SDK advertises in ``ready``.
+_CAPABILITIES = ("requests",)
 
 
 class Worker:
@@ -86,7 +86,6 @@ class Worker:
         self._limits = FrameLimits.from_env()
         self.__ok = False
         self.__send_lock = threading.Lock()
-        self.__exec_payload: Optional[Data] = None
         self.__sock_path = sock
         self.name = name
         self.extra: Dict[str, str] = extra or {}
@@ -231,7 +230,7 @@ class Worker:
         """
 
     def execute(self, data: ExecutePayload) -> ExecuteResult:
-        """Process one ``execute`` or ``retry`` payload.
+        """Process one ``execute`` request payload.
 
         Override this hook and return a dictionary for ``done.data`` or
         ``None`` for an empty result. Exceptions and non-dictionary results are
@@ -263,8 +262,9 @@ class Worker:
     def _validate_inbound(value: object) -> Envelope:
         """Validate the exact envelope shape and Manager operation boundary.
 
-        Custom envelopes omit ``x_op``. Only ``execute``, ``retry``, and
-        ``terminate`` are valid internal operations from Manager to worker.
+        Custom envelopes omit ``x_op``. Only ``execute`` (which must carry a
+        ``x_req`` request ID) and ``terminate`` are valid internal operations
+        from Manager to worker.
         """
         if not isinstance(value, dict) or set(value) != {"meta", "data"}:
             raise ValueError("Envelope must contain exactly 'meta' and 'data'")
@@ -290,51 +290,55 @@ class Worker:
                 raise ValueError(
                     f"Runpy operation '{operation}' is invalid for manager-to-worker envelopes"
                 )
+            if operation == "execute" and not meta.get("x_req"):
+                raise ValueError("execute must carry a 'x_req' request ID")
+        if "x_req" in meta and operation != "execute":
+            raise ValueError("Only execute envelopes may carry 'x_req'")
 
         return {"meta": dict(meta), "data": dict(data)}
 
-    def _send_error(self, kind: str, message: str) -> None:
-        """Send a structured ``error`` envelope with ``kind`` and ``message``."""
-        self._send_operation("error", {"kind": kind, "message": message})
+    def _send_result(self, operation: str, data: Data, request_id: str) -> None:
+        """Send ``done`` or ``error`` correlated with ``request_id``."""
+        envelope = create_envelope(data)
+        envelope["meta"]["x_op"] = operation
+        envelope["meta"]["x_req"] = request_id
+        self._send_envelope(envelope)
 
-    def _send_exception(self, error: BaseException) -> None:
-        """Report an application exception without losing its type.
-
-        An exception with an empty message reports its type name as message.
-        """
+    @staticmethod
+    def _error_data(error: BaseException) -> Data:
+        """Structured error body; an empty message reports the type name."""
         kind = type(error).__name__
-        self._send_error(kind, str(error) or kind)
+        return {"kind": kind, "message": str(error) or kind}
 
-    def _complete_execution(self, *, retry: bool = False) -> None:
-        """Run the current execute payload and emit ``done`` or ``error``.
+    def _complete_execution(self, request_id: str, payload: Data) -> None:
+        """Run one request and reply with ``done`` or ``error`` for it.
 
-        Retry reuses the last payload. A retry before execute, an exception,
-        an invalid result type, and a result that cannot be encoded produce
-        structured ``error`` envelopes. ``SystemExit``, ``KeyboardInterrupt``,
-        and other non-``Exception`` signals are not converted; they propagate
-        and end the worker. A socket failure while sending propagates too.
+        An exception, an invalid result type, and a result that cannot be
+        encoded produce structured ``error`` envelopes carrying the same
+        request ID. ``SystemExit``, ``KeyboardInterrupt``, and other
+        non-``Exception`` signals are not converted; they propagate and end
+        the worker. A socket failure while sending propagates too.
         """
-        if self.__exec_payload is None:
-            self._send_error(
-                "RuntimeError", "Retry requested before an execute operation"
-            )
-            return
-
         try:
-            result = self.execute(self.__exec_payload)
+            result = self.execute(payload)
         except Exception as error:
-            self._send_exception(error)
+            self._send_result("error", self._error_data(error), request_id)
             return
         if result is not None and not isinstance(result, dict):
-            self._send_error(
-                "TypeError", "Worker.execute must return a dictionary or None"
+            self._send_result(
+                "error",
+                {
+                    "kind": "TypeError",
+                    "message": "Worker.execute must return a dictionary or None",
+                },
+                request_id,
             )
             return
         try:
-            self._send_operation("done", result or {})
+            self._send_result("done", result or {}, request_id)
         except (TypeError, ValueError) as error:
             # Encoding failed before any byte was written.
-            self._send_exception(error)
+            self._send_result("error", self._error_data(error), request_id)
 
     def _dispatch(self, envelope: Envelope) -> None:
         """Dispatch one validated envelope to lifecycle or developer hooks."""
@@ -344,18 +348,14 @@ class Worker:
             return
 
         if operation == "execute":
-            self.__exec_payload = envelope["data"]
-            self._complete_execution()
-            return
-
-        if operation == "retry":
-            self._complete_execution(retry=True)
+            self._complete_execution(envelope["meta"]["x_req"], envelope["data"])
             return
 
         try:
             self.handle_envelope(envelope)
         except Exception as error:
-            self._send_exception(error)
+            # No request to answer: an unsolicited error without ``x_req``.
+            self._send_operation("error", self._error_data(error))
 
     def run(self) -> None:
         """Announce readiness, then receive and dispatch envelopes until
@@ -378,7 +378,10 @@ class Worker:
         try:
             self._send_operation(
                 "ready",
-                {"protocol_version": PROTOCOL_VERSION, "capabilities": []},
+                {
+                    "protocol_version": PROTOCOL_VERSION,
+                    "capabilities": list(_CAPABILITIES),
+                },
             )
             while self.__ok:
                 try:

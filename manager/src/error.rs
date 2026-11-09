@@ -4,6 +4,7 @@ use std::fmt;
 use std::path::PathBuf;
 
 use crate::protocol::EnvelopeError;
+use crate::request::{RemoteError, RequestId};
 
 /// Why a worker script name was rejected.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -36,6 +37,10 @@ pub enum TimeoutStage {
     /// Delivery is unknown, so the connection is closed instead of risking a
     /// corrupted stream.
     Write,
+    /// A request was sent but no result arrived before its deadline.
+    ///
+    /// It may still be running; the worker stays occupied until it finishes.
+    Response,
 }
 
 impl fmt::Display for TimeoutStage {
@@ -45,6 +50,7 @@ impl fmt::Display for TimeoutStage {
             Self::Admission => "waiting for queue capacity",
             Self::Queued => "waiting in the outbound queue",
             Self::Write => "writing to the socket",
+            Self::Response => "waiting for the worker's result",
         })
     }
 }
@@ -103,6 +109,23 @@ pub enum RunpyError {
     Io(std::io::Error),
     /// An envelope could not be serialized.
     Encode(serde_json::Error),
+    /// The worker does not support the requested feature.
+    Unsupported(String),
+    /// The worker reported an error for a request.
+    Execution {
+        /// The failed request.
+        request_id: RequestId,
+        /// What the worker reported.
+        error: RemoteError,
+    },
+    /// The worker stopped while running a request, so whether it completed
+    /// (and any side effects it had) is unknown. Runpy never replays it.
+    OutcomeUnknown {
+        /// The interrupted request.
+        request_id: RequestId,
+        /// Worker that was running it.
+        worker_id: String,
+    },
 }
 
 impl fmt::Display for RunpyError {
@@ -141,6 +164,18 @@ impl fmt::Display for RunpyError {
             }
             Self::Io(error) => write!(f, "I/O failed: {error}"),
             Self::Encode(error) => write!(f, "envelope could not be encoded: {error}"),
+            Self::Unsupported(what) => write!(f, "unsupported: {what}"),
+            Self::Execution { request_id, error } => {
+                write!(f, "request {request_id} failed: {error}")
+            }
+            Self::OutcomeUnknown {
+                request_id,
+                worker_id,
+            } => write!(
+                f,
+                "worker '{worker_id}' stopped while running request {request_id}; \
+                 its outcome is unknown"
+            ),
         }
     }
 }

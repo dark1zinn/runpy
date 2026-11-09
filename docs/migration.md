@@ -52,8 +52,10 @@ is now the null device by default instead of the Manager's stdin.
   connection removes the worker and stops its process group; reconnecting is
   no longer supported.
 - `spawn` returns only after the worker's versioned `ready`. `ready` is no
-  longer passed to `on_message` handlers: send the first work right after
-  `spawn` returns instead of replying to `ready`.
+  longer passed to `on_message` handlers.
+- `Envelope::execute` and `Envelope::retry` are removed. Run work with
+  `Worker::execute(data, deadline)` or `Worker::submit` and read the
+  correlated result instead of matching `done` in a handler:
 
   ```rust
   // Before
@@ -64,8 +66,10 @@ is now the null device by default instead of the Manager's stdin.
   });
   // After
   let worker = manager.worker("my_worker").spawn().await?;
-  worker.send_message(Envelope::execute(data)).await?;
+  let output = worker.execute(data, Duration::from_secs(30)).await?;
   ```
+- There is no implicit retry: requests are never replayed. Resubmit a new
+  request explicitly after `OutcomeUnknown` when the work is idempotent.
 - `Worker::terminate` returns `Result<WorkerExit, RunpyError>` (whether the
   `terminate` frame was written is no longer reported) and
   `Manager::terminate_all` returns each `WorkerExit`. `Worker::wait` observes
@@ -85,3 +89,6 @@ is now the null device by default instead of the Manager's stdin.
 - `ready` is sent by `Worker.run()` instead of the constructor and carries
   `{"protocol_version": 1, "capabilities": [...]}`. The Rust Manager rejects
   any other version: upgrade `runpy` and `runpyrs` together.
+- `retry` is no longer an operation and `Worker` no longer stores the last
+  payload. `execute` envelopes carry `x_req`, and `done`/`error` echo it.
+  `ready` advertises the `requests` capability.

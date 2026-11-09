@@ -244,15 +244,37 @@ risking a corrupted stream; it never resends a frame.
 
 ### 6. Execute Python business logic
 
-An `execute` envelope stores its `data` and calls `Worker.execute`. A dictionary
-result becomes `done.data`; `None` becomes an empty object. An `Exception`, a
+`Worker::execute(data, deadline)` (or `Worker::submit`, which returns a
+`Request` handle) sends an `execute` envelope carrying a Manager-generated
+request ID in `x_req`. Each worker has a request dispatcher: requests wait in
+order and only one is written to the worker at a time; the next is sent only
+after the active one's `done` or `error` arrives. Different workers run
+requests concurrently. Submitted, unconsumed requests are bounded
+Manager-wide by `max_pending_requests` (64); waiting for that capacity counts
+against the deadline and expires as `Timeout(Admission)`.
+
+The deadline covers the whole request. A request that expires while queued
+fails with `Timeout(Queued)` and is never sent. One that expires while running
+fails with `Timeout(Response)`, but the worker stays occupied until it answers;
+the late result is discarded. Dropping a `Request` does not cancel it either.
+Runpy never retries or replays a request: if the worker exits or the
+connection closes, the running request fails with `OutcomeUnknown` and queued
+ones with `WorkerExited`. Resubmit explicitly when the work is idempotent.
+
+On the Python side, `Worker.execute` receives `data`. A dictionary result
+becomes `done.data`; `None` becomes an empty object. An `Exception`, a
 non-dictionary result, or a result that cannot be encoded becomes an `error`
 envelope whose data is `{"kind": "<exception type>", "message": "<text>"}`;
-an exception with an empty message reports its type name as the message. The
-worker continues its receive loop after sending the error. `SystemExit`,
-`KeyboardInterrupt`, and other non-`Exception` signals are not converted: they
-end the worker. `retry` repeats the most recent execute payload; retry before
-execute returns an error envelope.
+an exception with an empty message reports its type name as the message. Both
+carry the request's `x_req`, and Rust returns the error as
+`RunpyError::Execution`. The worker continues its receive loop after sending
+the error. `SystemExit`, `KeyboardInterrupt`, and other non-`Exception` signals
+are not converted: they end the worker. A `done` or `error` with an unknown or
+missing request ID while a request is active is a protocol violation. An
+`error` without `x_req` (for example from a failing `handle_envelope`) is
+unsolicited: it completes nothing and only reaches handlers. Request results
+also reach handlers after the request completes. Raw `execute` envelopes
+cannot be sent through `send_message` or `reply`.
 
 A message without `x_op` is passed once to `Worker.handle_envelope`. The method
 can reply with `Worker.send` or emit a structured `Worker.log` envelope.
@@ -334,6 +356,7 @@ The JSON value must contain exactly two fields, both objects:
 {
   "meta": {
     "x_op": "execute",
+    "x_req": "17",
     "x_wid": "my_worker-3f2a9c1e0d7b4e6a8c5f1b2d3e4a5b6c",
     "x_spath": "/tmp/runpy-Xk3p9Q/w8f3c2a1b0e9d7c6a.sock",
     "correlation_id": 42
@@ -356,6 +379,7 @@ reject such keys. At each outbound transport edge, Runpy stamps `x_wid` and
 | `x_wid` | Manager-generated identity for the running worker. |
 | `x_spath` | Manager-bound socket path for that worker. |
 | `x_op` | Optional lifecycle operation; absence denotes a custom envelope. |
+| `x_req` | Manager-generated request ID; only on `execute`, `done`, and `error`. |
 
 Reserved fields must be strings. Unknown `x_` fields and unknown operations
 are protocol errors.
@@ -365,8 +389,7 @@ are protocol errors.
 | Operation | Direction | Behavior |
 | --- | --- | --- |
 | `ready` | Python → Rust | First envelope: `protocol_version` and `capabilities`. Consumed by Runpy, not dispatched. |
-| `execute` | Rust → Python | Calls `Worker.execute(data)`. |
-| `retry` | Rust → Python | Repeats the last execute payload. |
+| `execute` | Rust → Python | Calls `Worker.execute(data)` for request `x_req`. |
 | `terminate` | Rust → Python | Stops the Python receive loop and closes its socket. |
 | `done` | Python → Rust | Carries the direct dictionary execution result. |
 | `error` | Python → Rust | Carries `data.kind` (exception type) and `data.message` for an execution or dispatch failure. |

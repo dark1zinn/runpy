@@ -6,7 +6,7 @@ use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::process::{Child, ExitStatus};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Weak};
 use std::thread;
@@ -24,6 +24,9 @@ use crate::lifecycle::{
     parse_ready,
 };
 use crate::manager::WorkerIdentity;
+use crate::request::{
+    ActiveSlot, Completion, PendingRequest, RemoteError, Request, RequestId, run_dispatcher,
+};
 use crate::scribbler::Scribbler;
 use crate::watchdog::WatchdogService;
 
@@ -37,16 +40,9 @@ pub type Data = Map<String, Value>;
 const X_WORKER_ID: &str = "x_wid";
 const X_SOCKET_PATH: &str = "x_spath";
 const X_OPERATION: &str = "x_op";
-const OPERATIONS: &[&str] = &[
-    "ready",
-    "execute",
-    "retry",
-    "terminate",
-    "done",
-    "error",
-    "log",
-];
-const MANAGER_OPERATIONS: &[&str] = &["execute", "retry", "terminate"];
+const X_REQUEST: &str = "x_req";
+const OPERATIONS: &[&str] = &["ready", "execute", "terminate", "done", "error", "log"];
+const MANAGER_OPERATIONS: &[&str] = &["execute", "terminate"];
 const WORKER_OPERATIONS: &[&str] = &["ready", "done", "error", "log"];
 
 const OUTPUT_QUEUE_CAPACITY: usize = 256;
@@ -186,30 +182,15 @@ impl Envelope {
         Ok(Self { meta, data })
     }
 
-    /// Build a Manager-to-worker `execute` request.
-    ///
-    /// ```
-    /// use runpy::{Data, Envelope};
-    /// use serde_json::json;
-    ///
-    /// let envelope = Envelope::execute(Data::from_iter([("task".into(), json!("parse"))]));
-    /// assert_eq!(envelope.meta()["x_op"], "execute");
-    /// ```
-    pub fn execute(data: Data) -> Self {
-        Self::with_operation("execute", data)
-    }
-
-    /// Build a Manager-to-worker `retry` request with empty data.
-    ///
-    /// ```
-    /// use runpy::Envelope;
-    ///
-    /// let envelope = Envelope::retry();
-    /// assert_eq!(envelope.meta()["x_op"], "retry");
-    /// assert!(envelope.data().is_empty());
-    /// ```
-    pub fn retry() -> Self {
-        Self::with_operation("retry", Data::new())
+    /// Internal `execute` carrying a request ID; never built by callers, who
+    /// use [`crate::Worker::submit`] so the one-request-at-a-time invariant
+    /// cannot be bypassed.
+    pub(crate) fn request(id: &RequestId, data: Data) -> Self {
+        let mut envelope = Self::with_operation("execute", data);
+        envelope
+            .meta
+            .insert(X_REQUEST.to_string(), Value::String(id.to_string()));
+        envelope
     }
 
     /// Build a Manager-to-worker graceful `terminate` request.
@@ -247,6 +228,14 @@ impl Envelope {
         self.meta.get(X_OPERATION).and_then(Value::as_str)
     }
 
+    fn request_id(&self) -> Option<&str> {
+        self.meta.get(X_REQUEST).and_then(Value::as_str)
+    }
+
+    pub(crate) fn into_data(self) -> Data {
+        self.data
+    }
+
     fn stamp_trusted(&mut self, worker_id: &str, socket_path: &str) {
         self.meta.insert(
             X_WORKER_ID.to_string(),
@@ -274,7 +263,7 @@ fn validate_wire_meta(meta: &Meta) -> Result<(), EnvelopeError> {
         }
 
         match key.as_str() {
-            X_WORKER_ID | X_SOCKET_PATH => {
+            X_WORKER_ID | X_SOCKET_PATH | X_REQUEST => {
                 if !value.is_string() {
                     return Err(EnvelopeError::InvalidReservedMetadata(key.clone()));
                 }
@@ -289,6 +278,18 @@ fn validate_wire_meta(meta: &Meta) -> Result<(), EnvelopeError> {
             }
             _ => return Err(EnvelopeError::UnknownReservedMetadata(key.clone())),
         }
+    }
+    // Only request-bearing operations may carry a request ID. A worker `error`
+    // may omit it (unsolicited), so presence is not required here.
+    if meta.contains_key(X_REQUEST)
+        && !matches!(
+            meta.get(X_OPERATION).and_then(Value::as_str),
+            Some("execute" | "done" | "error")
+        )
+    {
+        return Err(EnvelopeError::InvalidReservedMetadata(
+            X_REQUEST.to_string(),
+        ));
     }
     Ok(())
 }
@@ -547,9 +548,22 @@ impl MessageSender {
         Ok(receipt)
     }
 
+    /// Reject internal request operations on the application send paths.
+    fn application(envelope: &Envelope) -> Result<(), RunpyError> {
+        if envelope.operation() == Some("execute") {
+            return Err(RunpyError::InvalidConfig(
+                "execute envelopes cannot be sent directly; use Worker::submit or \
+                 Worker::execute"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Admit within the send deadline, waiting for byte budget and a slot.
     async fn admit(&self, envelope: Envelope) -> Result<SendReceipt, RunpyError> {
         self.accepting()?;
+        Self::application(&envelope)?;
         self.admit_until(envelope, Instant::now() + self.send_timeout)
             .await
     }
@@ -557,6 +571,7 @@ impl MessageSender {
     /// Admit immediately or fail with [`RunpyError::QueueFull`].
     pub(crate) fn try_send(&self, envelope: Envelope) -> Result<SendReceipt, RunpyError> {
         self.accepting()?;
+        Self::application(&envelope)?;
         let deadline = Instant::now() + self.send_timeout;
         let (frame, cost) = self.encode(envelope)?;
         let budget =
@@ -579,6 +594,16 @@ impl MessageSender {
     /// Admit and wait until the frame is completely written.
     pub(crate) async fn send(&self, envelope: Envelope) -> Result<(), RunpyError> {
         self.admit(envelope).await?.wait().await
+    }
+
+    /// Write a Runpy-internal envelope (a request) before `deadline`.
+    pub(crate) async fn send_internal(
+        &self,
+        envelope: Envelope,
+        deadline: Instant,
+    ) -> Result<(), RunpyError> {
+        self.accepting()?;
+        self.admit_until(envelope, deadline).await?.wait().await
     }
 
     /// Stop accepting application sends, then try to deliver `terminate`
@@ -605,6 +630,8 @@ pub(crate) struct WorkerHandle {
     pub process_group_id: u32,
     /// Publishes readiness and the retained final exit to worker handles.
     pub lifecycle: LifecycleSender,
+    /// Submission queue of this worker's request dispatcher.
+    pub requests: mpsc::UnboundedSender<PendingRequest>,
 }
 
 /// Process-lifetime tasks removed as one unit during cleanup.
@@ -613,6 +640,9 @@ pub(crate) struct WorkerHandle {
 /// remain singular for the lifetime of the process.
 struct WorkerTasks {
     session: JoinHandle<()>,
+    /// Request dispatcher; aborting it tells every waiter whether its
+    /// request ran.
+    dispatcher: JoinHandle<()>,
     stdout: JoinHandle<()>,
     stderr: JoinHandle<()>,
 }
@@ -704,6 +734,7 @@ struct WorkerSession {
     limits: ProtocolLimits,
     ended: mpsc::UnboundedSender<(String, ExitReason)>,
     lifecycle: LifecycleSender,
+    active_request: ActiveSlot,
 }
 
 /// Kill the complete process group when possible, then reap the stored child.
@@ -890,6 +921,10 @@ pub(crate) struct ControlPlane {
     queue: QueueLimits,
     /// Manager-wide byte budget for admitted, unwritten outbound frames.
     budget: Arc<Semaphore>,
+    /// Manager-wide bound on submitted requests not yet consumed.
+    request_budget: Arc<Semaphore>,
+    /// Next request ID; never wraps.
+    next_request: AtomicU64,
     /// Sessions report their terminal reason here; the monitor removes them.
     ended_tx: mpsc::UnboundedSender<(String, ExitReason)>,
     ended_rx: Mutex<Option<mpsc::UnboundedReceiver<(String, ExitReason)>>>,
@@ -924,6 +959,8 @@ impl ControlPlane {
             limits,
             queue,
             budget: Arc::new(Semaphore::new(queue.queued_bytes)),
+            request_budget: Arc::new(Semaphore::new(queue.max_pending_requests)),
+            next_request: AtomicU64::new(1),
             ended_tx,
             ended_rx: Mutex::new(Some(ended_rx)),
         })
@@ -1086,6 +1123,14 @@ impl ControlPlane {
 
         self.start_monitoring(5);
         let (lifecycle, observer) = lifecycle_channel();
+        let (requests, request_queue) = mpsc::unbounded_channel();
+        let active_request = ActiveSlot::default();
+        let dispatcher = tokio::spawn(run_dispatcher(
+            worker_id.clone(),
+            sender.clone(),
+            request_queue,
+            active_request.clone(),
+        ));
         workers.insert(
             worker_id.clone(),
             WorkerHandle {
@@ -1095,6 +1140,7 @@ impl ControlPlane {
                 sender,
                 process_group_id,
                 lifecycle: lifecycle.clone(),
+                requests,
             },
         );
 
@@ -1110,6 +1156,7 @@ impl ControlPlane {
             limits: self.limits,
             ended: self.ended_tx.clone(),
             lifecycle,
+            active_request,
         }));
         let stdout = tokio::spawn(capture_worker_output(
             stdout,
@@ -1127,11 +1174,65 @@ impl ControlPlane {
             worker_id,
             WorkerTasks {
                 session,
+                dispatcher,
                 stdout,
                 stderr,
             },
         );
         Ok(observer)
+    }
+
+    /// Admit a request for `worker_id`, waiting for a pending slot until the
+    /// end-to-end deadline.
+    pub(crate) async fn submit(
+        &self,
+        worker_id: &str,
+        data: Data,
+        timeout: Duration,
+    ) -> Result<Request, RunpyError> {
+        if timeout.is_zero() {
+            return Err(RunpyError::InvalidConfig(
+                "request timeout must be greater than zero".to_string(),
+            ));
+        }
+        let deadline = Instant::now() + timeout;
+        let queue = {
+            let workers = self.workers.read();
+            let handle = workers
+                .get(worker_id)
+                .ok_or_else(|| RunpyError::WorkerExited {
+                    worker_id: worker_id.to_string(),
+                })?;
+            let supported = matches!(
+                &*handle.lifecycle.borrow(),
+                LifecycleState::Ready { capabilities }
+                    if capabilities.iter().any(|capability| capability == "requests")
+            );
+            if !supported {
+                return Err(RunpyError::Unsupported(format!(
+                    "worker '{worker_id}' did not advertise the `requests` capability"
+                )));
+            }
+            handle.requests.clone()
+        };
+        let permit = timeout_at(deadline, self.request_budget.clone().acquire_owned())
+            .await
+            .map_err(|_| RunpyError::Timeout(TimeoutStage::Admission))?
+            .map_err(|_| RunpyError::ManagerClosed)?;
+        let id = self.next_request_id()?;
+        let (request, pending) = Request::new(id, worker_id.to_string(), data, deadline, permit);
+        queue.send(pending).map_err(|_| RunpyError::WorkerExited {
+            worker_id: worker_id.to_string(),
+        })?;
+        Ok(request)
+    }
+
+    /// Allocate a request ID, failing rather than wrapping when exhausted.
+    fn next_request_id(&self) -> Result<RequestId, RunpyError> {
+        self.next_request
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |id| id.checked_add(1))
+            .map(RequestId::new)
+            .map_err(|_| RunpyError::InvalidConfig("request ID space exhausted".to_string()))
     }
 
     pub(crate) async fn send(&self, worker_id: &str, envelope: Envelope) -> Result<(), RunpyError> {
@@ -1268,6 +1369,7 @@ impl ControlPlane {
         let tasks = self.sessions.lock().remove(worker_id);
         if let Some(tasks) = &tasks {
             tasks.session.abort();
+            tasks.dispatcher.abort();
         }
 
         let handle = self.workers.write().remove(worker_id);
@@ -1333,6 +1435,7 @@ impl ControlPlane {
         }
         for (_, tasks) in sessions.drain() {
             tasks.session.abort();
+            tasks.dispatcher.abort();
             tasks.stdout.abort();
             tasks.stderr.abort();
         }
@@ -1374,6 +1477,7 @@ impl ControlPlane {
             limits,
             ended: _,
             lifecycle,
+            active_request,
         } = session;
         let stream = match listener.accept().await {
             Ok((stream, _)) => stream,
@@ -1460,9 +1564,44 @@ impl ControlPlane {
                         }
                     }
                     envelope.stamp_trusted(&worker_id, &socket_path);
+                    let envelope = Arc::new(envelope);
+
+                    // Request results complete their request before any
+                    // observer runs. An `error` without `x_req` reports a
+                    // custom-handler failure and only reaches observers.
+                    let operation = envelope.operation();
+                    if matches!(operation, Some("done" | "error")) {
+                        match envelope.request_id() {
+                            Some(id) => {
+                                let active = active_request.lock().take();
+                                let Some(active) = active.filter(|active| active.id.as_str() == id)
+                                else {
+                                    logger.error_with(
+                                        "Protocol",
+                                        &format!("{worker_id} answered unknown request '{id}'"),
+                                    );
+                                    return ExitReason::ProtocolViolation;
+                                };
+                                let completion = if operation == Some("done") {
+                                    Completion::Done(envelope.clone())
+                                } else {
+                                    Completion::Failed(RemoteError::from_data(envelope.data()))
+                                };
+                                let _ = active.complete.send(completion);
+                            }
+                            None if operation == Some("done") => {
+                                logger.error_with(
+                                    "Protocol",
+                                    &format!("{worker_id} sent `done` without a request ID"),
+                                );
+                                return ExitReason::ProtocolViolation;
+                            }
+                            None => {}
+                        }
+                    }
 
                     let inbound = InboundEnvelope {
-                        envelope: Arc::new(envelope),
+                        envelope,
                         worker_id: worker_id.clone(),
                         mailer: mailer.clone(),
                     };
@@ -1822,7 +1961,7 @@ mod tests {
     fn ready_envelope(protocol_version: u64) -> Envelope {
         serde_json::from_value(json!({
             "meta": {"x_op": "ready"},
-            "data": {"protocol_version": protocol_version, "capabilities": ["extra"]}
+            "data": {"protocol_version": protocol_version, "capabilities": ["requests", "extra"]}
         }))
         .unwrap()
     }
@@ -2171,7 +2310,7 @@ mod tests {
                 .unwrap();
             let source = inbound.envelope.data()["source"].clone();
             let _ = inbound
-                .reply(Envelope::execute(object(json!({ "source": source }))))
+                .reply(Envelope::new(Meta::new(), object(json!({ "source": source }))).unwrap())
                 .unwrap();
         }));
 
@@ -2295,7 +2434,9 @@ mod tests {
         .unwrap()
         .clone();
         match state {
-            LifecycleState::Ready { capabilities } => assert_eq!(&*capabilities, ["extra"]),
+            LifecycleState::Ready { capabilities } => {
+                assert_eq!(&*capabilities, ["requests", "extra"])
+            }
             other => panic!("unexpected state {other:?}"),
         }
 
@@ -2376,7 +2517,10 @@ mod tests {
         let mut stream =
             register_worker(&control_plane, directory.path(), "worker", Some(handler)).await;
 
-        write_envelope(&mut stream, &Envelope::execute(Data::new())).await;
+        let execute: Envelope =
+            serde_json::from_value(json!({"meta": {"x_op": "execute", "x_req": "1"}, "data": {}}))
+                .unwrap();
+        write_envelope(&mut stream, &execute).await;
         let mut byte = [0_u8; 1];
         let result = timeout(Duration::from_secs(1), stream.read_exact(&mut byte))
             .await
@@ -2724,6 +2868,346 @@ mod tests {
             1
         );
         assert!(control_plane.sessions.lock().is_empty());
+        control_plane.shutdown_now();
+    }
+
+    fn payload(value: u64) -> Data {
+        object(json!({ "value": value }))
+    }
+
+    /// Read the next frame and require it to be an `execute`; return its
+    /// request ID and data.
+    async fn read_request(stream: &mut UnixStream) -> (String, Data) {
+        let envelope = timeout(Duration::from_secs(2), read_envelope(stream))
+            .await
+            .expect("expected an execute frame");
+        assert_eq!(envelope.meta()["x_op"], "execute");
+        let id = envelope.meta()["x_req"].as_str().unwrap().to_string();
+        (id, envelope.data().clone())
+    }
+
+    async fn answer(stream: &mut UnixStream, operation: &str, id: Option<&str>, data: Data) {
+        let mut meta = json!({ "x_op": operation });
+        if let Some(id) = id {
+            meta["x_req"] = json!(id);
+        }
+        let envelope: Envelope =
+            serde_json::from_value(json!({ "meta": meta, "data": data })).unwrap();
+        write_envelope(stream, &envelope).await;
+    }
+
+    /// Assert that no frame arrives within a short window.
+    async fn assert_idle(stream: &mut UnixStream) {
+        use std::os::fd::AsRawFd;
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let mut byte = 0_u8;
+        // A non-consuming, nonblocking peek: anything pending is a frame the
+        // worker should not have received yet.
+        let pending = unsafe {
+            libc::recv(
+                stream.as_raw_fd(),
+                (&mut byte as *mut u8).cast(),
+                1,
+                libc::MSG_PEEK | libc::MSG_DONTWAIT,
+            )
+        };
+        assert_eq!(
+            pending, -1,
+            "the worker received a frame while it should be idle"
+        );
+        // Only "would block" proves an empty socket; any other error would
+        // make this check pass vacuously.
+        let error = std::io::Error::last_os_error().raw_os_error();
+        assert!(
+            error == Some(libc::EAGAIN) || error == Some(libc::EWOULDBLOCK),
+            "idle check failed: {error:?}"
+        );
+    }
+
+    const LONG: Duration = Duration::from_secs(10);
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn requests_run_one_at_a_time_and_return_their_own_results() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let control_plane = test_control_plane(ProtocolLimits::default());
+        let mut stream = register_worker(&control_plane, directory.path(), "worker", None).await;
+
+        let first = control_plane
+            .submit("worker", payload(1), LONG)
+            .await
+            .unwrap();
+        let second = control_plane
+            .submit("worker", payload(2), LONG)
+            .await
+            .unwrap();
+        assert_ne!(first.id(), second.id());
+
+        let (first_id, data) = read_request(&mut stream).await;
+        assert_eq!(first_id, first.id().as_str());
+        assert_eq!(data["value"], 1);
+        assert_idle(&mut stream).await;
+        // Logs between execute and done do not complete anything.
+        answer(&mut stream, "log", None, object(json!({"progress": 50}))).await;
+        answer(&mut stream, "done", Some(&first_id), payload(10)).await;
+
+        let (second_id, data) = read_request(&mut stream).await;
+        assert_eq!(data["value"], 2);
+        answer(
+            &mut stream,
+            "error",
+            Some(&second_id),
+            object(json!({"kind": "ValueError", "message": "bad"})),
+        )
+        .await;
+
+        assert_eq!(first.result().await.unwrap()["value"], 10);
+        match second.result().await {
+            Err(RunpyError::Execution { request_id, error }) => {
+                assert_eq!(request_id.as_str(), second_id);
+                assert_eq!(
+                    error,
+                    crate::request::RemoteError {
+                        kind: "ValueError".to_string(),
+                        message: "bad".to_string(),
+                    }
+                );
+            }
+            other => panic!("unexpected result {other:?}"),
+        }
+        control_plane.shutdown_now();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn queued_request_that_expires_never_runs() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let control_plane = test_control_plane(ProtocolLimits::default());
+        let mut stream = register_worker(&control_plane, directory.path(), "worker", None).await;
+
+        let busy = control_plane
+            .submit("worker", payload(1), LONG)
+            .await
+            .unwrap();
+        let queued = control_plane
+            .submit("worker", payload(2), Duration::from_millis(200))
+            .await
+            .unwrap();
+        let (busy_id, _) = read_request(&mut stream).await;
+
+        assert!(matches!(
+            queued.result().await,
+            Err(RunpyError::Timeout(TimeoutStage::Queued))
+        ));
+        answer(&mut stream, "done", Some(&busy_id), payload(1)).await;
+        busy.result().await.unwrap();
+        assert_idle(&mut stream).await;
+        control_plane.shutdown_now();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn running_request_past_its_deadline_keeps_the_worker_busy() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let control_plane = test_control_plane(ProtocolLimits::default());
+        let mut stream = register_worker(&control_plane, directory.path(), "worker", None).await;
+
+        let slow = control_plane
+            .submit("worker", payload(1), Duration::from_millis(200))
+            .await
+            .unwrap();
+        let (slow_id, _) = read_request(&mut stream).await;
+        assert!(matches!(
+            slow.result().await,
+            Err(RunpyError::Timeout(TimeoutStage::Response))
+        ));
+
+        let next = control_plane
+            .submit("worker", payload(2), LONG)
+            .await
+            .unwrap();
+        assert_idle(&mut stream).await;
+        // The late result frees the worker; it is discarded, not delivered.
+        answer(&mut stream, "done", Some(&slow_id), payload(99)).await;
+        let (next_id, data) = read_request(&mut stream).await;
+        assert_eq!(data["value"], 2);
+        answer(&mut stream, "done", Some(&next_id), payload(2)).await;
+        assert_eq!(next.result().await.unwrap()["value"], 2);
+        control_plane.shutdown_now();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dropped_request_still_runs_and_occupies_the_worker() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let control_plane = test_control_plane(ProtocolLimits::default());
+        let mut stream = register_worker(&control_plane, directory.path(), "worker", None).await;
+
+        drop(
+            control_plane
+                .submit("worker", payload(1), LONG)
+                .await
+                .unwrap(),
+        );
+        let (dropped_id, _) = read_request(&mut stream).await;
+        let next = control_plane
+            .submit("worker", payload(2), LONG)
+            .await
+            .unwrap();
+        assert_idle(&mut stream).await;
+        answer(&mut stream, "done", Some(&dropped_id), payload(1)).await;
+        let (next_id, _) = read_request(&mut stream).await;
+        answer(&mut stream, "done", Some(&next_id), payload(2)).await;
+        next.result().await.unwrap();
+        control_plane.shutdown_now();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unknown_or_missing_request_ids_are_protocol_violations() {
+        for (name, id) in [("wrong", Some("999")), ("missing", None)] {
+            let directory = tempfile::TempDir::new().unwrap();
+            let control_plane = test_control_plane(ProtocolLimits::default());
+            let mut stream = register_worker(&control_plane, directory.path(), name, None).await;
+            let request = control_plane.submit(name, payload(1), LONG).await.unwrap();
+            read_request(&mut stream).await;
+
+            answer(&mut stream, "done", id, payload(1)).await;
+            assert!(
+                matches!(
+                    request.result().await,
+                    Err(RunpyError::OutcomeUnknown { .. })
+                ),
+                "case {name}"
+            );
+            wait_for_removal(&control_plane, name).await;
+            control_plane.shutdown_now();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unsolicited_error_reaches_observers_without_completing_a_request() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let control_plane = test_control_plane(ProtocolLimits::default());
+        let (observed_tx, observed_rx) = std_mpsc::channel();
+        let handler: MessageHandler = Arc::new(move |inbound| {
+            observed_tx
+                .send(Envelope::clone(&inbound.envelope))
+                .unwrap();
+        });
+        let mut stream =
+            register_worker(&control_plane, directory.path(), "worker", Some(handler)).await;
+        let request = control_plane
+            .submit("worker", payload(1), LONG)
+            .await
+            .unwrap();
+        let (id, _) = read_request(&mut stream).await;
+
+        answer(
+            &mut stream,
+            "error",
+            None,
+            object(json!({"kind": "KeyError", "message": "x"})),
+        )
+        .await;
+        let unsolicited = observed_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(unsolicited.meta()["x_op"], "error");
+        assert!(unsolicited.meta().get("x_req").is_none());
+
+        answer(&mut stream, "done", Some(&id), payload(5)).await;
+        assert_eq!(request.result().await.unwrap()["value"], 5);
+        // Request results still reach observers, after completing the request.
+        let done = observed_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(done.meta()["x_req"], id.as_str());
+        control_plane.shutdown_now();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn worker_exit_is_never_replayed_and_reports_what_ran() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let control_plane = test_control_plane(ProtocolLimits::default());
+        let mut stream = register_worker(&control_plane, directory.path(), "worker", None).await;
+        let running = control_plane
+            .submit("worker", payload(1), LONG)
+            .await
+            .unwrap();
+        let queued = control_plane
+            .submit("worker", payload(2), LONG)
+            .await
+            .unwrap();
+        read_request(&mut stream).await;
+
+        drop(stream);
+        assert!(matches!(
+            running.result().await,
+            Err(RunpyError::OutcomeUnknown { .. })
+        ));
+        assert!(matches!(
+            queued.result().await,
+            Err(RunpyError::WorkerExited { .. })
+        ));
+        control_plane.shutdown_now();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pending_requests_are_bounded_manager_wide() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let queue = QueueLimits {
+            max_pending_requests: 1,
+            ..QueueLimits::default()
+        };
+        let control_plane = ControlPlane::new(test_logger(), ProtocolLimits::default(), queue);
+        let _first_stream = register_worker(&control_plane, directory.path(), "first", None).await;
+        let _second_stream =
+            register_worker(&control_plane, directory.path(), "second", None).await;
+
+        let held = control_plane
+            .submit("first", payload(1), LONG)
+            .await
+            .unwrap();
+        assert!(matches!(
+            control_plane
+                .submit("second", payload(2), Duration::from_millis(200))
+                .await,
+            Err(RunpyError::Timeout(TimeoutStage::Admission))
+        ));
+        drop(held);
+        control_plane.shutdown_now();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn request_api_rejects_misuse() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let control_plane = test_control_plane(ProtocolLimits::default());
+        let (mut stream, mut lifecycle) =
+            register_unready(&control_plane, directory.path(), "plain", None).await;
+        let ready: Envelope = serde_json::from_value(json!({
+            "meta": {"x_op": "ready"},
+            "data": {"protocol_version": 1, "capabilities": []}
+        }))
+        .unwrap();
+        write_envelope(&mut stream, &ready).await;
+        lifecycle
+            .wait_for(|state| matches!(state, LifecycleState::Ready { .. }))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            control_plane.submit("plain", payload(1), LONG).await,
+            Err(RunpyError::Unsupported(_))
+        ));
+        let raw: Envelope =
+            serde_json::from_value(json!({"meta": {"x_op": "execute", "x_req": "1"}, "data": {}}))
+                .unwrap();
+        assert!(matches!(
+            control_plane.send("plain", raw).await,
+            Err(RunpyError::InvalidConfig(_))
+        ));
+
+        let _ready = register_worker(&control_plane, directory.path(), "ready", None).await;
+        control_plane
+            .next_request
+            .store(u64::MAX, std::sync::atomic::Ordering::SeqCst);
+        assert!(matches!(
+            control_plane.submit("ready", payload(1), LONG).await,
+            Err(RunpyError::InvalidConfig(message)) if message.contains("exhausted")
+        ));
         control_plane.shutdown_now();
     }
 

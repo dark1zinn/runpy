@@ -1,5 +1,6 @@
 use runpy::{Data, Envelope, Manager, Meta};
 use serde_json::{json, Value};
+use std::time::Duration;
 
 fn object(value: Value) -> Data {
     value
@@ -54,9 +55,9 @@ async fn main() {
                         .unwrap_or("info");
                     worker_logger.info_with(level, &format!("{:?}", inbound.envelope.data()));
                 }
-                Some("done") => {
-                    worker_logger.success(&format!("Done: {:?}", inbound.envelope.data()));
-                }
+                // Request results (`done`, correlated `error`) are returned
+                // by `execute` and logged there, so the observer ignores them.
+                Some("done") => {}
                 Some("error") => {
                     worker_logger.error_with("Worker", &format!("{:?}", inbound.envelope.data()));
                 }
@@ -88,10 +89,13 @@ async fn main() {
     };
 
     // `spawn` returns once the worker reported `ready`, so work can be sent
-    // immediately.
-    let execute = Envelope::execute(object(json!({"name": "RunPy"})));
-    if let Err(error) = worker.send_message(execute).await {
-        logger.error_with("Worker", &format!("execute not sent: {error}"));
+    // immediately. A request is correlated with its own result.
+    match worker
+        .execute(object(json!({"name": "RunPy"})), Duration::from_secs(30))
+        .await
+    {
+        Ok(result) => logger.success(&format!("Result: {result:?}")),
+        Err(error) => logger.error_with("Worker", &format!("execute failed: {error}")),
     }
     let mut meta = Meta::new();
     meta.insert("some_custom_meta".into(), json!(42));

@@ -144,7 +144,7 @@ def test_constructor_does_not_send_and_run_announces_versioned_ready():
                 "x_wid": "worker-123",
                 "x_spath": socket_path,
             },
-            "data": {"protocol_version": 1, "capabilities": []},
+            "data": {"protocol_version": 1, "capabilities": ["requests"]},
         }
         send_envelope(connection, {"meta": {"x_op": "terminate"}, "data": {}})
         thread.join(timeout=1)
@@ -257,6 +257,11 @@ def test_log_serialization_error_does_not_print_fallback(capsys):
         close_worker(resources)
 
 
+def request(request_id: int, data: dict) -> dict:
+    """Build a Manager ``execute`` envelope carrying ``x_req``."""
+    return {"meta": {"x_op": "execute", "x_req": str(request_id)}, "data": data}
+
+
 def test_execute_returns_direct_done_data():
     resources = open_worker()
     try:
@@ -268,6 +273,7 @@ def test_execute_returns_direct_done_data():
             {
                 "meta": {
                     "x_op": "execute",
+                    "x_req": "9",
                     "x_wid": "worker-123",
                     "x_spath": socket_path,
                 },
@@ -276,6 +282,7 @@ def test_execute_returns_direct_done_data():
         )
         done = read_envelope(connection)
         assert done["meta"]["x_op"] == "done"
+        assert done["meta"]["x_req"] == "9"
         assert done["data"] == {"echo": {"value": 9}}
 
         send_envelope(
@@ -322,23 +329,37 @@ def test_custom_inbound_envelope_reaches_developer_hook_once():
         close_worker(resources)
 
 
-def test_retry_before_execute_returns_error():
+def test_retry_is_no_longer_an_operation():
     resources = open_worker()
     try:
         _, _, connection, worker, _, _ = resources
-        thread, _, _ = run_in_thread(worker, connection)
+        thread, errors, _ = run_in_thread(worker, connection)
         send_envelope(connection, {"meta": {"x_op": "retry"}, "data": {}})
-        error = read_envelope(connection)
-        assert error["meta"]["x_op"] == "error"
-        assert error["data"] == {
-            "kind": "RuntimeError",
-            "message": "Retry requested before an execute operation",
-        }
-        send_envelope(
-            connection,
-            {"meta": {"x_op": "terminate"}, "data": {}},
-        )
         thread.join(timeout=1)
+        assert not thread.is_alive()
+        assert len(errors) == 1 and isinstance(errors[0], ValueError)
+        assert connection.recv(1) == b""
+    finally:
+        close_worker(resources)
+
+
+@pytest.mark.parametrize(
+    "meta",
+    [
+        {"x_op": "execute"},
+        {"x_op": "execute", "x_req": 7},
+        {"x_op": "terminate", "x_req": "1"},
+    ],
+)
+def test_request_ids_are_required_exactly_on_execute(meta):
+    resources = open_worker()
+    try:
+        _, _, connection, worker, _, _ = resources
+        thread, errors, _ = run_in_thread(worker, connection)
+        send_envelope(connection, {"meta": meta, "data": {}})
+        thread.join(timeout=1)
+        assert not thread.is_alive()
+        assert len(errors) == 1 and isinstance(errors[0], ValueError)
     finally:
         close_worker(resources)
 
@@ -354,10 +375,11 @@ def test_invalid_execute_result_returns_error():
         thread, _, _ = run_in_thread(worker, connection)
         send_envelope(
             connection,
-            {"meta": {"x_op": "execute"}, "data": {}},
+            request(5, {}),
         )
         error = read_envelope(connection)
         assert error["meta"]["x_op"] == "error"
+        assert error["meta"]["x_req"] == "5"
         assert error["data"] == {
             "kind": "TypeError",
             "message": "Worker.execute must return a dictionary or None",
@@ -535,7 +557,7 @@ def test_idle_connection_has_no_frame_deadline(monkeypatch):
         thread, _, _ = run_in_thread(worker, connection)
         time.sleep(0.3)
         assert thread.is_alive()
-        send_envelope(connection, {"meta": {"x_op": "execute"}, "data": {"n": 1}})
+        send_envelope(connection, request(1, {"n": 1}))
         assert read_envelope(connection)["data"] == {"echo": {"n": 1}}
         send_envelope(connection, {"meta": {"x_op": "terminate"}, "data": {}})
         thread.join(timeout=1)
@@ -651,12 +673,12 @@ def test_non_finite_result_becomes_an_error_and_the_worker_stays_usable():
     try:
         _, _, connection, worker, _, _ = resources
         thread, _, _ = run_in_thread(worker, connection)
-        send_envelope(connection, {"meta": {"x_op": "execute"}, "data": {"bad": True}})
+        send_envelope(connection, request(1, {"bad": True}))
         error = read_envelope(connection)
         assert error["meta"]["x_op"] == "error"
         assert "JSON compliant" in error["data"]["message"]
 
-        send_envelope(connection, {"meta": {"x_op": "execute"}, "data": {}})
+        send_envelope(connection, request(2, {}))
         assert read_envelope(connection)["data"] == {"value": 1.5}
         send_envelope(connection, {"meta": {"x_op": "terminate"}, "data": {}})
         thread.join(timeout=1)
@@ -695,16 +717,12 @@ def test_execution_exceptions_report_type_and_keep_the_worker_alive():
     try:
         _, _, connection, worker, _, _ = resources
         thread, errors, _ = run_in_thread(worker, connection)
-        send_envelope(
-            connection, {"meta": {"x_op": "execute"}, "data": {"fail": "empty"}}
-        )
+        send_envelope(connection, request(1, {"fail": "empty"}))
         assert read_envelope(connection)["data"] == {
             "kind": "RuntimeError",
             "message": "RuntimeError",
         }
-        send_envelope(
-            connection, {"meta": {"x_op": "execute"}, "data": {"fail": "key"}}
-        )
+        send_envelope(connection, request(2, {"fail": "key"}))
         assert read_envelope(connection)["data"] == {
             "kind": "KeyError",
             "message": "'x'",
@@ -715,7 +733,7 @@ def test_execution_exceptions_report_type_and_keep_the_worker_alive():
             "kind": "ConnectionError",
             "message": "application network failure",
         }
-        send_envelope(connection, {"meta": {"x_op": "execute"}, "data": {}})
+        send_envelope(connection, request(3, {}))
         assert read_envelope(connection)["data"] == {"ok": True}
         send_envelope(connection, {"meta": {"x_op": "terminate"}, "data": {}})
         thread.join(timeout=1)
@@ -733,7 +751,7 @@ def test_system_exit_from_execute_is_not_converted():
     try:
         _, _, connection, worker, _, _ = resources
         thread, errors, _ = run_in_thread(worker, connection)
-        send_envelope(connection, {"meta": {"x_op": "execute"}, "data": {}})
+        send_envelope(connection, request(1, {}))
         thread.join(timeout=1)
         assert len(errors) == 1 and isinstance(errors[0], SystemExit)
         assert connection.recv(1) == b"", "no error envelope; connection closed"

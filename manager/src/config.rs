@@ -25,6 +25,8 @@ pub const DEFAULT_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 pub const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 /// Default deadline for starting up, including the `uv --version` check.
 pub const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+/// Default Manager-wide bound on submitted, unconsumed requests.
+pub const DEFAULT_MAX_PENDING_REQUESTS: usize = 64;
 
 /// Bounds on outbound memory and time shared by every worker route.
 #[derive(Clone, Copy, Debug)]
@@ -37,6 +39,8 @@ pub(crate) struct QueueLimits {
     pub send_timeout: Duration,
     /// Deadline from the start of termination until the group is killed.
     pub shutdown_grace: Duration,
+    /// Submitted requests, across all workers, not yet consumed.
+    pub max_pending_requests: usize,
 }
 
 impl Default for QueueLimits {
@@ -46,6 +50,7 @@ impl Default for QueueLimits {
             queued_bytes: DEFAULT_QUEUED_BYTES,
             send_timeout: DEFAULT_SEND_TIMEOUT,
             shutdown_grace: DEFAULT_SHUTDOWN_GRACE,
+            max_pending_requests: DEFAULT_MAX_PENDING_REQUESTS,
         }
     }
 }

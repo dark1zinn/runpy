@@ -57,37 +57,23 @@
 //! ## Complete lifecycle
 //!
 //! ```no_run
-//! use runpy::{Data, Envelope, Manager};
-//! use serde_json::{json, Value};
+//! use runpy::{Data, Manager};
+//! use serde_json::json;
 //! use std::time::Duration;
-//!
-//! fn object(value: Value) -> Data {
-//!     value.as_object().cloned().expect("JSON object")
-//! }
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), runpy::RunpyError> {
 //!     let manager = Manager::builder("worker").build().await?;
-//!     let (finished_tx, mut finished_rx) = tokio::sync::mpsc::unbounded_channel();
-//!     manager.on_message(move |inbound| {
-//!         if let Some("done" | "error") =
-//!             inbound.envelope.meta().get("x_op").and_then(Value::as_str)
-//!         {
-//!             println!("{:?}", inbound.envelope.data());
-//!             let _ = finished_tx.send(());
-//!         }
-//!     });
 //!
 //!     // `spawn` returns once the worker reported `ready`.
 //!     let worker = manager.worker("my_worker").spawn().await?;
 //!     println!("spawned {}", worker.id());
-//!     worker
-//!         .send_message(Envelope::execute(object(json!({"task": "process"}))))
-//!         .await?;
-//!     tokio::time::timeout(Duration::from_secs(30), finished_rx.recv())
-//!         .await
-//!         .expect("worker response timed out")
-//!         .expect("worker response channel closed");
+//!
+//!     // Each request is correlated with its own result.
+//!     let input = Data::from_iter([("task".into(), json!("process"))]);
+//!     let output = worker.execute(input, Duration::from_secs(30)).await?;
+//!     println!("{output:?}");
+//!
 //!     let exit = worker.terminate().await?;
 //!     println!("stopped: {:?}", exit.reason);
 //!     Ok(())
@@ -103,6 +89,7 @@ mod integrity;
 mod lifecycle;
 mod manager;
 mod protocol;
+mod request;
 mod scribbler;
 mod watchdog;
 
@@ -118,8 +105,9 @@ use crate::protocol::ControlPlane;
 
 // ── Public re-exports ──────────────────────────────────────────────────
 pub use config::{
-    DEFAULT_FRAME_TIMEOUT, DEFAULT_MAX_FRAME_BYTES, DEFAULT_OUTBOUND_CAPACITY,
-    DEFAULT_QUEUED_BYTES, DEFAULT_SEND_TIMEOUT, DEFAULT_SHUTDOWN_GRACE, DEFAULT_STARTUP_TIMEOUT,
+    DEFAULT_FRAME_TIMEOUT, DEFAULT_MAX_FRAME_BYTES, DEFAULT_MAX_PENDING_REQUESTS,
+    DEFAULT_OUTBOUND_CAPACITY, DEFAULT_QUEUED_BYTES, DEFAULT_SEND_TIMEOUT, DEFAULT_SHUTDOWN_GRACE,
+    DEFAULT_STARTUP_TIMEOUT,
 };
 pub use error::{InvalidScriptReason, RunpyError, TimeoutStage};
 pub use lifecycle::{ExitReason, WorkerExit};
@@ -128,6 +116,7 @@ pub use protocol::{
     Data, Envelope, EnvelopeError, InboundEnvelope, MessageHandler, Meta, SendReceipt,
     WorkerOutput, WorkerOutputHandler, WorkerOutputStream,
 };
+pub use request::{RemoteError, Request, RequestId};
 pub use scribbler::{LogLevel, Scribbler};
 pub use watchdog::{ProcessState, WatchdogService as Watchdog, WorkerReport};
 
@@ -237,13 +226,21 @@ impl ManagerBuilder {
         self
     }
 
+    /// Manager-wide bound on submitted requests whose result has not been
+    /// consumed or dropped; default [`DEFAULT_MAX_PENDING_REQUESTS`] (64).
+    /// Submissions beyond it wait, within their deadline, for a slot.
+    pub fn max_pending_requests(mut self, requests: usize) -> Self {
+        self.queue.max_pending_requests = requests;
+        self
+    }
+
     fn validate(&self) -> Result<ProtocolLimits, RunpyError> {
         let limits = ProtocolLimits::new(self.max_frame_bytes, self.frame_timeout)
             .map_err(RunpyError::InvalidConfig)?;
         let queue = &self.queue;
-        if queue.outbound_capacity == 0 {
+        if queue.outbound_capacity == 0 || queue.max_pending_requests == 0 {
             return Err(RunpyError::InvalidConfig(
-                "outbound_capacity must be greater than zero".to_string(),
+                "outbound_capacity and max_pending_requests must be greater than zero".to_string(),
             ));
         }
         if queue.queued_bytes < limits.max_frame_bytes() + 8 {

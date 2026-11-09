@@ -28,8 +28,9 @@ fn fake_uv(tmp: &TempDir) -> PathBuf {
 }
 
 /// Minimal stand-in for a Python SDK worker: connects to the socket Runpy
-/// passes after `--script <file>`, announces `ready`, and runs until it
-/// receives `terminate` or the connection closes.
+/// passes after `--script <file>`, announces `ready` with the `requests`
+/// capability, echoes each `execute` payload back as `done`, and runs until
+/// it receives `terminate` or the connection closes.
 const FAKE_WORKER: &str = r#"
 import json, socket, struct, sys
 args = sys.argv[1:]
@@ -37,9 +38,10 @@ index = args.index("--script")
 sock_path = args[index + 2]
 stream = socket.socket(socket.AF_UNIX)
 stream.connect(sock_path)
-body = json.dumps({"meta": {"x_op": "ready"},
-                   "data": {"protocol_version": 1, "capabilities": []}}).encode()
-stream.sendall(struct.pack("<Q", len(body)) + body)
+def send(meta, data):
+    body = json.dumps({"meta": meta, "data": data}).encode()
+    stream.sendall(struct.pack("<Q", len(body)) + body)
+send({"x_op": "ready"}, {"protocol_version": 1, "capabilities": ["requests"]})
 def read(size):
     data = b""
     while len(data) < size:
@@ -50,8 +52,12 @@ def read(size):
     return data
 while True:
     (size,) = struct.unpack("<Q", read(8))
-    if json.loads(read(size))["meta"].get("x_op") == "terminate":
+    envelope = json.loads(read(size))
+    operation = envelope["meta"].get("x_op")
+    if operation == "terminate":
         sys.exit(0)
+    if operation == "execute":
+        send({"x_op": "done", "x_req": envelope["meta"]["x_req"]}, {"echo": envelope["data"]})
 "#;
 
 /// A fake uv whose launch runs `body` and then hands over to the fake worker.
@@ -468,7 +474,13 @@ exec python3 "$FAKE_WORKER" "$@""#,
     };
 
     let worker = spawn("ready").await.unwrap();
-    assert!(worker.capabilities().is_empty());
+    assert_eq!(worker.capabilities(), ["requests"]);
+    let input = serde_json::Map::from_iter([("task".to_string(), serde_json::json!("parse"))]);
+    let output = worker
+        .execute(input.clone(), Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert_eq!(output["echo"], serde_json::Value::Object(input));
     worker.terminate().await.unwrap();
 
     assert!(matches!(

@@ -10,7 +10,9 @@ use tokio::net::UnixListener;
 use crate::error::{InvalidScriptReason, RunpyError, TimeoutStage};
 use crate::integrity::IntegrityChecker;
 use crate::lifecycle::{ExitReason, LifecycleReceiver, LifecycleState, WorkerExit, wait_for_exit};
-use crate::protocol::{ControlPlane, Envelope, InboundEnvelope, MessageHandler, SendReceipt};
+use crate::protocol::{ControlPlane, Data, Envelope, InboundEnvelope, MessageHandler, SendReceipt};
+use crate::request::Request;
+use std::time::Duration;
 
 // ── Worker Identity ────────────────────────────────────────────────────
 
@@ -440,6 +442,49 @@ impl Worker {
     /// fails. Dropping the receipt does not cancel the send.
     pub fn try_send_message(&self, envelope: Envelope) -> Result<SendReceipt, RunpyError> {
         self.control_plane()?.try_send(&self.id, envelope)
+    }
+
+    /// Run one request on this worker and wait for its result.
+    ///
+    /// Equivalent to [`Worker::submit`] followed by [`Request::result`]; see
+    /// those for queueing, deadline, and error semantics.
+    ///
+    /// ```no_run
+    /// use runpy::{Data, Manager};
+    /// use serde_json::json;
+    /// use std::time::Duration;
+    ///
+    /// # async fn demo(manager: &Manager) -> Result<(), runpy::RunpyError> {
+    /// let worker = manager.worker("parser").spawn().await?;
+    /// let input = Data::from_iter([("text".into(), json!("hello"))]);
+    /// let output = worker.execute(input, Duration::from_secs(10)).await?;
+    /// println!("{output:?}");
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn execute(&self, data: Data, timeout: Duration) -> Result<Data, RunpyError> {
+        self.submit(data, timeout).await?.result().await
+    }
+
+    /// Queue one request and return a handle to its result.
+    ///
+    /// A worker runs one request at a time, in submission order. `timeout`
+    /// bounds the whole request from this call: waiting for a pending slot,
+    /// waiting for the worker, sending, and the result. A request still
+    /// queued at its deadline never runs; one already running keeps the
+    /// worker busy until it finishes, and its late result is discarded.
+    /// Nothing is ever retried or replayed: resubmitting creates a new
+    /// request with a new ID and may repeat side effects.
+    ///
+    /// # Errors
+    ///
+    /// [`RunpyError::Unsupported`] when the worker did not advertise the
+    /// `requests` capability, [`RunpyError::Timeout`] with
+    /// [`TimeoutStage::Admission`] when no pending slot freed in time, and
+    /// [`RunpyError::WorkerExited`] or [`RunpyError::ManagerClosed`] when the
+    /// worker or Manager is gone.
+    pub async fn submit(&self, data: Data, timeout: Duration) -> Result<Request, RunpyError> {
+        self.control_plane()?.submit(&self.id, data, timeout).await
     }
 
     /// Wait until the worker stops and return its retained exit.

@@ -64,16 +64,13 @@ both packages together.
 
 ## Execution model
 
-- `execute(data)` handles `execute`; return a dictionary for `done.data` or
-  `None` for an empty result.
+- `execute(data)` handles one `execute` request; return a dictionary for
+  `done.data` or `None` for an empty result. The result is correlated with the
+  request's `x_req`; the Manager sends one request at a time.
 - An exception, non-dictionary result, or unencodable result becomes an
   `error` envelope with `{"kind": "<exception type>", "message": "<text>"}`.
   It does not terminate the worker. `SystemExit` and `KeyboardInterrupt` are
   not converted and end the worker.
-- `retry` reuses the same mutable payload stored by `Worker._dispatch` and
-  passed to `Worker._complete_execution`. Mutations made by `execute` remain
-  present on retry; copy inputs before mutating them. Retry before execute
-  returns an error envelope.
 - `handle_envelope(envelope)` receives application messages without `x_op`.
 - `send(data, meta=...)` sends an application envelope.
 - `log(data, level=..., meta=...)` sends a structured `log` envelope.
@@ -128,9 +125,10 @@ reserves the complete `x_` namespace:
 | `x_wid` | Trusted worker identity stamped by Runpy. |
 | `x_spath` | Trusted socket path stamped by Runpy. |
 | `x_op` | Optional lifecycle operation. |
+| `x_req` | Request ID on `execute` and its `done`/`error`. |
 
-The reserved operations are `ready`, `execute`, `retry`, `terminate`, `done`,
-`error`, and `log`. `create_envelope` copies its inputs and rejects
+The reserved operations are `ready`, `execute`, `terminate`, `done`, `error`,
+and `log`. `create_envelope` copies its inputs and rejects
 application-provided `x_` metadata.
 
 ## Public API
