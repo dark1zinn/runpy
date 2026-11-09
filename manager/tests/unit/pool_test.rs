@@ -189,9 +189,16 @@ async fn waiting_pool_gets_the_next_slot_before_a_hot_pool() {
     let other = fixture.pool(PoolConfig::default()).await;
     let log = fixture.path("events");
 
+    // The first three hot requests finish 400 ms apart, far more than process
+    // startup jitter, so each freed slot is granted well before the next.
     let mut hot_requests = Vec::new();
     for index in 0..6 {
-        let input = data(json!({ "pool": "hot", "index": index, "record": log, "sleep": 0.4 }));
+        let sleep = if index < 3 {
+            0.4 * f64::from(index + 1)
+        } else {
+            0.1
+        };
+        let input = data(json!({ "pool": "hot", "index": index, "record": log, "sleep": sleep }));
         hot_requests.push(hot.submit(input, LONG).await.unwrap());
     }
     eventually(async || fixture.launches() == 3, "hot pool saturation").await;
