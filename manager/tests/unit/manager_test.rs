@@ -526,12 +526,13 @@ exec python3 "$FAKE_WORKER" "$@""#,
 }
 
 /// A fake uv that records each launch in `launches` and fails at once when
-/// `RUNPY_TEST_MODE=exit`; otherwise it becomes a ready worker.
+/// `RUNPY_TEST_MODE=exit` or the file `<launches>.fail` exists; otherwise it
+/// becomes a ready worker.
 pub(crate) fn counting_uv(tmp: &TempDir, launches: &Path) -> PathBuf {
     uv_script(
         tmp,
         &format!(
-            "echo launch >> '{}'\n[ \"$RUNPY_TEST_MODE\" = exit ] && exit 3\nexec python3 \"$FAKE_WORKER\" \"$@\"",
+            "echo launch >> '{0}'\n[ \"$RUNPY_TEST_MODE\" = exit ] && exit 3\n[ -e '{0}.fail' ] && exit 3\nexec python3 \"$FAKE_WORKER\" \"$@\"",
             launches.display()
         ),
     )

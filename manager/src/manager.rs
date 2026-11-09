@@ -10,7 +10,9 @@ use tokio::net::UnixListener;
 use crate::error::{InvalidScriptReason, RunpyError, TimeoutStage};
 use crate::integrity::IntegrityChecker;
 use crate::lifecycle::{ExitReason, LifecycleReceiver, LifecycleState, WorkerExit, wait_for_exit};
-use crate::protocol::{ControlPlane, Data, Envelope, InboundEnvelope, MessageHandler, SendReceipt};
+use crate::protocol::{
+    ControlPlane, Data, Envelope, InboundEnvelope, MessageHandler, ProcessSlot, SendReceipt,
+};
 use crate::request::Request;
 use std::time::Duration;
 
@@ -202,6 +204,14 @@ impl WorkerBuilder {
         std::ptr::eq(self.control_plane.as_ptr(), Arc::as_ptr(control_plane))
     }
 
+    /// Startup deadline configured on the owning Manager.
+    pub(crate) fn startup_timeout(&self) -> Result<Duration, RunpyError> {
+        self.integrity
+            .upgrade()
+            .map(|integrity| integrity.startup_timeout)
+            .ok_or(RunpyError::ManagerClosed)
+    }
+
     /// Launch the configured script and register it with the Manager.
     ///
     /// The script name must be a single path component naming a root-level
@@ -222,6 +232,12 @@ impl WorkerBuilder {
     /// startup timeout, and [`RunpyError::Io`] when the socket, process, or
     /// pipes cannot be set up.
     pub async fn spawn(self) -> Result<Worker, RunpyError> {
+        self.spawn_with(None).await
+    }
+
+    /// [`WorkerBuilder::spawn`] using `slot` instead of reserving a process
+    /// slot from the Manager-wide limit; pools pass slots they reserved.
+    pub(crate) async fn spawn_with(self, slot: Option<ProcessSlot>) -> Result<Worker, RunpyError> {
         let script_name = Path::new(&self.script);
         if self.script.is_empty() || script_name.file_name() != Some(script_name.as_os_str()) {
             return Err(RunpyError::InvalidScript {
@@ -243,7 +259,10 @@ impl WorkerBuilder {
         // released only after that process group is stopped and reaped (or
         // here, if launching fails).
         let deadline = tokio::time::Instant::now() + integrity.startup_timeout;
-        let slot = control_plane.reserve_process(deadline).await?;
+        let slot = match slot {
+            Some(slot) => slot,
+            None => control_plane.reserve_process(deadline).await?,
+        };
 
         // No await between binding the socket and registering the child, so
         // cancelling `spawn` can never leak a socket or an unowned process.

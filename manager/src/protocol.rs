@@ -6,7 +6,7 @@ use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::process::{Child, ExitStatus};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Weak};
 use std::thread;
@@ -932,6 +932,8 @@ pub(crate) struct ControlPlane {
     /// Manager-wide bound on worker processes. A slot is held from before
     /// `uv` starts until its process group has been killed and reaped.
     processes: Arc<Semaphore>,
+    /// Sum of warm minima held by pools; never above `max_workers`.
+    reserved_minima: AtomicUsize,
     /// Next request ID; never wraps.
     next_request: AtomicU64,
     /// Sessions report their terminal reason here; the monitor removes them.
@@ -970,6 +972,7 @@ impl ControlPlane {
             budget: Arc::new(Semaphore::new(queue.queued_bytes)),
             request_budget: Arc::new(Semaphore::new(queue.max_pending_requests)),
             processes: Arc::new(Semaphore::new(queue.max_workers)),
+            reserved_minima: AtomicUsize::new(0),
             next_request: AtomicU64::new(1),
             ended_tx,
             ended_rx: Mutex::new(Some(ended_rx)),
@@ -1049,6 +1052,33 @@ impl ControlPlane {
             .await
             .map_err(|_| RunpyError::Timeout(TimeoutStage::Admission))?
             .map_err(|_| RunpyError::ManagerClosed)
+    }
+
+    /// The Manager-wide worker-process semaphore, for the pool scheduler.
+    pub(crate) fn processes(&self) -> &Arc<Semaphore> {
+        &self.processes
+    }
+
+    /// Account for `count` more warm-minimum workers, failing if the sum of
+    /// all pools' minima would exceed `max_workers`.
+    pub(crate) fn reserve_minima(&self, count: usize) -> Result<(), RunpyError> {
+        let limit = self.queue.max_workers;
+        self.reserved_minima
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |reserved| {
+                reserved.checked_add(count).filter(|total| *total <= limit)
+            })
+            .map(|_| ())
+            .map_err(|reserved| {
+                RunpyError::InvalidConfig(format!(
+                    "pool min_workers ({count}) plus minima already reserved ({reserved}) \
+                     exceeds the Manager's max_workers ({limit})"
+                ))
+            })
+    }
+
+    /// Return minima accounted by [`ControlPlane::reserve_minima`].
+    pub(crate) fn release_minima(&self, count: usize) {
+        self.reserved_minima.fetch_sub(count, Ordering::AcqRel);
     }
 
     pub(crate) async fn register_worker(

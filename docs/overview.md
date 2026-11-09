@@ -403,6 +403,34 @@ class Parser(Worker):
         return {"tokens": load_model(data["model"]).parse(data["text"])}
 ```
 
+### Warm minima and fair scheduling
+
+`PoolConfig::min_workers(n)` keeps `n` warm workers. It requires reuse, and
+`min_workers <= max_workers <=` the Manager's `max_workers`; the sum of all
+open pools' minima must also fit the Manager's `max_workers`. Invalid
+configurations are rejected before anything starts. Creating such a pool
+takes `n` Manager-wide slots out of circulation (waiting up to the startup
+timeout for running workers to free them), starts the minimum, and returns
+only when all of them are ready; if any fails, the started ones are stopped
+and the reservation is returned. Reserved slots are never used by direct
+`spawn` calls or other pools, and minimum workers never idle out. `close`
+returns the reservation.
+
+A minimum worker that exits, or fails a request, gets exactly one replacement
+start. If that start fails, the pool closes (queued requests fail with
+`PoolClosed`) instead of restarting in a loop; call `close` to release its
+reservation. Workers above the minimum are not replaced; new ones start only
+for queued requests. Failed requests are never replayed: whether to resubmit
+is the application's decision.
+
+Workers above a pool's minimum obtain Manager-wide slots from a shared
+scheduler. Requests stay FIFO within a pool, and when several pools wait for
+capacity the scheduler hands each freed slot to the next waiting pool in
+round-robin order, so a busy pool cannot starve another. While pools wait and
+no slot is free, the scheduler retires an idle worker above another pool's
+minimum. Running requests and reserved minima are never preempted, and
+requests have no affinity to particular workers.
+
 ## Protocol reference
 
 ### Frame format

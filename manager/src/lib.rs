@@ -91,22 +91,21 @@ mod manager;
 mod pool;
 mod protocol;
 mod request;
+mod scheduler;
 mod scribbler;
 mod watchdog;
 
 use std::collections::HashMap;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Weak};
 use std::time::Duration;
-
-use parking_lot::Mutex;
 
 use crate::config::{ProtocolLimits, QueueLimits};
 use crate::integrity::IntegrityChecker;
-use crate::pool::PoolCore;
 use crate::protocol::ControlPlane;
+use crate::scheduler::Scheduler;
 
 // ── Public re-exports ──────────────────────────────────────────────────
 pub use config::{
@@ -314,13 +313,14 @@ impl ManagerBuilder {
 
         let control_plane = ControlPlane::new(logger.clone(), limits, self.queue);
         control_plane.start_monitoring(5);
+        let scheduler = Scheduler::new(control_plane.processes().clone());
 
         Ok(Manager {
             integrity,
             logger,
             control_plane,
             socket_dir,
-            pools: Mutex::new(Vec::new()),
+            scheduler,
             next_pool: AtomicU64::new(1),
         })
     }
@@ -400,9 +400,10 @@ pub struct Manager {
     control_plane: Arc<ControlPlane>,
     /// Removed when the Manager drops, after every worker has been stopped.
     socket_dir: tempfile::TempDir,
-    /// Pools stopped when the Manager drops. A pool's own tasks keep it
-    /// alive while it runs, so dropped handles never orphan it.
-    pools: Mutex<Vec<Weak<PoolCore>>>,
+    /// Grants Manager-wide slots fairly across pools and stops them when the
+    /// Manager drops. A pool's own tasks keep it alive while it runs, so
+    /// dropped handles never orphan it.
+    scheduler: Arc<Scheduler>,
     next_pool: AtomicU64,
 }
 
@@ -531,14 +532,17 @@ impl Manager {
         self.control_plane.terminate_all().await
     }
 
-    /// Register a pool of cold workers that runs independent requests for
-    /// `template`'s script across separate processes.
+    /// Register a pool that runs independent requests for `template`'s
+    /// script across separate processes.
     ///
     /// Every call creates a distinct pool, even for the same script and
-    /// configuration; pools are never merged by filename. Creation starts no
-    /// process. The Manager owns the pool: dropping every [`WorkerPool`]
-    /// handle leaves submitted requests running, and dropping the Manager
-    /// stops the pool and its workers. See [`WorkerPool`] for scheduling.
+    /// configuration; pools are never merged by filename. Without
+    /// [`PoolConfig::min_workers`] creation starts no process; with it,
+    /// creation reserves the minimum's slots and waits until those workers
+    /// are ready, rolling everything back if one fails. The Manager owns the
+    /// pool: dropping every [`WorkerPool`] handle leaves submitted requests
+    /// running, and dropping the Manager stops the pool and its workers. See
+    /// [`WorkerPool`] for scheduling.
     ///
     /// ```no_run
     /// use runpy::{Manager, PoolConfig};
@@ -556,8 +560,13 @@ impl Manager {
     /// # Errors
     ///
     /// [`RunpyError::InvalidConfig`] when `template` belongs to another
-    /// Manager or `config` is out of range (`max_workers` must be between 1
-    /// and the Manager's `max_workers`; `queue_capacity` must be positive).
+    /// Manager or `config` is out of range: `min_workers <= max_workers <=`
+    /// the Manager's `max_workers`, `max_workers` positive, a positive
+    /// minimum only with reuse, the sum of all pools' minima within the
+    /// Manager's `max_workers`, and positive `queue_capacity` and
+    /// `idle_timeout`. Starting the minimum can fail like
+    /// [`WorkerBuilder::spawn`], or with `Timeout(Admission)` when running
+    /// workers do not free enough slots within the startup timeout.
     pub async fn pool(
         &self,
         template: WorkerBuilder,
@@ -568,11 +577,16 @@ impl Manager {
                 "the pool template must come from this Manager's `worker`".to_string(),
             ));
         }
-        let id = format!("pool-{}", self.next_pool.fetch_add(1, Ordering::Relaxed));
-        let (pool, core) = WorkerPool::start(id, template, &self.control_plane, config)?;
-        let mut pools = self.pools.lock();
-        pools.retain(|pool| pool.strong_count() > 0);
-        pools.push(core);
+        let key = self.next_pool.fetch_add(1, Ordering::Relaxed);
+        let (pool, core) = WorkerPool::start(
+            key,
+            template,
+            &self.control_plane,
+            self.scheduler.clone(),
+            config,
+        )
+        .await?;
+        self.scheduler.register(key, core);
         Ok(pool)
     }
 }
@@ -582,11 +596,7 @@ impl Drop for Manager {
         self.logger
             .info_with("Manager", "Shutting down all workers...");
         self.control_plane.shutdown_now();
-        for pool in self.pools.lock().drain(..) {
-            if let Some(pool) = pool.upgrade() {
-                pool.shutdown_now();
-            }
-        }
+        self.scheduler.shutdown_now();
         self.logger.success("All workers terminated.");
     }
 }

@@ -1,4 +1,4 @@
-use runpy::{Data, Manager, PoolConfig, RunpyError, TimeoutStage, WorkerPool};
+use runpy::{Data, Manager, ManagerBuilder, PoolConfig, RunpyError, TimeoutStage, WorkerPool};
 use serde_json::{Value, json};
 use std::fs;
 use std::time::{Duration, Instant};
@@ -22,12 +22,15 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> Self {
+        Self::with(|builder| builder).await
+    }
+
+    async fn with(configure: impl FnOnce(ManagerBuilder) -> ManagerBuilder) -> Self {
         let tmp = TempDir::new().unwrap();
         let launches = tmp.path().join("launches");
         let uv = counting_uv(&tmp, &launches);
         let scripts = scripts_dir(&tmp, &["parse"]);
-        let manager = Manager::builder(&scripts)
-            .uv_path(&uv)
+        let manager = configure(Manager::builder(&scripts).uv_path(&uv))
             .build()
             .await
             .unwrap();
@@ -72,6 +75,203 @@ impl Fixture {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
+}
+
+/// Wait until `check` holds, polling briefly.
+async fn eventually(mut check: impl AsyncFnMut() -> bool, what: &str) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !check().await {
+        assert!(Instant::now() < deadline, "{what} did not happen");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+fn warm(min: usize) -> PoolConfig {
+    PoolConfig::default().min_workers(min).reuse_workers(true)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn warm_minimum_starts_eagerly_and_its_slots_are_not_borrowed() {
+    let fixture =
+        Fixture::with(|builder| builder.startup_timeout(Duration::from_millis(500))).await;
+    let pool = fixture.pool(warm(2)).await;
+    // Creation waited for both minimum workers.
+    assert_eq!(fixture.launches(), 2);
+    assert_eq!(fixture.manager.watchdog().report().await.len(), 2);
+
+    // Only the one unreserved slot is available to direct spawns.
+    let direct = fixture.manager.worker("parse").spawn().await.unwrap();
+    assert!(matches!(
+        fixture.manager.worker("parse").spawn().await,
+        Err(RunpyError::Timeout(TimeoutStage::Admission))
+    ));
+
+    // Requests run on the warm workers without starting more.
+    let output = pool.execute(data(json!({})), LONG).await.unwrap();
+    let pids: Vec<u32> = fixture
+        .manager
+        .watchdog()
+        .report()
+        .await
+        .iter()
+        .map(|report| report.pid)
+        .collect();
+    assert_eq!(fixture.launches(), 3);
+    assert!(output["pid"].as_u64().is_some());
+    assert_eq!(pids.len(), 3);
+
+    // Closing returns the reservation: three direct spawns fit again.
+    assert_eq!(pool.close().await.len(), 2);
+    direct.terminate().await.unwrap();
+    for _ in 0..3 {
+        fixture.manager.worker("parse").spawn().await.unwrap();
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn failed_warm_start_rolls_back_the_reservation() {
+    let fixture =
+        Fixture::with(|builder| builder.startup_timeout(Duration::from_millis(500))).await;
+    let template = fixture
+        .manager
+        .worker("parse")
+        .env("RUNPY_TEST_MODE", "exit");
+    assert!(matches!(
+        fixture.manager.pool(template, warm(2)).await,
+        Err(RunpyError::WorkerExited { .. })
+    ));
+    assert!(fixture.manager.watchdog().report().await.is_empty());
+    // Neither the reserved slots nor the minima accounting leaked.
+    let _pool = fixture.pool(warm(3)).await;
+    assert_eq!(fixture.manager.watchdog().report().await.len(), 3);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn lost_minimum_worker_is_replaced_once_or_the_pool_closes() {
+    let fixture = Fixture::new().await;
+    let pool = fixture.pool(warm(1).max_workers(1)).await;
+    let first = pool.execute(data(json!({})), LONG).await.unwrap()["pid"]
+        .as_u64()
+        .unwrap();
+
+    // The worker dies while idle and is replaced by a new process.
+    unsafe { libc::kill(first as libc::pid_t, libc::SIGKILL) };
+    eventually(async || fixture.launches() == 2, "replacement").await;
+    let second = pool.execute(data(json!({})), LONG).await.unwrap()["pid"]
+        .as_u64()
+        .unwrap();
+    assert_ne!(first, second);
+
+    // If the single replacement attempt fails, the pool closes instead of
+    // retrying in a loop.
+    fs::write(fixture.tmp.path().join("launches.fail"), "").unwrap();
+    unsafe { libc::kill(second as libc::pid_t, libc::SIGKILL) };
+    eventually(
+        async || {
+            matches!(
+                pool.submit(data(json!({})), LONG).await,
+                Err(RunpyError::PoolClosed)
+            )
+        },
+        "pool closing",
+    )
+    .await;
+    assert_eq!(fixture.launches(), 3);
+    pool.close().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn waiting_pool_gets_the_next_slot_before_a_hot_pool() {
+    let fixture = Fixture::new().await;
+    let hot = fixture.pool(PoolConfig::default()).await;
+    let other = fixture.pool(PoolConfig::default()).await;
+    let log = fixture.path("events");
+
+    let mut hot_requests = Vec::new();
+    for index in 0..6 {
+        let input = data(json!({ "pool": "hot", "index": index, "record": log, "sleep": 0.4 }));
+        hot_requests.push(hot.submit(input, LONG).await.unwrap());
+    }
+    eventually(async || fixture.launches() == 3, "hot pool saturation").await;
+    let other_request = other
+        .submit(data(json!({ "pool": "other", "record": log })), LONG)
+        .await
+        .unwrap();
+    let other_pid = other_request.result().await.unwrap()["pid"]
+        .as_u64()
+        .unwrap() as u32;
+    for request in hot_requests {
+        request.result().await.unwrap();
+    }
+
+    // The other pool started before the hot pool's fourth request.
+    let starts: Vec<u32> = fixture
+        .events("events")
+        .into_iter()
+        .filter(|(event, ..)| event == "start")
+        .map(|(_, pid, _)| pid)
+        .collect();
+    let position = starts.iter().position(|pid| *pid == other_pid).unwrap();
+    assert_eq!(position, 3, "start order: {starts:?}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn idle_surplus_is_retired_to_serve_another_pool() {
+    let fixture = Fixture::new().await;
+    let reusing = fixture
+        .pool(
+            PoolConfig::default()
+                .reuse_workers(true)
+                .idle_timeout(LONG * 6),
+        )
+        .await;
+    let barrier = fixture.tmp.path().join("barrier");
+    fs::create_dir(&barrier).unwrap();
+    let mut requests = Vec::new();
+    for _ in 0..3 {
+        let input = data(json!({ "barrier": barrier.to_string_lossy(), "parties": 3 }));
+        requests.push(reusing.submit(input, LONG).await.unwrap());
+    }
+    for request in requests {
+        request.result().await.unwrap();
+    }
+    // Three idle workers now hold every Manager-wide slot.
+    assert_eq!(fixture.manager.watchdog().report().await.len(), 3);
+
+    let other = fixture.pool(PoolConfig::default()).await;
+    other
+        .execute(data(json!({})), Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert_eq!(fixture.launches(), 4);
+}
+
+#[tokio::test]
+async fn invalid_minima_are_rejected_before_starting_anything() {
+    let fixture = Fixture::new().await;
+    for config in [PoolConfig::default().min_workers(1), warm(3).max_workers(2)] {
+        assert!(matches!(
+            fixture
+                .manager
+                .pool(fixture.manager.worker("parse"), config)
+                .await,
+            Err(RunpyError::InvalidConfig(_))
+        ));
+    }
+    let _first = fixture.pool(warm(2)).await;
+    assert!(matches!(
+        fixture
+            .manager
+            .pool(fixture.manager.worker("parse"), warm(2))
+            .await,
+        Err(RunpyError::InvalidConfig(_))
+    ));
+    assert_eq!(fixture.launches(), 2);
 }
 
 #[cfg(unix)]

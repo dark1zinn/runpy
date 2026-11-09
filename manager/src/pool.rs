@@ -4,6 +4,12 @@
 //! separate worker processes. It owns no wire protocol of its own: each
 //! request becomes an ordinary correlated request on a worker. Workers are
 //! retired after one request unless the pool explicitly enables reuse.
+//!
+//! Capacity has three layers. The pool slot semaphore bounds this pool's own
+//! workers (`max_workers`). Warm minima are backed by Manager-wide slots
+//! taken out of general circulation at creation, so neither direct spawns
+//! nor other pools can borrow them. Workers above the minimum obtain
+//! Manager-wide slots from the fair [`Scheduler`].
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -12,13 +18,14 @@ use std::sync::{Arc, Weak};
 use parking_lot::Mutex;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError, mpsc, watch};
 use tokio::task::{AbortHandle, JoinHandle, JoinSet};
-use tokio::time::{Duration, Instant, sleep_until, timeout_at};
+use tokio::time::{Duration, Instant, sleep_until, timeout, timeout_at};
 
 use crate::error::{RunpyError, TimeoutStage};
 use crate::lifecycle::WorkerExit;
 use crate::manager::{Worker, WorkerBuilder};
-use crate::protocol::{ControlPlane, Data};
+use crate::protocol::{ControlPlane, Data, ProcessSlot};
 use crate::request::{PendingRequest, Request};
+use crate::scheduler::Scheduler;
 
 /// Default bound on requests waiting in one pool's queue.
 pub const DEFAULT_POOL_QUEUE_CAPACITY: usize = 64;
@@ -29,12 +36,20 @@ pub const DEFAULT_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 ///
 /// ```
 /// use runpy::PoolConfig;
+/// use std::time::Duration;
 ///
-/// let config = PoolConfig::default().max_workers(2).queue_capacity(16);
+/// // Two warm workers always ready, up to three under load.
+/// let config = PoolConfig::default()
+///     .min_workers(2)
+///     .max_workers(3)
+///     .reuse_workers(true)
+///     .idle_timeout(Duration::from_secs(60))
+///     .queue_capacity(16);
 /// # let _ = config;
 /// ```
 #[derive(Clone, Copy, Debug)]
 pub struct PoolConfig {
+    min_workers: usize,
     max_workers: Option<usize>,
     queue_capacity: usize,
     reuse_workers: bool,
@@ -44,6 +59,7 @@ pub struct PoolConfig {
 impl Default for PoolConfig {
     fn default() -> Self {
         Self {
+            min_workers: 0,
             max_workers: None,
             queue_capacity: DEFAULT_POOL_QUEUE_CAPACITY,
             reuse_workers: false,
@@ -53,8 +69,21 @@ impl Default for PoolConfig {
 }
 
 impl PoolConfig {
+    /// Warm workers kept ready at all times; default 0.
+    ///
+    /// A positive minimum requires [`PoolConfig::reuse_workers`]. Their
+    /// Manager-wide slots are reserved when the pool is created and are
+    /// never used by direct spawns or other pools; the sum of every pool's
+    /// minimum must fit the Manager's `max_workers`. Pool creation waits until
+    /// all minimum workers are ready.
+    pub fn min_workers(mut self, workers: usize) -> Self {
+        self.min_workers = workers;
+        self
+    }
+
     /// Most worker processes this pool runs at once; defaults to the
-    /// Manager's `max_workers`. Must be positive and at most that limit.
+    /// Manager's `max_workers`. Must be positive, at least `min_workers`,
+    /// and at most the Manager's `max_workers`.
     pub fn max_workers(mut self, workers: usize) -> Self {
         self.max_workers = Some(workers);
         self
@@ -81,8 +110,9 @@ impl PoolConfig {
         self
     }
 
-    /// How long a reusable worker may stay idle before it is retired;
-    /// default [`DEFAULT_POOL_IDLE_TIMEOUT`] (30 s). Must be positive.
+    /// How long a reusable worker above the minimum may stay idle before it
+    /// is retired; default [`DEFAULT_POOL_IDLE_TIMEOUT`] (30 s). Must be
+    /// positive. Minimum workers never time out.
     pub fn idle_timeout(mut self, timeout: Duration) -> Self {
         self.idle_timeout = timeout;
         self
@@ -92,23 +122,58 @@ impl PoolConfig {
 /// A request admitted to the pool and waiting for a worker.
 struct Job {
     pending: PendingRequest,
-    /// Released when the job leaves the queue for a worker slot.
+    /// Released when the job leaves the queue for a worker.
     _queued: OwnedSemaphorePermit,
+}
+
+/// A started worker together with the pool slot it occupies.
+struct Lease {
+    worker: Worker,
+    slot: OwnedSemaphorePermit,
+    /// Whether its process slot comes from the pool's warm reservation.
+    reserved: bool,
+}
+
+/// How a queued job obtained a worker.
+enum Assigned {
+    /// A pool slot for a worker that still has to be started.
+    Fresh(OwnedSemaphorePermit),
+    /// A parked worker.
+    Idle(Lease),
+}
+
+/// A worker kept between requests.
+struct IdleWorker {
+    /// Distinguishes this parking from later ones of the same worker.
+    token: u64,
+    lease: Lease,
+    /// Idle-timeout timer, or the exit watcher of a minimum worker.
+    timer: AbortHandle,
 }
 
 /// State shared by every [`WorkerPool`] handle and the pool's tasks.
 pub(crate) struct PoolCore {
     id: String,
+    /// Scheduler key; grants rotate across pools in key order.
+    key: u64,
     template: WorkerBuilder,
     control_plane: Weak<ControlPlane>,
+    scheduler: Arc<Scheduler>,
     jobs: mpsc::UnboundedSender<Job>,
     queue_slots: Arc<Semaphore>,
+    /// This pool's `max_workers`.
+    slots: Arc<Semaphore>,
+    min_workers: usize,
+    /// Process slots reserved for the warm minimum.
+    reserve: Arc<Semaphore>,
+    /// Whether the reservation was already returned to the Manager.
+    released: AtomicBool,
     closed: AtomicBool,
     closing: watch::Sender<bool>,
     /// Workers currently running a pool request, keyed by worker ID.
     active: Mutex<HashMap<String, Worker>>,
     dispatcher: Mutex<Option<JoinHandle<()>>>,
-    /// One task per started request; owns its worker until it is retired.
+    /// Request runs, idle timers, and replacements; each may own a worker.
     runs: Arc<Mutex<JoinSet<Option<WorkerExit>>>>,
     /// `Some(idle_timeout)` when finished workers are kept for reuse.
     reuse: Option<Duration>,
@@ -117,23 +182,6 @@ pub(crate) struct PoolCore {
     /// Wakes the dispatcher when a worker is parked.
     parked: Notify,
     next_token: AtomicU64,
-}
-
-/// How a queued job obtained a worker.
-enum Assigned {
-    /// A pool slot for a worker that still has to be started.
-    Fresh(OwnedSemaphorePermit),
-    /// A parked worker, together with the pool slot it kept while idle.
-    Idle(Worker, OwnedSemaphorePermit),
-}
-
-/// A worker kept between requests when reuse is enabled.
-struct IdleWorker {
-    /// Distinguishes this parking from later ones of the same worker.
-    token: u64,
-    worker: Worker,
-    slot: OwnedSemaphorePermit,
-    timer: AbortHandle,
 }
 
 impl PoolCore {
@@ -148,34 +196,57 @@ impl PoolCore {
         self.runs.lock().abort_all();
     }
 
-    /// Keep a worker idle with its pool slot and arm its idle timeout.
+    /// Retire one idle worker above the minimum so another pool can use its
+    /// Manager-wide slot. Returns whether one was found.
+    pub(crate) fn retire_surplus_idle(&self) -> bool {
+        let entry = {
+            let mut idle = self.idle.lock();
+            let Some(position) = idle.iter().position(|entry| !entry.lease.reserved) else {
+                return false;
+            };
+            idle.swap_remove(position)
+        };
+        entry.timer.abort();
+        self.spawn_run(retire_lease(entry.lease));
+        true
+    }
+
+    fn spawn_run(&self, task: impl Future<Output = Option<WorkerExit>> + Send + 'static) {
+        let mut runs = self.runs.lock();
+        while runs.try_join_next().is_some() {}
+        runs.spawn(task);
+    }
+
+    /// Keep a worker idle with its pool slot. Workers above the minimum get
+    /// an idle timeout; minimum workers get an exit watcher that replaces
+    /// them once if they die.
     ///
-    /// Hands the worker back when the pool is closed: `close` drains the
-    /// idle list under the same lock after setting `closed`, so a worker
-    /// can never be parked after it.
-    fn park(
-        self: &Arc<Self>,
-        worker: Worker,
-        slot: OwnedSemaphorePermit,
-    ) -> Result<(), (Worker, OwnedSemaphorePermit)> {
+    /// Hands the lease back when reuse is off or the pool is closed: `close`
+    /// drains the idle list under the same lock after setting `closed`, so a
+    /// worker can never be parked after it.
+    fn park(self: &Arc<Self>, lease: Lease) -> Result<(), Lease> {
         let Some(idle_timeout) = self.reuse else {
-            return Err((worker, slot));
+            return Err(lease);
         };
         let token = self.next_token.fetch_add(1, Ordering::Relaxed);
-        // The timer looks its entry up under this lock, so it cannot run
+        // Timers look their entry up under this lock, so they cannot run
         // before the entry exists.
         let mut idle = self.idle.lock();
         if self.closed.load(Ordering::Acquire) {
-            return Err((worker, slot));
+            return Err(lease);
         }
-        let timer = self
-            .runs
-            .lock()
-            .spawn(expire_idle(self.clone(), token, idle_timeout));
+        let timer = {
+            let mut runs = self.runs.lock();
+            while runs.try_join_next().is_some() {}
+            if lease.reserved {
+                runs.spawn(watch_minimum(self.clone(), token, lease.worker.clone()))
+            } else {
+                runs.spawn(expire_idle(self.clone(), token, idle_timeout))
+            }
+        };
         idle.push(IdleWorker {
             token,
-            worker,
-            slot,
+            lease,
             timer,
         });
         drop(idle);
@@ -183,30 +254,63 @@ impl PoolCore {
         Ok(())
     }
 
-    /// Take a parked worker that is still ready, cancelling its idle timer.
-    /// Parked workers that exited meanwhile are discarded; the Manager has
-    /// already reaped or is reaping them.
-    fn take_idle(&self) -> Option<IdleWorker> {
-        let mut idle = self.idle.lock();
-        while let Some(entry) = idle.pop() {
+    /// Take a parked worker that is still ready, cancelling its timer.
+    /// Parked workers that exited meanwhile are discarded (minimum workers
+    /// are replaced once).
+    fn take_idle(self: &Arc<Self>) -> Option<Lease> {
+        loop {
+            let entry = self.idle.lock().pop()?;
             entry.timer.abort();
-            if entry.worker.is_ready() {
-                return Some(entry);
+            if entry.lease.worker.is_ready() {
+                return Some(entry.lease);
+            }
+            let reserved = entry.lease.reserved;
+            drop(entry);
+            if reserved {
+                self.spawn_run(replace_minimum(self.clone()));
             }
         }
-        None
+    }
+
+    /// Close the pool after a minimum worker could not be replaced.
+    fn fail(&self, error: &RunpyError) {
+        if let Some(control_plane) = self.control_plane.upgrade() {
+            control_plane.logger().error_with(
+                "Pool",
+                &format!("{}: minimum worker could not be replaced: {error}", self.id),
+            );
+        }
+        self.closed.store(true, Ordering::Release);
+        self.queue_slots.close();
+        self.closing.send_replace(true);
+    }
+
+    /// Return the warm reservation to the Manager once every minimum worker
+    /// has been reaped. Runs at most once.
+    async fn release_reservation(&self) {
+        if self.min_workers == 0 || self.released.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let count = u32::try_from(self.min_workers).expect("min_workers fits the global cap");
+        if let Ok(permits) = self.reserve.acquire_many(count).await {
+            permits.forget();
+        }
+        if let Some(control_plane) = self.control_plane.upgrade() {
+            control_plane.processes().add_permits(self.min_workers);
+            control_plane.release_minima(self.min_workers);
+        }
     }
 }
 
 /// Handle to a pool of workers for one script template.
 ///
 /// Created by [`crate::Manager::pool`]. Requests are started in FIFO order up
-/// to the pool's `max_workers` and the Manager-wide process limit. By
-/// default each request gets its own new worker process, retired after the
-/// request's terminal result, so no state carries between requests; with
-/// [`PoolConfig::reuse_workers`] a finished worker serves later requests.
-/// Requests have no affinity either way. Cloning is cheap; the Manager owns
-/// the pool, so dropping every handle neither stops it nor leaks it: the
+/// to the pool's `max_workers`. By default each request gets its own new
+/// worker process, retired after the request's terminal result, so no state
+/// carries between requests; with [`PoolConfig::reuse_workers`] a finished
+/// worker serves later requests, and [`PoolConfig::min_workers`] keeps some
+/// warm. Requests have no affinity either way. Cloning is cheap; the Manager
+/// owns the pool, so dropping every handle neither stops it nor leaks it: the
 /// pool keeps serving submitted requests until [`WorkerPool::close`] or
 /// Manager drop.
 ///
@@ -243,20 +347,28 @@ impl std::fmt::Debug for WorkerPool {
 }
 
 impl WorkerPool {
-    /// Validate `config` against the Manager and start the pool's
-    /// dispatcher. No worker process is created.
-    pub(crate) fn start(
-        id: String,
+    /// Validate `config`, reserve and start the warm minimum, and start the
+    /// pool's dispatcher. Without a minimum no worker process is created.
+    pub(crate) async fn start(
+        key: u64,
         template: WorkerBuilder,
         control_plane: &Arc<ControlPlane>,
+        scheduler: Arc<Scheduler>,
         config: PoolConfig,
     ) -> Result<(Self, Weak<PoolCore>), RunpyError> {
         let global = control_plane.max_workers();
         let max_workers = config.max_workers.unwrap_or(global);
-        if max_workers == 0 || max_workers > global {
+        let min_workers = config.min_workers;
+        if max_workers == 0 || max_workers > global || min_workers > max_workers {
             return Err(RunpyError::InvalidConfig(format!(
-                "pool max_workers ({max_workers}) must be between 1 and the Manager's max_workers ({global})"
+                "pool workers must satisfy min_workers ({min_workers}) <= max_workers \
+                 ({max_workers}) <= the Manager's max_workers ({global}), with max_workers > 0"
             )));
+        }
+        if min_workers > 0 && !config.reuse_workers {
+            return Err(RunpyError::InvalidConfig(
+                "pool min_workers requires reuse_workers".to_string(),
+            ));
         }
         if config.queue_capacity == 0 {
             return Err(RunpyError::InvalidConfig(
@@ -268,15 +380,44 @@ impl WorkerPool {
                 "pool idle_timeout must be greater than zero".to_string(),
             ));
         }
+        let startup_timeout = template.startup_timeout()?;
+
+        // Take the minimum's slots out of general circulation.
+        control_plane.reserve_minima(min_workers)?;
+        if min_workers > 0 {
+            let count = u32::try_from(min_workers).expect("min_workers fits the global cap");
+            match timeout(
+                startup_timeout,
+                control_plane.processes().clone().acquire_many_owned(count),
+            )
+            .await
+            {
+                Ok(Ok(permits)) => permits.forget(),
+                Ok(Err(_)) => {
+                    control_plane.release_minima(min_workers);
+                    return Err(RunpyError::ManagerClosed);
+                }
+                Err(_) => {
+                    control_plane.release_minima(min_workers);
+                    return Err(RunpyError::Timeout(TimeoutStage::Admission));
+                }
+            }
+        }
 
         let (jobs_tx, jobs_rx) = mpsc::unbounded_channel();
         let (closing, closing_rx) = watch::channel(false);
         let core = Arc::new(PoolCore {
-            id,
+            id: format!("pool-{key}"),
+            key,
             template,
             control_plane: Arc::downgrade(control_plane),
+            scheduler,
             jobs: jobs_tx,
             queue_slots: Arc::new(Semaphore::new(config.queue_capacity)),
+            slots: Arc::new(Semaphore::new(max_workers)),
+            min_workers,
+            reserve: Arc::new(Semaphore::new(min_workers)),
+            released: AtomicBool::new(false),
             closed: AtomicBool::new(false),
             closing,
             active: Mutex::new(HashMap::new()),
@@ -287,15 +428,42 @@ impl WorkerPool {
             parked: Notify::new(),
             next_token: AtomicU64::new(0),
         });
-        let task = tokio::spawn(dispatch(
-            core.clone(),
-            jobs_rx,
-            closing_rx,
-            Arc::new(Semaphore::new(max_workers)),
-        ));
+        let pool = Self { core: core.clone() };
+
+        // Start the minimum eagerly; any failure rolls the whole pool back.
+        let mut starting = JoinSet::new();
+        for _ in 0..min_workers {
+            let core = core.clone();
+            starting.spawn(async move { start_reserved(&core).await });
+        }
+        let mut started = Vec::new();
+        let mut failure = None;
+        while let Some(result) = starting.join_next().await {
+            match result {
+                Ok(Ok(lease)) => started.push(lease),
+                Ok(Err(error)) => failure = failure.or(Some(error)),
+                Err(error) => {
+                    failure = failure.or(Some(RunpyError::Io(std::io::Error::other(error))))
+                }
+            }
+        }
+        if let Some(error) = failure {
+            core.closed.store(true, Ordering::Release);
+            for lease in started {
+                retire_lease(lease).await;
+            }
+            core.release_reservation().await;
+            return Err(error);
+        }
+        for lease in started {
+            if let Err(lease) = core.park(lease) {
+                retire_lease(lease).await;
+            }
+        }
+
+        let task = tokio::spawn(dispatch(core.clone(), jobs_rx, closing_rx));
         *core.dispatcher.lock() = Some(task);
-        let weak = Arc::downgrade(&core);
-        Ok((Self { core }, weak))
+        Ok((pool, Arc::downgrade(&core)))
     }
 
     /// Manager-assigned identity of this pool.
@@ -303,7 +471,7 @@ impl WorkerPool {
         &self.core.id
     }
 
-    /// Run one request on a fresh worker and wait for its result.
+    /// Run one request on a pool worker and wait for its result.
     ///
     /// Equivalent to [`WorkerPool::submit`] followed by [`Request::result`].
     pub async fn execute(&self, data: Data, timeout: Duration) -> Result<Data, RunpyError> {
@@ -357,9 +525,10 @@ impl WorkerPool {
 
     /// Stop accepting requests, fail queued ones with
     /// [`RunpyError::PoolClosed`], gracefully terminate running and idle
-    /// workers, and return the exit of every worker this pool still owned.
-    /// Requests interrupted this way fail with
-    /// [`RunpyError::OutcomeUnknown`]. Closing twice returns no exits.
+    /// workers, return the warm reservation to the Manager, and return the
+    /// exit of every worker this pool still owned. Requests interrupted this
+    /// way fail with [`RunpyError::OutcomeUnknown`]. Closing twice returns
+    /// no exits.
     pub async fn close(&self) -> Vec<WorkerExit> {
         let core = &self.core;
         core.closed.store(true, Ordering::Release);
@@ -381,11 +550,7 @@ impl WorkerPool {
         }
         for entry in parked {
             entry.timer.abort();
-            stopping.spawn(async move {
-                let exit = retire(entry.worker).await;
-                drop(entry.slot);
-                exit
-            });
+            stopping.spawn(retire_lease(entry.lease));
         }
         let mut exits: Vec<WorkerExit> = stopping.join_all().await.into_iter().flatten().collect();
         let mut runs = std::mem::take(&mut *core.runs.lock());
@@ -394,6 +559,7 @@ impl WorkerPool {
                 exits.push(exit);
             }
         }
+        core.release_reservation().await;
         exits
     }
 
@@ -446,7 +612,6 @@ async fn dispatch(
     core: Arc<PoolCore>,
     mut jobs: mpsc::UnboundedReceiver<Job>,
     mut closing: watch::Receiver<bool>,
-    slots: Arc<Semaphore>,
 ) {
     'jobs: loop {
         let job = tokio::select! {
@@ -455,11 +620,11 @@ async fn dispatch(
         };
         let Some(job) = job else { break };
         let assigned = loop {
-            if let Some(entry) = core.take_idle() {
-                break Assigned::Idle(entry.worker, entry.slot);
+            if let Some(lease) = core.take_idle() {
+                break Assigned::Idle(lease);
             }
             tokio::select! {
-                slot = slots.clone().acquire_owned() => {
+                slot = core.slots.clone().acquire_owned() => {
                     break Assigned::Fresh(slot.expect("pool slots are never closed"));
                 }
                 // A finished worker was parked; prefer it over a new process.
@@ -476,16 +641,54 @@ async fn dispatch(
         };
         let Job { pending, .. } = job;
         if pending.is_abandoned() {
+            if let Assigned::Idle(lease) = assigned
+                && let Err(lease) = core.park(lease)
+            {
+                core.spawn_run(retire_lease(lease));
+            }
             continue;
         }
-        let mut runs = core.runs.lock();
-        while runs.try_join_next().is_some() {}
-        runs.spawn(run(core.clone(), pending, assigned));
+        core.spawn_run(run(core.clone(), pending, assigned));
     }
     // Late submissions now fail at send; everything still queued is failed.
     jobs.close();
     while let Ok(job) = jobs.try_recv() {
         job.pending.fail_unsent(RunpyError::PoolClosed);
+    }
+}
+
+/// Start a worker on a slot reserved for the minimum.
+async fn start_reserved(core: &Arc<PoolCore>) -> Result<Lease, RunpyError> {
+    let slot = core
+        .slots
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| RunpyError::PoolClosed)?;
+    let process = core
+        .reserve
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| RunpyError::PoolClosed)?;
+    let worker = core.template.clone().spawn_with(Some(process)).await?;
+    Ok(Lease {
+        worker,
+        slot,
+        reserved: true,
+    })
+}
+
+/// Obtain a process slot for a new worker: from the warm reservation when
+/// one is free, otherwise fairly from the Manager-wide limit.
+async fn process_slot(
+    core: &PoolCore,
+    deadline: Instant,
+) -> Result<(ProcessSlot, bool), RunpyError> {
+    if let Ok(slot) = core.reserve.clone().try_acquire_owned() {
+        return Ok((slot, true));
+    }
+    match core.scheduler.acquire(core.key, deadline).await {
+        Some(slot) => Ok((slot, false)),
+        None => Err(core.scheduler.unavailable()),
     }
 }
 
@@ -495,18 +698,28 @@ async fn dispatch(
 /// Afterwards the worker is parked for reuse when the pool allows it and the
 /// request ended normally (`done` or a reported execution error); otherwise
 /// it is retired, and the pool slot is released only after its process
-/// group was stopped and reaped.
+/// group was stopped and reaped. A lost minimum worker is replaced once.
 async fn run(
     core: Arc<PoolCore>,
     pending: PendingRequest,
     assigned: Assigned,
 ) -> Option<WorkerExit> {
-    let (worker, slot) = match assigned {
-        Assigned::Idle(worker, slot) => (worker, slot),
+    let lease = match assigned {
+        Assigned::Idle(lease) => lease,
         Assigned::Fresh(slot) => {
             let deadline = pending.deadline();
-            match timeout_at(deadline, core.template.clone().spawn()).await {
-                Ok(Ok(worker)) => (worker, slot),
+            let started = timeout_at(deadline, async {
+                let (process, reserved) = process_slot(&core, deadline).await?;
+                let worker = core.template.clone().spawn_with(Some(process)).await?;
+                Ok::<_, RunpyError>((worker, reserved))
+            })
+            .await;
+            match started {
+                Ok(Ok((worker, reserved))) => Lease {
+                    worker,
+                    slot,
+                    reserved,
+                },
                 // `spawn` already stopped anything it started; the request
                 // never ran.
                 Ok(Err(error)) => {
@@ -522,13 +735,15 @@ async fn run(
     };
     if pending.is_abandoned() || core.closed.load(Ordering::Acquire) {
         pending.fail_unsent(RunpyError::PoolClosed);
-        return retire(worker).await;
+        return finish_lease(&core, lease, false).await;
     }
 
-    let worker_id = worker.id().to_string();
-    core.active.lock().insert(worker_id.clone(), worker.clone());
+    let worker_id = lease.worker.id().to_string();
+    core.active
+        .lock()
+        .insert(worker_id.clone(), lease.worker.clone());
     let (inner, outcome, relay) = pending.relay();
-    match worker.control_plane() {
+    match lease.worker.control_plane() {
         Ok(control_plane) => control_plane.enqueue(&worker_id, inner),
         Err(_) => drop(inner),
     }
@@ -536,43 +751,104 @@ async fn run(
     let ended_normally = matches!(outcome, Ok(Ok(_) | Err(RunpyError::Execution { .. })));
     relay.finish(outcome, &worker_id);
     core.active.lock().remove(&worker_id);
+    finish_lease(&core, lease, ended_normally).await
+}
 
-    let (worker, slot) = if ended_normally && worker.is_ready() {
-        match core.park(worker, slot) {
+/// Park a healthy worker or retire it; a retired minimum worker that failed
+/// is replaced once.
+async fn finish_lease(core: &Arc<PoolCore>, lease: Lease, healthy: bool) -> Option<WorkerExit> {
+    let lease = if healthy && lease.worker.is_ready() {
+        match core.park(lease) {
             Ok(()) => return None,
-            Err(returned) => returned,
+            Err(lease) => lease,
         }
     } else {
-        (worker, slot)
+        lease
     };
-    let exit = retire(worker).await;
-    drop(slot);
+    let reserved = lease.reserved;
+    let exit = retire_lease(lease).await;
+    if reserved && !healthy && !core.closed.load(Ordering::Acquire) {
+        core.spawn_run(replace_minimum(core.clone()));
+    }
     exit
 }
 
-/// Retire a parked worker whose idle timeout passed, unless new work took it
-/// first: a stale timer can never stop a busy worker.
+/// One startup attempt to restore a lost minimum worker. If it fails the
+/// pool closes rather than retrying in a loop.
+async fn replace_minimum(core: Arc<PoolCore>) -> Option<WorkerExit> {
+    /// Time allowed for the lost worker's slots to be released.
+    const SLOT_WAIT: Duration = Duration::from_secs(5);
+    if core.closed.load(Ordering::Acquire) {
+        return None;
+    }
+    let slots = timeout(SLOT_WAIT, async {
+        let slot = core.slots.clone().acquire_owned().await.ok()?;
+        let process = core.reserve.clone().acquire_owned().await.ok()?;
+        Some((slot, process))
+    })
+    .await
+    .ok()
+    .flatten();
+    let Some((slot, process)) = slots else {
+        core.fail(&RunpyError::Timeout(TimeoutStage::Admission));
+        return None;
+    };
+    match core.template.clone().spawn_with(Some(process)).await {
+        Ok(worker) => {
+            let lease = Lease {
+                worker,
+                slot,
+                reserved: true,
+            };
+            match core.park(lease) {
+                Ok(()) => None,
+                Err(lease) => retire_lease(lease).await,
+            }
+        }
+        Err(error) => {
+            core.fail(&error);
+            None
+        }
+    }
+}
+
+/// Retire a parked worker above the minimum whose idle timeout passed,
+/// unless new work took it first: a stale timer never stops a busy worker.
 async fn expire_idle(
     core: Arc<PoolCore>,
     token: u64,
     idle_timeout: Duration,
 ) -> Option<WorkerExit> {
     tokio::time::sleep(idle_timeout).await;
-    let entry = {
-        let mut idle = core.idle.lock();
-        let position = idle.iter().position(|entry| entry.token == token)?;
-        idle.swap_remove(position)
-    };
-    let exit = retire(entry.worker).await;
-    drop(entry.slot);
+    let entry = take_parked(&core, token)?;
+    retire_lease(entry.lease).await
+}
+
+/// Watch a parked minimum worker and replace it once if it exits while idle.
+async fn watch_minimum(core: Arc<PoolCore>, token: u64, worker: Worker) -> Option<WorkerExit> {
+    let exit = worker.wait().await.ok();
+    if let Some(entry) = take_parked(&core, token) {
+        drop(entry);
+        if !core.closed.load(Ordering::Acquire) {
+            core.spawn_run(replace_minimum(core.clone()));
+        }
+    }
     exit
 }
 
-/// Terminate a worker and return its exit, or `None` if the Manager is gone
-/// and nothing retained it.
-async fn retire(worker: Worker) -> Option<WorkerExit> {
-    match worker.terminate().await {
+fn take_parked(core: &PoolCore, token: u64) -> Option<IdleWorker> {
+    let mut idle = core.idle.lock();
+    let position = idle.iter().position(|entry| entry.token == token)?;
+    Some(idle.swap_remove(position))
+}
+
+/// Terminate a worker, then release its pool slot. Returns its exit, or
+/// `None` if the Manager is gone and nothing retained it.
+async fn retire_lease(lease: Lease) -> Option<WorkerExit> {
+    let exit = match lease.worker.terminate().await {
         Ok(exit) => Some(exit),
-        Err(_) => worker.wait().await.ok(),
-    }
+        Err(_) => lease.worker.wait().await.ok(),
+    };
+    drop(lease.slot);
+    exit
 }
