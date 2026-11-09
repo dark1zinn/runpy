@@ -81,9 +81,7 @@ jobs:
         run: cargo test --workspace --all-features --locked
 
       - name: Build documentation
-        env:
-          RUSTDOCFLAGS: -D warnings
-        run: cargo doc -p runpy --no-deps --locked
+        run: cargo rustdoc -p runpy --locked -- -D warnings -D missing-docs
 
   integration:
     name: Integration (${{ matrix.os }}, Python ${{ matrix.python }})
@@ -149,7 +147,7 @@ jobs:
       - name: Run tests and doctests
         run: >-
           uv run --frozen --all-packages --python ${{ matrix.python }}
-          pytest worker/tests tests/docs tests/hooks --doctest-modules worker/src/runpyrs
+          pytest worker/tests tests/docs tests/hooks tests/release --doctest-modules worker/src/runpyrs
 
   packages:
     name: Package smoke

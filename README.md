@@ -193,7 +193,7 @@ Run Rust checks:
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --all-features --locked
-RUSTDOCFLAGS="-D warnings" cargo doc -p runpy --no-deps --locked
+cargo rustdoc -p runpy --locked -- -D warnings -D missing-docs
 ```
 
 The Rust tests include end-to-end runs through real `uv` and the local Python
@@ -205,7 +205,7 @@ Run Python checks:
 uv run --frozen ruff format --check worker/src/runpyrs worker/tests tests scripts examples/playground/worker/my_script.py
 uv run --frozen ruff check worker/src/runpyrs worker/tests tests scripts examples/playground/worker/my_script.py
 uv run --frozen mypy
-uv run --frozen --all-packages pytest worker/tests tests/docs tests/hooks --doctest-modules worker/src/runpyrs
+uv run --frozen --all-packages pytest worker/tests tests/docs tests/hooks tests/release --doctest-modules worker/src/runpyrs
 # Against the minimum Python without replacing .venv:
 uv run --frozen --all-packages --isolated --python 3.10 pytest worker/tests
 ```

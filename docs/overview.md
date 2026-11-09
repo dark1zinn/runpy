@@ -778,7 +778,7 @@ Run Rust validation from the repository root:
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --all-features --locked
-RUSTDOCFLAGS="-D warnings" cargo doc -p runpy --no-deps --locked
+cargo rustdoc -p runpy --locked -- -D warnings -D missing-docs
 ```
 
 `cargo test` includes `manager/tests/end_to_end.rs`, which runs real `uv` and
@@ -796,7 +796,7 @@ Run Python validation from the repository root:
 uv run --frozen ruff format --check worker/src/runpyrs worker/tests tests scripts examples/playground/worker/my_script.py
 uv run --frozen ruff check worker/src/runpyrs worker/tests tests scripts examples/playground/worker/my_script.py
 uv run --frozen mypy
-uv run --frozen --all-packages pytest worker/tests tests/docs tests/hooks --doctest-modules worker/src/runpyrs
+uv run --frozen --all-packages pytest worker/tests tests/docs tests/hooks tests/release --doctest-modules worker/src/runpyrs
 # Against the minimum Python without replacing .venv:
 uv run --frozen --all-packages --isolated --python 3.10 pytest worker/tests
 # Build both packages and use them from outside the checkout:
@@ -869,6 +869,43 @@ uv run --frozen pip-audit --disable-pip --require-hashes -r /tmp/req.txt
 Raise the minimum in the manifest when an old version is vulnerable. Suppress
 only when no fixed version exists and the code path is unreachable, with a
 short expiry.
+
+### Releases
+
+Releases are source-only: a GitHub release points at a tag, carries no build
+artifacts, and nothing is published to crates.io or PyPI, so no registry
+tokens exist. Consumers install from the tag (see the
+[installation guide](installation.md)).
+
+| Tag | Kind | Manifest version |
+| --- | --- | --- |
+| `vX.Y.Z` | Release | `X.Y.Z` |
+| `vX.Y.Z-dev`, `vX.Y.Z-dev.N` | Pre-release | `X.Y.Z` (the same base) |
+
+The root `pyproject.toml`, `manager/Cargo.toml`, and `worker/pyproject.toml`
+must all declare `X.Y.Z`; pre-releases share the base version by policy
+instead of encoding `-dev` in the manifests. To release:
+
+1. Set the three manifest versions to `X.Y.Z` (refresh `Cargo.lock` and
+   `uv.lock`), record breaking changes in the [migration guide](migration.md),
+   and merge to `main`.
+2. Tag a commit on `main` and push the tag:
+
+   ```bash
+   git tag v0.2.0-dev.1 <commit-on-main>
+   git push origin v0.2.0-dev.1
+   ```
+
+`release.yml` runs for every `v*` tag. Its `verify` job runs
+`scripts/release-check.py`, which rejects malformed tags, any manifest that
+does not match, and commits not reachable from `origin/main` (the tag need not
+be the tip). The full quality gate then runs on the exact tag commit. Only if
+both succeed does the `release` job, the only one with `contents: write`,
+create the release with generated notes and a link to the migration guide at
+that tag. Rerunning the workflow updates the existing release instead of
+duplicating it. `tests/release` exercises the check against disposable
+repositories and pins the job dependencies that keep a failed gate from
+publishing.
 
 `tests/protocol_vectors.json` holds wire vectors that both languages must
 agree on: frame bodies (Unicode, reserved fields, direction, malformed JSON,
