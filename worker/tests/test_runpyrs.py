@@ -70,6 +70,21 @@ def close_worker(resources) -> None:
         temp.cleanup()
 
 
+def run_in_thread(worker: Worker):
+    """Run the receive loop in a thread, capturing any raised exception."""
+    errors: list[BaseException] = []
+
+    def target():
+        try:
+            worker.run()
+        except BaseException as error:  # noqa: BLE001 - recorded for asserts
+            errors.append(error)
+
+    thread = threading.Thread(target=target)
+    thread.start()
+    return thread, errors
+
+
 def test_envelope_types_describe_the_wire_shape():
     assert get_type_hints(Envelope) == {"meta": Meta, "data": Data}
     assert ExecutePayload is Data
@@ -306,7 +321,8 @@ def test_retry_before_execute_returns_error():
         error = read_envelope(connection)
         assert error["meta"]["x_op"] == "error"
         assert error["data"] == {
-            "message": "Retry requested before an execute operation"
+            "kind": "RuntimeError",
+            "message": "Retry requested before an execute operation",
         }
         send_envelope(
             connection,
@@ -334,7 +350,8 @@ def test_invalid_execute_result_returns_error():
         error = read_envelope(connection)
         assert error["meta"]["x_op"] == "error"
         assert error["data"] == {
-            "message": "Worker.execute must return a dictionary or None"
+            "kind": "TypeError",
+            "message": "Worker.execute must return a dictionary or None",
         }
         send_envelope(
             connection,
@@ -354,16 +371,16 @@ def test_invalid_execute_result_returns_error():
         {"meta": {"x_op": "ready"}, "data": {}},
     ],
 )
-def test_protocol_violation_closes_without_response(invalid):
+def test_protocol_violation_closes_without_response_and_raises(invalid):
     resources = open_worker()
     try:
         _, _, connection, worker, _, _ = resources
-        thread = threading.Thread(target=worker.run)
-        thread.start()
+        thread, errors = run_in_thread(worker)
         send_envelope(connection, invalid)
         thread.join(timeout=1)
         assert not thread.is_alive()
         assert connection.recv(1) == b""
+        assert len(errors) == 1 and isinstance(errors[0], ValueError)
     finally:
         close_worker(resources)
 
@@ -451,12 +468,12 @@ def test_invalid_inbound_length_closes_without_reading_a_body(monkeypatch, size)
     resources = open_worker()
     try:
         _, _, connection, worker, _, _ = resources
-        thread = threading.Thread(target=worker.run)
-        thread.start()
+        thread, errors = run_in_thread(worker)
         connection.sendall(struct.pack("<Q", size))
         thread.join(timeout=1)
         assert not thread.is_alive()
         assert connection.recv(1) == b""
+        assert len(errors) == 1 and isinstance(errors[0], ValueError)
     finally:
         close_worker(resources)
 
@@ -493,11 +510,11 @@ def test_stalled_frame_times_out_after_its_first_byte(monkeypatch, sent):
     resources = open_worker()
     try:
         _, _, connection, worker, _, _ = resources
-        thread = threading.Thread(target=worker.run)
-        thread.start()
+        thread, errors = run_in_thread(worker)
         connection.sendall(_frame(b'{"meta":{},"data":{}}')[:sent])
         thread.join(timeout=2)
         assert not thread.is_alive()
+        assert len(errors) == 1 and isinstance(errors[0], TimeoutError)
     finally:
         close_worker(resources)
 
@@ -640,14 +657,162 @@ def test_inbound_non_finite_number_is_a_protocol_violation():
     resources = open_worker()
     try:
         _, _, connection, worker, _, _ = resources
-        thread = threading.Thread(target=worker.run)
-        thread.start()
+        thread, errors = run_in_thread(worker)
         connection.sendall(_frame(b'{"meta":{},"data":{"v":NaN}}'))
         thread.join(timeout=1)
         assert not thread.is_alive()
         assert connection.recv(1) == b""
+        assert len(errors) == 1 and isinstance(errors[0], ValueError)
     finally:
         close_worker(resources)
+
+
+def test_execution_exceptions_report_type_and_keep_the_worker_alive():
+    class Failing(Worker):
+        def execute(self, data):
+            if data.get("fail") == "empty":
+                raise RuntimeError()
+            if data.get("fail") == "key":
+                raise KeyError("x")
+            return {"ok": True}
+
+        def handle_envelope(self, envelope):
+            raise ConnectionError("application network failure")
+
+    resources = open_worker(Failing)
+    try:
+        _, _, connection, worker, _, _ = resources
+        thread, errors = run_in_thread(worker)
+        send_envelope(
+            connection, {"meta": {"x_op": "execute"}, "data": {"fail": "empty"}}
+        )
+        assert read_envelope(connection)["data"] == {
+            "kind": "RuntimeError",
+            "message": "RuntimeError",
+        }
+        send_envelope(
+            connection, {"meta": {"x_op": "execute"}, "data": {"fail": "key"}}
+        )
+        assert read_envelope(connection)["data"] == {
+            "kind": "KeyError",
+            "message": "'x'",
+        }
+        # An application ConnectionError is not mistaken for a transport fault.
+        send_envelope(connection, {"meta": {}, "data": {}})
+        assert read_envelope(connection)["data"] == {
+            "kind": "ConnectionError",
+            "message": "application network failure",
+        }
+        send_envelope(connection, {"meta": {"x_op": "execute"}, "data": {}})
+        assert read_envelope(connection)["data"] == {"ok": True}
+        send_envelope(connection, {"meta": {"x_op": "terminate"}, "data": {}})
+        thread.join(timeout=1)
+        assert errors == []
+    finally:
+        close_worker(resources)
+
+
+def test_system_exit_from_execute_is_not_converted():
+    class Exiting(Worker):
+        def execute(self, data):
+            raise SystemExit(3)
+
+    resources = open_worker(Exiting)
+    try:
+        _, _, connection, worker, _, _ = resources
+        thread, errors = run_in_thread(worker)
+        send_envelope(connection, {"meta": {"x_op": "execute"}, "data": {}})
+        thread.join(timeout=1)
+        assert len(errors) == 1 and isinstance(errors[0], SystemExit)
+        assert connection.recv(1) == b"", "no error envelope; connection closed"
+    finally:
+        close_worker(resources)
+
+
+_SCRIPT = """
+import os, sys
+from runpyrs import RunScript, Worker
+
+class Echo(Worker):
+    def execute(self, data):
+        return data
+
+if os.environ.get("CLOSE_STDERR"):
+    os.close(2)
+RunScript(Echo)
+"""
+
+
+def _run_script(args, env_extra=None, manager=None):
+    import os
+    import subprocess
+
+    env = dict(os.environ)
+    env.update(env_extra or {})
+    process = subprocess.Popen(
+        [sys.executable, "-c", _SCRIPT, *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+    )
+    if manager is not None:
+        manager()
+    stdout, stderr = process.communicate(timeout=10)
+    return process.returncode, stdout.decode(), stderr.decode()
+
+
+def _serve(path, behaviour):
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(path)
+    listener.listen(1)
+
+    def manager():
+        connection, _ = listener.accept()
+        connection.settimeout(5)
+        try:
+            read_envelope(connection)
+            behaviour(connection)
+        finally:
+            connection.close()
+            listener.close()
+
+    return manager
+
+
+@pytest.mark.parametrize("close_stderr", [False, True])
+def test_runscript_exits_nonzero_on_protocol_violation(close_stderr):
+    with tempfile.TemporaryDirectory() as directory:
+        path = f"{directory}/worker.sock"
+        manager = _serve(path, lambda c: c.sendall(_frame(b"not json")))
+        env = {"CLOSE_STDERR": "1"} if close_stderr else {}
+        code, stdout, stderr = _run_script([path, "worker-1"], env, manager)
+    assert code == 1
+    assert stdout == ""
+    if not close_stderr:
+        assert stderr.startswith("Protocol violation: ValueError")
+
+
+def test_runscript_exits_zero_after_terminate():
+    with tempfile.TemporaryDirectory() as directory:
+        path = f"{directory}/worker.sock"
+        manager = _serve(
+            path,
+            lambda c: send_envelope(c, {"meta": {"x_op": "terminate"}, "data": {}}),
+        )
+        code, stdout, stderr = _run_script([path, "worker-1"], manager=manager)
+    assert (code, stdout, stderr) == (0, "", "")
+
+
+def test_runscript_reports_startup_errors_on_stderr():
+    code, stdout, stderr = _run_script([])
+    assert code == 1
+    assert stdout == ""
+    assert "Socket path and worker ID arguments required" in stderr
+
+    code, stdout, stderr = _run_script(["/nonexistent/worker.sock", "worker-1"])
+    assert code == 1
+    assert stdout == ""
+    assert stderr.startswith("Worker initialization failed: FileNotFoundError")
 
 
 def test_close_is_idempotent_and_context_manager_closes():

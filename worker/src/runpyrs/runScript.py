@@ -22,16 +22,32 @@ def _parse_extra_args(args: list[str]) -> Dict[str, str]:
     return extra
 
 
-def RunScript(worker_class: Type[Worker]):
+def _fail(message: str) -> None:
+    """Write a diagnostic to stderr when possible, then exit with status 1.
+
+    A closed or broken stderr must not hide the failure status, so write
+    errors are ignored.
+    """
+    try:
+        print(message, file=sys.stderr, flush=True)
+    except (OSError, ValueError, AttributeError):
+        pass
+    sys.exit(1)
+
+
+def RunScript(worker_class: Type[Worker]) -> None:
     """Instantiate a :class:`Worker` subclass and run its receive loop.
 
     The Rust Manager supplies the Unix socket path in ``sys.argv[1]`` and the
     required worker identity in ``sys.argv[2]``. Remaining ``--key=value``
     tokens populate :attr:`Worker.extra`.
 
-    ``worker_class`` must inherit :class:`Worker`. Missing arguments, an
-    invalid class, connection failure, or another initialization exception
-    prints a diagnostic and exits with status 1.
+    Returns normally (exit status 0) after ``terminate`` or when the Manager
+    closes the connection. Missing arguments, a class that does not inherit
+    :class:`Worker`, a construction or connection failure, a protocol
+    violation, or a socket failure writes one diagnostic to stderr and exits
+    with status 1. ``SystemExit`` and ``KeyboardInterrupt`` raised by worker
+    code propagate unchanged.
 
     Example:
         .. code-block:: python
@@ -45,24 +61,23 @@ def RunScript(worker_class: Type[Worker]):
             if __name__ == "__main__":
                 RunScript(MyWorker)
     """
+    if len(sys.argv) < 3:
+        _fail("Error: Socket path and worker ID arguments required")
+
+    socket_path = sys.argv[1]
+    worker_name = sys.argv[2]
+    extra_args = _parse_extra_args(sys.argv[3:])
+
+    if not isinstance(worker_class, type) or not issubclass(worker_class, Worker):
+        name = getattr(worker_class, "__name__", repr(worker_class))
+        _fail(f"Configuration error: {name} must inherit from Worker")
+
     try:
-        if len(sys.argv) < 3:
-            print("Error: Socket path and worker ID arguments required")
-            sys.exit(1)
-
-        socket_path = sys.argv[1]
-        worker_name = sys.argv[2]
-        extra_args = _parse_extra_args(sys.argv[3:]) if len(sys.argv) > 3 else {}
-
-        if not issubclass(worker_class, Worker):
-            raise TypeError(f"{worker_class.__name__} must inherit from Worker")
-
         worker = worker_class(socket_path, worker_name, extra_args)
-        worker.run()
+    except Exception as error:
+        _fail(f"Worker initialization failed: {type(error).__name__}: {error}")
 
-    except TypeError as e:
-        print(f"Configuration error: {e}")
-        sys.exit(1)
-    except Exception as e:
-        print(f"Worker initialization failed: {e}")
-        sys.exit(1)
+    try:
+        worker.run()
+    except Exception as error:
+        _fail(f"Protocol violation: {type(error).__name__}: {error}")

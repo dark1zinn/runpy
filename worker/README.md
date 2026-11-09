@@ -63,8 +63,10 @@ arguments. Additional `--key=value` arguments become `Worker.extra`.
 
 - `execute(data)` handles `execute`; return a dictionary for `done.data` or
   `None` for an empty result.
-- An exception or non-dictionary result becomes an `error` envelope. It does
-  not automatically terminate the worker.
+- An exception, non-dictionary result, or unencodable result becomes an
+  `error` envelope with `{"kind": "<exception type>", "message": "<text>"}`.
+  It does not terminate the worker. `SystemExit` and `KeyboardInterrupt` are
+  not converted and end the worker.
 - `retry` reuses the same mutable payload stored by `Worker._dispatch` and
   passed to `Worker._complete_execution`. Mutations made by `execute` remain
   present on retry; copy inputs before mutating them. Retry before execute
@@ -72,8 +74,10 @@ arguments. Additional `--key=value` arguments become `Worker.extra`.
 - `handle_envelope(envelope)` receives application messages without `x_op`.
 - `send(data, meta=...)` sends an application envelope.
 - `log(data, level=..., meta=...)` sends a structured `log` envelope.
-- `run()` closes the connection on malformed frames, invalid reserved
-  metadata, or a wrong-direction operation.
+- `run()` raises on malformed frames, invalid reserved metadata, or a
+  wrong-direction operation (`ValueError`), and on socket failures
+  (`OSError`). `RunScript` turns those into one stderr diagnostic and exit
+  status 1; `terminate` or a Manager close exits with status 0.
 - `send` and `log` are thread-safe: a lock writes each frame atomically, so
   background threads can report progress while `execute` runs. Hooks such as
   `execute` and `handle_envelope` still run one at a time on the receive-loop

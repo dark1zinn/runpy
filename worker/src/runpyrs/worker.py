@@ -50,8 +50,6 @@ class Worker:
                 RunScript(Parser)
     """
 
-    _INTERNAL_OPS = _MANAGER_OPERATIONS
-
     def __init__(
         self,
         sock: str,
@@ -286,30 +284,48 @@ class Worker:
 
         return {"meta": dict(meta), "data": dict(data)}
 
+    def _send_error(self, kind: str, message: str) -> None:
+        """Send a structured ``error`` envelope with ``kind`` and ``message``."""
+        self._send_operation("error", {"kind": kind, "message": message})
+
+    def _send_exception(self, error: BaseException) -> None:
+        """Report an application exception without losing its type.
+
+        An exception with an empty message reports its type name as message.
+        """
+        kind = type(error).__name__
+        self._send_error(kind, str(error) or kind)
+
     def _complete_execution(self, *, retry: bool = False) -> None:
         """Run the current execute payload and emit ``done`` or ``error``.
 
-        Retry reuses the last payload. A retry before execute and an invalid
-        result type produce explicit ``error`` messages.
+        Retry reuses the last payload. A retry before execute, an exception,
+        an invalid result type, and a result that cannot be encoded produce
+        structured ``error`` envelopes. ``SystemExit``, ``KeyboardInterrupt``,
+        and other non-``Exception`` signals are not converted; they propagate
+        and end the worker. A socket failure while sending propagates too.
         """
         if self.__exec_payload is None:
-            self._send_operation(
-                "error", {"message": "Retry requested before an execute operation"}
+            self._send_error(
+                "RuntimeError", "Retry requested before an execute operation"
             )
             return
 
         try:
             result = self.execute(self.__exec_payload)
-            if result is not None and not isinstance(result, dict):
-                self._send_operation(
-                    "error",
-                    {"message": "Worker.execute must return a dictionary or None"},
-                )
-                return
-            self._send_operation("done", result or {})
         except Exception as error:
-            prefix = "Retry execution error" if retry else "Execution error"
-            self._send_operation("error", {"message": f"{prefix}: {error}"})
+            self._send_exception(error)
+            return
+        if result is not None and not isinstance(result, dict):
+            self._send_error(
+                "TypeError", "Worker.execute must return a dictionary or None"
+            )
+            return
+        try:
+            self._send_operation("done", result or {})
+        except (TypeError, ValueError) as error:
+            # Encoding failed before any byte was written.
+            self._send_exception(error)
 
     def _dispatch(self, envelope: Envelope) -> None:
         """Dispatch one validated envelope to lifecycle or developer hooks."""
@@ -330,28 +346,33 @@ class Worker:
         try:
             self.handle_envelope(envelope)
         except Exception as error:
-            self._send_operation(
-                "error", {"message": f"Envelope handler error: {error}"}
-            )
+            self._send_exception(error)
 
     def run(self) -> None:
-        """Receive and dispatch envelopes until termination or protocol failure.
+        """Receive and dispatch envelopes until termination or failure.
 
-        ``terminate`` closes normally. A malformed frame or handler-level
-        protocol failure prints one diagnostic and ends the loop. The
-        connection is always closed when the loop returns.
+        Returns normally after ``terminate``, after the Manager closes the
+        connection, or after :meth:`close` from another thread. A malformed
+        frame, invalid envelope, stalled frame, or socket failure raises the
+        underlying exception. The connection is always closed first.
+
+        Raises:
+            ValueError: For protocol violations such as invalid JSON, an
+                oversized frame, or a wrong-direction operation.
+            OSError: For socket failures, including a stalled frame
+                (``TimeoutError``) or a lost connection.
         """
 
         try:
             while self.__ok:
                 try:
                     envelope = self._recv_envelope()
-                    if envelope is None:
-                        break
-                    self._dispatch(envelope)
-                except Exception as error:
-                    if self.__ok:
-                        print(f"Protocol violation: {error}")
-                    break
+                except OSError:
+                    if not self.__ok:
+                        return
+                    raise
+                if envelope is None:
+                    return
+                self._dispatch(envelope)
         finally:
             self.close()

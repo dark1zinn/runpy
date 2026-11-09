@@ -188,10 +188,14 @@ risking a corrupted stream; it never resends a frame.
 ### 6. Execute Python business logic
 
 An `execute` envelope stores its `data` and calls `Worker.execute`. A dictionary
-result becomes `done.data`; `None` becomes an empty object. Any exception, or a
-non-dictionary result, becomes an `error` envelope. The worker continues its
-receive loop after sending the error. `retry` repeats the most recent execute
-payload; retry before execute returns an error envelope.
+result becomes `done.data`; `None` becomes an empty object. An `Exception`, a
+non-dictionary result, or a result that cannot be encoded becomes an `error`
+envelope whose data is `{"kind": "<exception type>", "message": "<text>"}`;
+an exception with an empty message reports its type name as the message. The
+worker continues its receive loop after sending the error. `SystemExit`,
+`KeyboardInterrupt`, and other non-`Exception` signals are not converted: they
+end the worker. `retry` repeats the most recent execute payload; retry before
+execute returns an error envelope.
 
 A message without `x_op` is passed once to `Worker.handle_envelope`. The method
 can reply with `Worker.send` or emit a structured `Worker.log` envelope.
@@ -301,7 +305,7 @@ are protocol errors.
 | `retry` | Rust → Python | Repeats the last execute payload. |
 | `terminate` | Rust → Python | Stops the Python receive loop and closes its socket. |
 | `done` | Python → Rust | Carries the direct dictionary execution result. |
-| `error` | Python → Rust | Carries a `data.message` execution or dispatch failure. |
+| `error` | Python → Rust | Carries `data.kind` (exception type) and `data.message` for an execution or dispatch failure. |
 | `log` | Python → Rust | Carries developer-selected structured log data. |
 
 A known operation sent in the wrong direction is a protocol violation: the
@@ -373,9 +377,14 @@ if __name__ == "__main__":
 
 `RunScript` requires a `Worker` subclass. It reads the socket and trusted worker
 ID from `sys.argv[1]` and `sys.argv[2]`. Later arguments matching
-`--key=value` populate `Worker.extra`; other arguments are ignored. Missing
-required arguments, an invalid class, or initialization failure prints a
-configuration message and exits with status 1.
+`--key=value` populate `Worker.extra`; other arguments are ignored.
+
+`RunScript` returns normally (exit status 0) after `terminate` or when the
+Manager closes the connection. Missing required arguments, an invalid class,
+a construction or connection failure, a protocol violation, or a socket
+failure writes one diagnostic to stderr and exits with status 1, so Rust
+captures it at warning level. A closed stderr does not change the status.
+`SystemExit` and `KeyboardInterrupt` from worker code propagate unchanged.
 
 ### Worker hooks
 
@@ -386,8 +395,10 @@ reject application metadata in the `x_` namespace.
 
 `run()` owns the receive loop. Malformed frames, invalid JSON, non-finite
 numbers, invalid reserved metadata, and wrong-direction operations are protocol
-violations: Python prints a diagnostic and ends the loop. `run()` always closes
-the connection when it returns.
+violations: `run()` raises `ValueError` (a stalled frame raises
+`TimeoutError`, a socket failure `OSError`). It returns normally after
+`terminate`, a Manager close, or `close()` from another thread, and always
+closes the connection first.
 
 `send` and `log` may be called from any thread: a lock writes each frame
 atomically. Results and messages are encoded before any byte is written, so a
