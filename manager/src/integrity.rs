@@ -1,131 +1,171 @@
-use std::collections::HashSet;
 use std::io::ErrorKind;
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::Duration;
 
-use crate::error::RunpyError;
-use crate::scribbler::Scribbler;
+use crate::error::{InvalidScriptReason, RunpyError};
 
-/// Private runtime validator shared by Manager and worker facades.
+/// Private runtime validator shared by the Manager and worker builders.
 ///
-/// It retains configured paths and a diagnostic index; Worker::spawn validates
-/// script names before selecting a file.
-pub struct IntegrityChecker {
+/// Every check runs without blocking an async runtime thread: `uv` is run
+/// through Tokio's process API under a deadline, and filesystem checks run on
+/// the blocking pool. Nothing is cached, so a script added or removed after
+/// the Manager was built is seen by the next spawn.
+pub(crate) struct IntegrityChecker {
     /// Configured `uv` executable or command name.
     pub uv_path: PathBuf,
     /// Directory containing managed worker scripts.
     pub scripts_dir: PathBuf,
-    /// Recursively indexed non-dunder Python file stems.
-    pub registry: Mutex<HashSet<String>>,
-    logger: Arc<Scribbler>,
+    /// Deadline for `uv --version`.
+    pub startup_timeout: Duration,
 }
 
 impl IntegrityChecker {
-    pub fn new(scripts: PathBuf, uv_path: PathBuf, logger: Arc<Scribbler>) -> Self {
+    pub fn new(scripts: PathBuf, uv_path: PathBuf, startup_timeout: Duration) -> Self {
         Self {
             uv_path,
             scripts_dir: scripts,
-            registry: Mutex::new(HashSet::new()),
-            logger,
+            startup_timeout,
         }
     }
 
-    /// Validate that uv executes successfully, verify the scripts directory,
-    /// and refresh the diagnostic script index.
+    /// Check that `uv --version` succeeds and the scripts path is a directory.
     ///
-    /// The uv check requires only a successful `--version` exit; it does not
-    /// parse or enforce a semantic version.
-    pub fn perform_check(&self) -> Result<(), RunpyError> {
-        self.validate_uv()?;
-
-        match std::fs::metadata(&self.scripts_dir) {
-            Ok(metadata) if metadata.is_dir() => {}
-            Ok(_) => {
-                return Err(RunpyError::ScriptsDirectory {
-                    path: self.scripts_dir.clone(),
-                    source: std::io::Error::new(ErrorKind::NotADirectory, "not a directory"),
-                });
-            }
-            Err(source) => {
-                return Err(RunpyError::ScriptsDirectory {
-                    path: self.scripts_dir.clone(),
-                    source,
-                });
-            }
-        }
-
-        // Index Scripts
-        self.index_scripts();
-
-        Ok(())
+    /// The uv check requires only a successful exit; it does not parse or
+    /// enforce a semantic version. A `uv` that does not exit within the
+    /// startup timeout is killed and reaped.
+    pub async fn check(&self) -> Result<(), RunpyError> {
+        self.validate_uv().await?;
+        self.validate_scripts_dir().await
     }
 
-    /// Check if a specific script exists in the registry. Re-indexes first.
-    #[allow(dead_code)]
-    pub fn check_script(&self, script: &str) -> bool {
-        self.index_scripts();
-        let scripts = self.registry.lock().unwrap();
-        scripts.contains(script)
-    }
-
-    fn validate_uv(&self) -> Result<(), RunpyError> {
+    async fn validate_uv(&self) -> Result<(), RunpyError> {
         let unavailable = |detail: String| RunpyError::UvUnavailable {
             path: self.uv_path.clone(),
             detail,
         };
-        match Command::new(&self.uv_path)
+        let mut child = match tokio::process::Command::new(&self.uv_path)
             .arg("--version")
+            .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .status()
+            // Cancelling the check (dropping its future) kills `uv`.
+            .kill_on_drop(true)
+            .spawn()
         {
-            Ok(status) if status.success() => Ok(()),
-            Ok(status) => Err(unavailable(format!(
+            Ok(child) => child,
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                return Err(unavailable("executable not found".to_string()));
+            }
+            Err(error) => return Err(unavailable(format!("failed to execute: {error}"))),
+        };
+
+        match tokio::time::timeout(self.startup_timeout, child.wait()).await {
+            Ok(Ok(status)) if status.success() => Ok(()),
+            Ok(Ok(status)) => Err(unavailable(format!(
                 "`--version` returned non-zero status: {status}"
             ))),
-            Err(error) if error.kind() == ErrorKind::NotFound => {
-                Err(unavailable("executable not found".to_string()))
-            }
-            Err(error) => Err(unavailable(format!("failed to execute: {error}"))),
-        }
-    }
-
-    /// Refresh the recursive script-stem index used for diagnostics.
-    ///
-    /// This index is diagnostic and does not authorize script selection.
-    fn index_scripts(&self) {
-        let mut scripts = self.registry.lock().unwrap();
-        scripts.clear();
-
-        self.walk_dir(&self.scripts_dir, &mut scripts);
-
-        self.logger.debug_with(
-            "Integrity",
-            &format!("Indexed {} scripts: {:?}", scripts.len(), scripts),
-        );
-    }
-
-    /// Add readable `.py` stems recursively, excluding dunder files.
-    ///
-    /// Unreadable entries and non-UTF-8 stems are skipped so diagnostics cannot
-    /// make otherwise valid manager construction fail.
-    fn walk_dir(&self, dir: &PathBuf, scripts: &mut HashSet<String>) {
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    self.walk_dir(&path, scripts);
-                } else if path.extension().and_then(|s| s.to_str()) == Some("py") {
-                    let Some(name) = path.file_stem().and_then(|s| s.to_str()) else {
-                        continue;
-                    };
-                    // Skip __init__.py and other dunder files
-                    if !name.starts_with("__") {
-                        scripts.insert(name.to_string());
-                    }
-                }
+            Ok(Err(error)) => Err(unavailable(format!("failed to wait: {error}"))),
+            Err(_) => {
+                // `kill` also waits, so the process is reaped before returning.
+                let _ = child.kill().await;
+                Err(unavailable(format!(
+                    "`--version` did not exit within {:?}",
+                    self.startup_timeout
+                )))
             }
         }
     }
+
+    async fn validate_scripts_dir(&self) -> Result<(), RunpyError> {
+        let error = |source| RunpyError::ScriptsDirectory {
+            path: self.scripts_dir.clone(),
+            source,
+        };
+        match tokio::fs::metadata(&self.scripts_dir).await {
+            Ok(metadata) if metadata.is_dir() => Ok(()),
+            Ok(_) => Err(error(std::io::Error::new(
+                ErrorKind::NotADirectory,
+                "not a directory",
+            ))),
+            Err(source) => Err(error(source)),
+        }
+    }
+
+    /// Resolve `<scripts>/<script>.py` and its canonical scripts directory.
+    ///
+    /// `script` must already be a single path component. Symlinked scripts are
+    /// followed: the scripts directory is trusted.
+    pub async fn resolve_script(&self, script: &str) -> Result<ResolvedScript, RunpyError> {
+        let scripts_dir = self.scripts_dir.clone();
+        let script = script.to_string();
+        blocking(move || {
+            let scripts_dir =
+                scripts_dir
+                    .canonicalize()
+                    .map_err(|source| RunpyError::ScriptsDirectory {
+                        path: scripts_dir.clone(),
+                        source,
+                    })?;
+            let script_file = scripts_dir.join(format!("{script}.py"));
+            if !script_file.is_file() {
+                return Err(RunpyError::InvalidScript {
+                    script,
+                    reason: InvalidScriptReason::NotFound(script_file),
+                });
+            }
+            let lock_file = script_file.with_extension("py.lock");
+            let locked = lock_file.is_file();
+            Ok(ResolvedScript {
+                scripts_dir,
+                script_file,
+                locked,
+            })
+        })
+        .await
+    }
+
+    /// Absolute path for a relative multi-component `uv` path; a bare command
+    /// name such as `uv` is left for the operating system to resolve.
+    pub async fn resolve_uv(&self) -> Result<PathBuf, RunpyError> {
+        let uv_path = self.uv_path.clone();
+        if uv_path.is_absolute() || uv_path.components().count() == 1 {
+            return Ok(uv_path);
+        }
+        blocking(move || {
+            uv_path
+                .canonicalize()
+                .map_err(|error| RunpyError::UvUnavailable {
+                    path: uv_path.clone(),
+                    detail: format!("cannot resolve path: {error}"),
+                })
+        })
+        .await
+    }
+}
+
+/// A launchable script located inside the scripts directory.
+pub(crate) struct ResolvedScript {
+    pub scripts_dir: PathBuf,
+    pub script_file: PathBuf,
+    /// Whether an adjacent `<script>.py.lock` exists.
+    pub locked: bool,
+}
+
+impl ResolvedScript {
+    /// Parent of the scripts directory, the default working directory.
+    pub fn root(&self) -> Option<&Path> {
+        self.scripts_dir.parent()
+    }
+}
+
+/// Run blocking filesystem work on Tokio's blocking pool.
+async fn blocking<T, F>(work: F) -> Result<T, RunpyError>
+where
+    F: FnOnce() -> Result<T, RunpyError> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|error| RunpyError::Io(std::io::Error::other(error)))?
 }

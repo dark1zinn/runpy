@@ -267,6 +267,121 @@ async fn build_reports_uv_and_scripts_directory_failures_distinctly() {
     ));
 }
 
+/// A fake uv whose `--version` records its pid and then runs `version_tail`.
+fn slow_version_uv(tmp: &TempDir, pid_file: &Path, version_tail: &str) -> PathBuf {
+    write_executable(
+        tmp,
+        "uv",
+        &format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo $$ > '{}'\n  {version_tail}\nfi\nexec sleep 300\n",
+            pid_file.display()
+        ),
+    )
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn uv_check_does_not_block_a_single_threaded_runtime() {
+    let tmp = TempDir::new().unwrap();
+    let uv = slow_version_uv(&tmp, &tmp.path().join("pid"), "sleep 0.5; exit 0");
+    let scripts = scripts_dir(&tmp, &[]);
+    let ticks = std::rc::Rc::new(std::cell::Cell::new(0_u32));
+    let ticker = {
+        let ticks = ticks.clone();
+        async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                ticks.set(ticks.get() + 1);
+            }
+        }
+    };
+
+    let manager = tokio::select! {
+        manager = Manager::builder(&scripts).uv_path(&uv).build() => manager.unwrap(),
+        _ = ticker => unreachable!(),
+    };
+    assert!(
+        ticks.get() >= 20,
+        "the runtime stalled during the uv check ({} ticks)",
+        ticks.get()
+    );
+    drop(manager);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn hung_uv_is_killed_at_the_startup_timeout_and_on_cancellation() {
+    let tmp = TempDir::new().unwrap();
+    let pid_file = tmp.path().join("pid");
+    let uv = slow_version_uv(&tmp, &pid_file, "exec sleep 300");
+    let scripts = scripts_dir(&tmp, &[]);
+
+    let started = Instant::now();
+    let result = Manager::builder(&scripts)
+        .uv_path(&uv)
+        .startup_timeout(Duration::from_millis(300))
+        .build()
+        .await;
+    assert!(matches!(result, Err(RunpyError::UvUnavailable { .. })));
+    assert!(started.elapsed() < Duration::from_secs(3));
+    let pid: u32 = fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(
+        process_is_stopped(pid),
+        "timed-out uv must be killed and reaped"
+    );
+
+    fs::remove_file(&pid_file).unwrap();
+    let cancelled = tokio::time::timeout(
+        Duration::from_millis(300),
+        Manager::builder(&scripts).uv_path(&uv).build(),
+    )
+    .await;
+    assert!(cancelled.is_err());
+    wait_for_file(&pid_file).await;
+    let pid: u32 = fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !process_is_stopped(pid) {
+        assert!(
+            Instant::now() < deadline,
+            "cancelled uv check leaked a process"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn scripts_are_resolved_per_spawn_without_walking_the_directory() {
+    let tmp = TempDir::new().unwrap();
+    let uv = recording_uv(&tmp, "exec sleep 300");
+    let scripts = scripts_dir(&tmp, &["present"]);
+    // A symlink cycle would never finish a recursive walk.
+    std::os::unix::fs::symlink(&scripts, scripts.join("loop")).unwrap();
+
+    let manager = tokio::time::timeout(Duration::from_secs(2), manager_with_uv(&scripts, &uv))
+        .await
+        .expect("build must not traverse the scripts directory");
+
+    fs::write(scripts.join("added.py"), "# stub").unwrap();
+    manager.worker("added").spawn().await.unwrap();
+
+    fs::remove_file(scripts.join("present.py")).unwrap();
+    assert!(matches!(
+        manager.worker("present").spawn().await,
+        Err(RunpyError::InvalidScript {
+            reason: InvalidScriptReason::NotFound(_),
+            ..
+        })
+    ));
+}
+
 #[tokio::test]
 async fn worker_handles_stop_working_after_manager_drop() {
     let tmp = TempDir::new().unwrap();

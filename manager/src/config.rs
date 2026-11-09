@@ -23,6 +23,8 @@ pub const DEFAULT_QUEUED_BYTES: usize = 16 * 1024 * 1024;
 pub const DEFAULT_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 /// Default time a worker gets to exit after termination starts.
 pub const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+/// Default deadline for starting up, including the `uv --version` check.
+pub const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Bounds on outbound memory and time shared by every worker route.
 #[derive(Clone, Copy, Debug)]

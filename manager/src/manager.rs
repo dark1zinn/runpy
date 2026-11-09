@@ -197,17 +197,19 @@ impl WorkerBuilder {
     /// Launch the configured script and register it with the Manager.
     ///
     /// The script name must be a single path component naming a root-level
-    /// `<script>.py`. Runpy creates a unique socket and launches
-    /// `uv run --no-project [--locked] --script`. Registration owns the child
-    /// process group, protocol session, and output readers; failures after
-    /// the process starts kill and reap its group and remove the socket.
+    /// `<script>.py`, checked on every spawn so scripts added or removed after
+    /// the Manager was built are seen. Runpy creates a unique socket and
+    /// launches `uv run --no-project [--locked] --script`. Registration owns
+    /// the child process group, protocol session, and output readers;
+    /// failures after the process starts kill and reap its group and remove
+    /// the socket. Filesystem checks run off the async runtime threads.
     ///
     /// # Errors
     ///
     /// [`RunpyError::ManagerClosed`] after Manager drop or during shutdown,
     /// [`RunpyError::InvalidScript`] for a bad or missing script,
     /// [`RunpyError::ScriptsDirectory`] or [`RunpyError::UvUnavailable`] when
-    /// the runtime check fails, and [`RunpyError::Io`] when the socket,
+    /// a path cannot be resolved, and [`RunpyError::Io`] when the socket,
     /// process, or pipes cannot be set up.
     pub async fn spawn(self) -> Result<Worker, RunpyError> {
         let script_name = Path::new(&self.script);
@@ -219,40 +221,15 @@ impl WorkerBuilder {
         }
 
         let integrity = self.integrity.upgrade().ok_or(RunpyError::ManagerClosed)?;
+        let resolved = integrity.resolve_script(&self.script).await?;
+        let uv_path = integrity.resolve_uv().await?;
         let control_plane = self
             .control_plane
             .upgrade()
             .ok_or(RunpyError::ManagerClosed)?;
 
-        integrity.perform_check()?;
-        let scripts_dir = integrity.scripts_dir.canonicalize().map_err(|source| {
-            RunpyError::ScriptsDirectory {
-                path: integrity.scripts_dir.clone(),
-                source,
-            }
-        })?;
-        let script_file = scripts_dir.join(format!("{}.py", self.script));
-        if !script_file.is_file() {
-            return Err(RunpyError::InvalidScript {
-                script: self.script,
-                reason: InvalidScriptReason::NotFound(script_file),
-            });
-        }
-
-        let uv_path =
-            if integrity.uv_path.is_absolute() || integrity.uv_path.components().count() == 1 {
-                integrity.uv_path.clone()
-            } else {
-                integrity
-                    .uv_path
-                    .canonicalize()
-                    .map_err(|error| RunpyError::UvUnavailable {
-                        path: integrity.uv_path.clone(),
-                        detail: format!("cannot resolve path: {error}"),
-                    })?
-            };
-        let lock_file = script_file.with_extension("py.lock");
-
+        // No await between binding the socket and registering the child, so
+        // cancelling `spawn` can never leak a socket or an unowned process.
         let (identity, sock_path, listener) =
             bind_unique(&self.socket_dir, || WorkerIdentity::new(&self.script))?;
         let worker_id = identity.name.clone();
@@ -272,19 +249,19 @@ impl WorkerBuilder {
         // synchronously while Tokio adapts only the detached output pipes.
         let mut cmd = std::process::Command::new(&uv_path);
         cmd.arg("run").arg("--no-project");
-        if lock_file.is_file() {
+        if resolved.locked {
             cmd.arg("--locked");
         }
         cmd.arg("--script")
-            .arg(&script_file)
+            .arg(&resolved.script_file)
             .arg(&sock_path)
             .arg(&identity.name);
         for (key, value) in &self.extra_args {
             cmd.arg(format!("--{key}={value}"));
         }
-        if let Some(parent) = scripts_dir.parent() {
-            cmd.current_dir(parent);
-            cmd.env("PYTHONPATH", parent);
+        if let Some(root) = resolved.root() {
+            cmd.current_dir(root);
+            cmd.env("PYTHONPATH", root);
         }
         if let Some(cwd) = &self.cwd {
             cmd.current_dir(cwd);

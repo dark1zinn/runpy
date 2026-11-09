@@ -121,7 +121,7 @@ use crate::protocol::ControlPlane;
 // ── Public re-exports ──────────────────────────────────────────────────
 pub use config::{
     DEFAULT_FRAME_TIMEOUT, DEFAULT_MAX_FRAME_BYTES, DEFAULT_OUTBOUND_CAPACITY,
-    DEFAULT_QUEUED_BYTES, DEFAULT_SEND_TIMEOUT, DEFAULT_SHUTDOWN_GRACE,
+    DEFAULT_QUEUED_BYTES, DEFAULT_SEND_TIMEOUT, DEFAULT_SHUTDOWN_GRACE, DEFAULT_STARTUP_TIMEOUT,
 };
 pub use error::{InvalidScriptReason, RunpyError, TimeoutStage};
 pub use manager::{StdinMode, Worker, WorkerBuilder, WorkerIdentity};
@@ -162,6 +162,7 @@ pub struct ManagerBuilder {
     socket_parent: Option<PathBuf>,
     max_frame_bytes: usize,
     frame_timeout: Duration,
+    startup_timeout: Duration,
     queue: QueueLimits,
 }
 
@@ -184,6 +185,14 @@ impl ManagerBuilder {
     /// limited to about 100 bytes.
     pub fn socket_parent(mut self, dir: impl Into<PathBuf>) -> Self {
         self.socket_parent = Some(dir.into());
+        self
+    }
+
+    /// Deadline for starting up: the `uv --version` check; default
+    /// [`DEFAULT_STARTUP_TIMEOUT`] (30 seconds). A `uv` that does not exit in
+    /// time is killed and reported as [`RunpyError::UvUnavailable`].
+    pub fn startup_timeout(mut self, timeout: Duration) -> Self {
+        self.startup_timeout = timeout;
         self
     }
 
@@ -248,6 +257,7 @@ impl ManagerBuilder {
         for (name, value) in [
             ("send_timeout", queue.send_timeout),
             ("shutdown_grace", queue.shutdown_grace),
+            ("startup_timeout", self.startup_timeout),
         ] {
             if value.is_zero() {
                 return Err(RunpyError::InvalidConfig(format!(
@@ -281,9 +291,9 @@ impl ManagerBuilder {
         let integrity = Arc::new(IntegrityChecker::new(
             self.scripts,
             self.uv_path,
-            logger.clone(),
+            self.startup_timeout,
         ));
-        integrity.perform_check()?;
+        integrity.check().await?;
         let socket_dir = create_socket_dir(self.socket_parent.as_deref())?;
 
         let control_plane = ControlPlane::new(logger.clone(), limits, self.queue);
@@ -384,6 +394,7 @@ impl Manager {
             socket_parent: None,
             max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
             frame_timeout: DEFAULT_FRAME_TIMEOUT,
+            startup_timeout: DEFAULT_STARTUP_TIMEOUT,
             queue: QueueLimits::default(),
         }
     }
@@ -475,7 +486,7 @@ impl Manager {
 
     /// Re-run the `uv` and scripts-directory checks performed by `build`.
     pub async fn check_integrity(&self) -> Result<(), RunpyError> {
-        self.integrity.perform_check()
+        self.integrity.check().await
     }
 
     /// Send one envelope to every currently registered worker.

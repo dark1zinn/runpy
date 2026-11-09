@@ -59,11 +59,15 @@ dropped they return `RunpyError::ManagerClosed`.
 
 ### IntegrityChecker
 
-The private `IntegrityChecker` executes the configured `uv --version`,
-verifies the scripts directory, and recursively indexes Python file stems for
-diagnostics. `WorkerBuilder::spawn` performs the checks again, requires the
-supplied name to be a single path component, and resolves it as
-`<scripts-directory>/<name>.py`.
+The private `IntegrityChecker` runs `uv --version` under the startup timeout
+(a hung `uv` is killed and reaped, and cancelling `build` kills it too) and
+verifies that the scripts path is a directory. `build` and
+`Manager::check_integrity` run these checks; spawns do not repeat the `uv`
+check. Each `WorkerBuilder::spawn` requires the supplied name to be a single
+path component and resolves `<scripts-directory>/<name>.py` afresh, so scripts
+added or removed after `build` are seen; nothing is indexed or cached.
+Filesystem checks run on Tokio's blocking pool, so no check stalls a runtime
+thread. Symlinked scripts are followed: the scripts directory is trusted.
 
 ### Socket directory and identities
 
@@ -138,6 +142,7 @@ the runtime checks later. The Watchdog monitor starts during `build`.
 | `outbound_capacity` | 64 | Admitted frames per worker awaiting the writer. |
 | `queued_bytes` | 16 MiB | Manager-wide encoded bytes awaiting a write; must hold one maximum frame. |
 | `send_timeout` | 5 s | Deadline for outbound admission plus the write. |
+| `startup_timeout` | 30 s | Deadline for the `uv --version` check. |
 | `shutdown_grace` | 2 s | Time a worker gets to exit after termination starts. |
 
 ### 2. Configure a WorkerBuilder
