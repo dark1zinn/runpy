@@ -62,13 +62,15 @@ async fn reports_aggregate_memory_and_cpu_of_the_whole_group() {
         .unwrap();
     let worker = manager.worker("hog").spawn().await.unwrap();
 
+    // Poll until a window shows the busy loop: the first complete window may
+    // still cover the descendant's startup.
     let report = report_until(&manager, worker.id(), |report| {
-        report.cpu_percent.is_some() && report.memory_bytes.unwrap_or(0) >= 64 * MIB
+        report.cpu_percent.is_some_and(|cpu| cpu > 30.0)
+            && report.memory_bytes.unwrap_or(0) >= 64 * MIB
     })
     .await;
     assert_eq!(report.state, ProcessState::Running);
     assert!(report.process_count.unwrap() >= 2, "{report:?}");
-    assert!(report.cpu_percent.unwrap() > 30.0, "{report:?}");
     assert!(report.sampled_at.is_some());
     worker.terminate().await.unwrap();
 }

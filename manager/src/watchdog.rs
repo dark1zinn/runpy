@@ -130,32 +130,38 @@ impl Sampler {
             sample.process_count += 1;
             sample.stopped &= is_stopped(*pid, process);
         }
-        // CPU comes from each member's accumulated CPU time across two
-        // samples, not sysinfo's `cpu_usage`, which stays 0 for a process
-        // whose first sample had not yet used a full clock tick. A group gets
-        // a figure only when every current member was also sampled last time.
-        let elapsed = self
-            .previous_at
-            .map(|at| now.duration_since(at).as_secs_f32())
-            .filter(|seconds| *seconds > 0.0);
+        let elapsed = self.previous_at.map(|at| now.duration_since(at));
         for (group, sample) in &mut samples {
-            let (Some(elapsed), Some(previous)) = (elapsed, self.previous.get(group)) else {
-                continue;
-            };
-            let current = &members[group];
-            if current.keys().all(|pid| previous.contains_key(pid)) {
-                let used_ms: u64 = current
-                    .iter()
-                    .map(|(pid, total)| total.saturating_sub(previous[pid]))
-                    .sum();
-                // CPU-milliseconds per second of wall time, as a percentage.
-                sample.cpu_percent = Some(used_ms as f32 / (elapsed * 10.0));
-            }
+            sample.cpu_percent = elapsed.and_then(|elapsed| {
+                group_cpu_percent(&members[group], self.previous.get(group)?, elapsed)
+            });
         }
         self.previous = members;
         self.previous_at = Some(now);
         samples
     }
+}
+
+/// CPU use of a group between two samples, in percent of one core.
+///
+/// Computed from each member's accumulated CPU milliseconds rather than
+/// sysinfo's `cpu_usage`, which stays 0 for a process whose first sample had
+/// not yet used a full clock tick. `None` unless every current member was
+/// also in the previous sample and some wall time passed.
+fn group_cpu_percent(
+    current: &HashMap<Pid, u64>,
+    previous: &HashMap<Pid, u64>,
+    elapsed: std::time::Duration,
+) -> Option<f32> {
+    if elapsed.is_zero() || !current.keys().all(|pid| previous.contains_key(pid)) {
+        return None;
+    }
+    let used_ms: u64 = current
+        .iter()
+        .map(|(pid, total)| total.saturating_sub(previous[pid]))
+        .sum();
+    // CPU-milliseconds per second of wall time, as a percentage.
+    Some(used_ms as f32 / (elapsed.as_secs_f32() * 10.0))
 }
 
 /// Whether `pid` is stopped by job control (for example `SIGSTOP`).
@@ -336,5 +342,50 @@ impl WatchdogService {
             process_count: sample.map(|sample| sample.process_count),
             sampled_at: sample.map(|sample| sample.sampled_at),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn members(entries: &[(u32, u64)]) -> HashMap<Pid, u64> {
+        entries
+            .iter()
+            .map(|(pid, ms)| (Pid::from_u32(*pid), *ms))
+            .collect()
+    }
+
+    #[test]
+    fn cpu_is_the_summed_member_delta_over_wall_time() {
+        let previous = members(&[(1, 1_000), (2, 0)]);
+        // 500 ms + 1 500 ms of CPU over 2 s: one full core.
+        let current = members(&[(1, 1_500), (2, 1_500)]);
+        let percent = group_cpu_percent(&current, &previous, Duration::from_secs(2)).unwrap();
+        assert!((percent - 100.0).abs() < 0.01, "{percent}");
+    }
+
+    #[test]
+    fn a_process_first_seen_without_cpu_time_still_counts() {
+        // sysinfo's own cpu_usage would stay 0 here.
+        let previous = members(&[(1, 0)]);
+        let current = members(&[(1, 900)]);
+        let percent = group_cpu_percent(&current, &previous, Duration::from_secs(1)).unwrap();
+        assert!((percent - 90.0).abs() < 0.01, "{percent}");
+    }
+
+    #[test]
+    fn cpu_is_unknown_until_every_member_has_a_previous_reading() {
+        let previous = members(&[(1, 100)]);
+        let current = members(&[(1, 200), (2, 50)]);
+        assert_eq!(
+            group_cpu_percent(&current, &previous, Duration::from_secs(1)),
+            None
+        );
+        assert_eq!(
+            group_cpu_percent(&previous, &previous, Duration::ZERO),
+            None
+        );
     }
 }

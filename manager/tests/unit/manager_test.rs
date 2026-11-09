@@ -237,8 +237,6 @@ async fn socket_parent_gets_a_fresh_child_and_is_never_adopted() {
 
 #[tokio::test]
 async fn unusable_socket_parents_are_rejected() {
-    use std::os::unix::ffi::OsStrExt;
-
     let tmp = TempDir::new().unwrap();
     let uv = fake_uv(&tmp);
     let scripts = scripts_dir(&tmp, &[]);
@@ -250,10 +248,13 @@ async fn unusable_socket_parents_are_rejected() {
         Err(RunpyError::InvalidConfig(message)) if message.contains("too long")
     ));
 
-    // APFS rejects non-UTF-8 names (EILSEQ), so such a parent cannot exist
-    // on macOS; the check applies where the filesystem allows one.
-    let non_utf8 = tmp.path().join(std::ffi::OsStr::from_bytes(b"bad-\xff"));
-    if fs::create_dir(&non_utf8).is_ok() {
+    // APFS rejects non-UTF-8 names (EILSEQ), so such a parent cannot exist on
+    // macOS; everywhere else the directory must be creatable and rejected.
+    #[cfg(not(target_os = "macos"))]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let non_utf8 = tmp.path().join(std::ffi::OsStr::from_bytes(b"bad-\xff"));
+        fs::create_dir(&non_utf8).unwrap();
         assert!(matches!(
             Manager::builder(&scripts).uv_path(&uv).socket_parent(&non_utf8).build().await,
             Err(RunpyError::InvalidConfig(message)) if message.contains("UTF-8")
