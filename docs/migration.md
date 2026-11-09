@@ -48,6 +48,10 @@ is now the null device by default instead of the Manager's stdin.
 
 ## Rust: lifecycle
 
+- At most `max_workers` (default 3) workers exist at once across all
+  scripts. Additional `spawn` calls wait for a slot within the startup timeout
+  and then fail with `Timeout(Admission)`; raise the limit with
+  `ManagerBuilder::max_workers` if you ran more workers before.
 - A worker's socket accepts exactly one connection. A closed or invalid
   connection removes the worker and stops its process group; reconnecting is
   no longer supported.

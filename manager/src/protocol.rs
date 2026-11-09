@@ -618,6 +618,9 @@ impl MessageSender {
     }
 }
 
+/// Reservation of one of the Manager's worker-process slots.
+pub(crate) type ProcessSlot = OwnedSemaphorePermit;
+
 /// Process and routing state retained for one registered worker.
 ///
 /// The standard child remains here so Watchdog polling and synchronous
@@ -632,6 +635,9 @@ pub(crate) struct WorkerHandle {
     pub lifecycle: LifecycleSender,
     /// Submission queue of this worker's request dispatcher.
     pub requests: mpsc::UnboundedSender<PendingRequest>,
+    /// Released when this handle is dropped, which every removal path does
+    /// only after the process group was stopped and reaped.
+    pub _slot: ProcessSlot,
 }
 
 /// Process-lifetime tasks removed as one unit during cleanup.
@@ -923,6 +929,9 @@ pub(crate) struct ControlPlane {
     budget: Arc<Semaphore>,
     /// Manager-wide bound on submitted requests not yet consumed.
     request_budget: Arc<Semaphore>,
+    /// Manager-wide bound on worker processes. A slot is held from before
+    /// `uv` starts until its process group has been killed and reaped.
+    processes: Arc<Semaphore>,
     /// Next request ID; never wraps.
     next_request: AtomicU64,
     /// Sessions report their terminal reason here; the monitor removes them.
@@ -960,6 +969,7 @@ impl ControlPlane {
             queue,
             budget: Arc::new(Semaphore::new(queue.queued_bytes)),
             request_budget: Arc::new(Semaphore::new(queue.max_pending_requests)),
+            processes: Arc::new(Semaphore::new(queue.max_workers)),
             next_request: AtomicU64::new(1),
             ended_tx,
             ended_rx: Mutex::new(Some(ended_rx)),
@@ -1024,16 +1034,30 @@ impl ControlPlane {
         &self.watchdog
     }
 
+    /// Reserve a worker-process slot before launching `uv`, waiting until
+    /// `deadline` for a running worker to be stopped and reaped.
+    pub(crate) async fn reserve_process(
+        &self,
+        deadline: Instant,
+    ) -> Result<ProcessSlot, RunpyError> {
+        timeout_at(deadline, self.processes.clone().acquire_owned())
+            .await
+            .map_err(|_| RunpyError::Timeout(TimeoutStage::Admission))?
+            .map_err(|_| RunpyError::ManagerClosed)
+    }
+
     pub(crate) async fn register_worker(
         self: &Arc<Self>,
         mut child: Child,
         identity: WorkerIdentity,
         sock_path: PathBuf,
-        socket_path: String,
         listener: UnixListener,
         worker_handler: Option<MessageHandler>,
+        slot: ProcessSlot,
     ) -> Result<LifecycleReceiver, RunpyError> {
         let worker_id = identity.name.clone();
+        // The Manager verified at build that its socket directory is UTF-8.
+        let socket_path = sock_path.to_string_lossy().into_owned();
         let process_group_id = child.id();
         let missing = |stream: &str| {
             RunpyError::Io(std::io::Error::other(format!(
@@ -1141,6 +1165,7 @@ impl ControlPlane {
                 process_group_id,
                 lifecycle: lifecycle.clone(),
                 requests,
+                _slot: slot,
             },
         );
 
@@ -1425,6 +1450,8 @@ impl ControlPlane {
 
     pub(crate) fn shutdown_now(&self) {
         self.closed.store(true, Ordering::Release);
+        // Waiting spawns fail with `ManagerClosed` instead of starting.
+        self.processes.close();
         if let Some(task) = self.monitor.lock().take() {
             task.abort();
         }
@@ -1931,7 +1958,6 @@ mod tests {
     ) -> (UnixStream, LifecycleReceiver) {
         let sock_path = directory.join(format!("{worker_id}.sock"));
         let listener = UnixListener::bind(&sock_path).unwrap();
-        let socket_path = sock_path.to_string_lossy().into_owned();
         let mut command = Command::new("sleep");
         command
             .arg("300")
@@ -1949,13 +1975,19 @@ mod tests {
                 child,
                 identity,
                 sock_path.clone(),
-                socket_path,
                 listener,
                 handler,
+                test_slot(),
             )
             .await
             .unwrap();
         (UnixStream::connect(sock_path).await.unwrap(), lifecycle)
+    }
+
+    /// A slot from a private semaphore, so plane-level tests are not bound by
+    /// the Manager-wide process limit they do not exercise.
+    fn test_slot() -> ProcessSlot {
+        Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap()
     }
 
     fn ready_envelope(protocol_version: u64) -> Envelope {
@@ -2708,9 +2740,9 @@ mod tests {
                     sock_file: "other.sock".to_string(),
                 },
                 sock_path.clone(),
-                sock_path.to_string_lossy().into_owned(),
                 listener,
                 None,
+                test_slot(),
             )
             .await
             .unwrap_err();
@@ -2739,7 +2771,6 @@ mod tests {
         );
         let sock_path = directory.path().join("worker.sock");
         let listener = UnixListener::bind(&sock_path).unwrap();
-        let socket_path = sock_path.to_string_lossy().into_owned();
         let mut command = Command::new("sleep");
         command
             .arg("300")
@@ -2758,9 +2789,9 @@ mod tests {
                     sock_file: "worker.sock".to_string(),
                 },
                 sock_path.clone(),
-                socket_path,
                 listener,
                 None,
+                test_slot(),
             )
             .await
             .unwrap_err();

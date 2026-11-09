@@ -27,6 +27,8 @@ pub const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 pub const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default Manager-wide bound on submitted, unconsumed requests.
 pub const DEFAULT_MAX_PENDING_REQUESTS: usize = 64;
+/// Default Manager-wide bound on starting, running, and stopping workers.
+pub const DEFAULT_MAX_WORKERS: usize = 3;
 
 /// Bounds on outbound memory and time shared by every worker route.
 #[derive(Clone, Copy, Debug)]
@@ -41,6 +43,8 @@ pub(crate) struct QueueLimits {
     pub shutdown_grace: Duration,
     /// Submitted requests, across all workers, not yet consumed.
     pub max_pending_requests: usize,
+    /// Worker processes, across all scripts, that may exist at once.
+    pub max_workers: usize,
 }
 
 impl Default for QueueLimits {
@@ -51,6 +55,7 @@ impl Default for QueueLimits {
             send_timeout: DEFAULT_SEND_TIMEOUT,
             shutdown_grace: DEFAULT_SHUTDOWN_GRACE,
             max_pending_requests: DEFAULT_MAX_PENDING_REQUESTS,
+            max_workers: DEFAULT_MAX_WORKERS,
         }
     }
 }

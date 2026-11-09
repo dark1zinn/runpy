@@ -504,6 +504,123 @@ exec python3 "$FAKE_WORKER" "$@""#,
     assert!(manager.watchdog().report().await.is_empty());
 }
 
+/// A fake uv that records each launch in `launches` and fails at once when
+/// `RUNPY_TEST_MODE=exit`; otherwise it becomes a ready worker.
+fn counting_uv(tmp: &TempDir, launches: &Path) -> PathBuf {
+    uv_script(
+        tmp,
+        &format!(
+            "echo launch >> '{}'\n[ \"$RUNPY_TEST_MODE\" = exit ] && exit 3\nexec python3 \"$FAKE_WORKER\" \"$@\"",
+            launches.display()
+        ),
+    )
+}
+
+fn launch_count(launches: &Path) -> usize {
+    fs::read_to_string(launches)
+        .map(|text| text.lines().count())
+        .unwrap_or(0)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn worker_processes_are_capped_across_scripts() {
+    let tmp = TempDir::new().unwrap();
+    let launches = tmp.path().join("launches");
+    let uv = counting_uv(&tmp, &launches);
+    let scripts = scripts_dir(&tmp, &["a", "b", "c", "d"]);
+    let manager = Manager::builder(&scripts)
+        .uv_path(&uv)
+        .startup_timeout(Duration::from_millis(500))
+        .build()
+        .await
+        .unwrap();
+
+    let a = manager.worker("a").spawn().await.unwrap();
+    let _b = manager.worker("b").spawn().await.unwrap();
+    let _c = manager.worker("c").spawn().await.unwrap();
+    // The default cap of three holds a fourth script back without ever
+    // launching it.
+    assert!(matches!(
+        manager.worker("d").spawn().await,
+        Err(RunpyError::Timeout(TimeoutStage::Admission))
+    ));
+    assert_eq!(launch_count(&launches), 3);
+
+    // A waiting spawn starts once a running worker has been stopped.
+    let waiting = tokio::spawn({
+        let builder = manager.worker("d");
+        async move { builder.spawn().await }
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(launch_count(&launches), 3);
+    a.terminate().await.unwrap();
+    let d = waiting.await.unwrap().unwrap();
+    assert_eq!(launch_count(&launches), 4);
+    assert_eq!(manager.watchdog().report().await.len(), 3);
+    d.terminate().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn configured_worker_cap_serializes_or_widens_admission() {
+    let tmp = TempDir::new().unwrap();
+    let launches = tmp.path().join("launches");
+    let uv = counting_uv(&tmp, &launches);
+    let scripts = scripts_dir(&tmp, &["a"]);
+
+    let single = Manager::builder(&scripts)
+        .uv_path(&uv)
+        .max_workers(1)
+        .startup_timeout(Duration::from_millis(500))
+        .build()
+        .await
+        .unwrap();
+    // A failed start releases its slot exactly once.
+    assert!(matches!(
+        single
+            .worker("a")
+            .env("RUNPY_TEST_MODE", "exit")
+            .spawn()
+            .await,
+        Err(RunpyError::WorkerExited { .. })
+    ));
+    let first = single.worker("a").spawn().await.unwrap();
+    assert!(matches!(
+        single.worker("a").spawn().await,
+        Err(RunpyError::Timeout(TimeoutStage::Admission))
+    ));
+    first.terminate().await.unwrap();
+    single.worker("a").spawn().await.unwrap();
+    drop(single);
+
+    let wide = Manager::builder(&scripts)
+        .uv_path(&uv)
+        .max_workers(4)
+        .build()
+        .await
+        .unwrap();
+    for _ in 0..4 {
+        wide.worker("a").spawn().await.unwrap();
+    }
+    assert_eq!(wide.watchdog().report().await.len(), 4);
+}
+
+#[tokio::test]
+async fn zero_worker_cap_is_rejected() {
+    let tmp = TempDir::new().unwrap();
+    let uv = fake_uv(&tmp);
+    let scripts = scripts_dir(&tmp, &[]);
+    assert!(matches!(
+        Manager::builder(&scripts)
+            .uv_path(&uv)
+            .max_workers(0)
+            .build()
+            .await,
+        Err(RunpyError::InvalidConfig(_))
+    ));
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn cancelling_spawn_before_ready_stops_the_process() {

@@ -106,8 +106,8 @@ use crate::protocol::ControlPlane;
 // ── Public re-exports ──────────────────────────────────────────────────
 pub use config::{
     DEFAULT_FRAME_TIMEOUT, DEFAULT_MAX_FRAME_BYTES, DEFAULT_MAX_PENDING_REQUESTS,
-    DEFAULT_OUTBOUND_CAPACITY, DEFAULT_QUEUED_BYTES, DEFAULT_SEND_TIMEOUT, DEFAULT_SHUTDOWN_GRACE,
-    DEFAULT_STARTUP_TIMEOUT,
+    DEFAULT_MAX_WORKERS, DEFAULT_OUTBOUND_CAPACITY, DEFAULT_QUEUED_BYTES, DEFAULT_SEND_TIMEOUT,
+    DEFAULT_SHUTDOWN_GRACE, DEFAULT_STARTUP_TIMEOUT,
 };
 pub use error::{InvalidScriptReason, RunpyError, TimeoutStage};
 pub use lifecycle::{ExitReason, WorkerExit};
@@ -234,13 +234,27 @@ impl ManagerBuilder {
         self
     }
 
+    /// Manager-wide bound on worker processes across all scripts; default
+    /// [`DEFAULT_MAX_WORKERS`] (3). A worker counts from before `uv` starts
+    /// until its process group has been stopped and reaped, so starting and
+    /// stopping workers occupy a slot too. [`WorkerBuilder::spawn`] waits for
+    /// a slot within the startup timeout, then fails with
+    /// `Timeout(Admission)`. The count is of managed workers; each one may
+    /// show several OS processes (`uv` plus Python and its descendants).
+    pub fn max_workers(mut self, workers: usize) -> Self {
+        self.queue.max_workers = workers;
+        self
+    }
+
     fn validate(&self) -> Result<ProtocolLimits, RunpyError> {
         let limits = ProtocolLimits::new(self.max_frame_bytes, self.frame_timeout)
             .map_err(RunpyError::InvalidConfig)?;
         let queue = &self.queue;
-        if queue.outbound_capacity == 0 || queue.max_pending_requests == 0 {
+        if queue.outbound_capacity == 0 || queue.max_pending_requests == 0 || queue.max_workers == 0
+        {
             return Err(RunpyError::InvalidConfig(
-                "outbound_capacity and max_pending_requests must be greater than zero".to_string(),
+                "outbound_capacity, max_pending_requests, and max_workers must be greater than zero"
+                    .to_string(),
             ));
         }
         if queue.queued_bytes < limits.max_frame_bytes() + 8 {

@@ -144,6 +144,16 @@ the runtime checks later. The Watchdog monitor starts during `build`.
 | `send_timeout` | 5 s | Deadline for outbound admission plus the write. |
 | `startup_timeout` | 30 s | Deadline for the `uv --version` check. |
 | `shutdown_grace` | 2 s | Time a worker gets to exit after termination starts. |
+| `max_workers` | 3 | Worker processes, across all scripts, that may exist at once. |
+| `max_pending_requests` | 64 | Submitted requests, across all workers, not yet consumed. |
+
+`max_workers` counts managed workers, not OS processes: each worker is a `uv`
+process plus its Python descendants. A worker holds a slot from before `uv`
+starts until its process group has been stopped and reaped, so starting and
+stopping workers count too. `spawn` waits for a free slot within the startup
+timeout (the same deadline that then covers waiting for `ready`) and fails with
+`Timeout(Admission)` without launching anything. A failed or cancelled start
+releases its slot once cleanup finishes.
 
 ### 2. Configure a WorkerBuilder
 

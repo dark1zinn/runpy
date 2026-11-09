@@ -231,13 +231,18 @@ impl WorkerBuilder {
             .upgrade()
             .ok_or(RunpyError::ManagerClosed)?;
 
+        // Admission and readiness share one startup deadline. The slot is
+        // reserved before `uv` starts and travels with the child, so it is
+        // released only after that process group is stopped and reaped (or
+        // here, if launching fails).
+        let deadline = tokio::time::Instant::now() + integrity.startup_timeout;
+        let slot = control_plane.reserve_process(deadline).await?;
+
         // No await between binding the socket and registering the child, so
         // cancelling `spawn` can never leak a socket or an unowned process.
         let (identity, sock_path, listener) =
             bind_unique(&self.socket_dir, || WorkerIdentity::new(&self.script))?;
         let worker_id = identity.name.clone();
-        // The Manager verified at build that its socket directory is UTF-8.
-        let socket_path = sock_path.to_string_lossy().into_owned();
 
         control_plane.logger().debug_with(
             "Worker",
@@ -305,9 +310,9 @@ impl WorkerBuilder {
                 child,
                 identity,
                 sock_path,
-                socket_path,
                 listener,
                 self.worker_handler,
+                slot,
             )
             .await?;
 
@@ -321,7 +326,6 @@ impl WorkerBuilder {
         };
         // Wait for `ready`, but notice at once if the process exits first
         // instead of waiting for the next watchdog tick.
-        let deadline = tokio::time::Instant::now() + integrity.startup_timeout;
         let mut observer = lifecycle.clone();
         let ready = tokio::select! {
             state = observer.wait_for(|state| !matches!(state, LifecycleState::Starting)) => {
