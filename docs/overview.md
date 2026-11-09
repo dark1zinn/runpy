@@ -63,7 +63,7 @@ requires the supplied name to be a single path component, and resolves it as
 ### ControlPlane, Mailer, and Watchdog
 
 The private `ControlPlane` owns the worker registry and the lifecycle tasks for
-each process. A protocol session accepts reconnects on the worker's socket. The
+each process. A protocol session serves the worker's single connection. The
 Mailer resolves replies to the originating worker's bounded outbound route.
 The single shared Watchdog polls registered child processes and removes process
 groups whose `uv` parent has exited.
@@ -144,9 +144,12 @@ worker ID as the first two positional arguments, creates the subclass, connects
 the Unix socket, and sends a `ready` envelope. Remaining `--key=value`
 arguments become `Worker.extra`.
 
-The Manager accepts repeated socket connections for the same live process. An
-output reader belongs to the process lifetime, not a socket connection, so a
-reconnect does not duplicate output capture.
+Each worker gets exactly one socket connection. When that connection closes,
+fails, or violates the protocol, the session ends and the Manager removes the
+worker: it stops the process group, fails every pending send, and removes the
+socket. There is no reconnect and nothing is replayed; create a replacement
+worker to continue. Output readers belong to the process lifetime and stop with
+it.
 
 ### 5. Route messages
 
@@ -193,8 +196,11 @@ can reply with `Worker.send` or emit a structured `Worker.log` envelope.
 `Worker::terminate` sends `terminate`. When the send succeeds, Rust allows two
 seconds for graceful handling, then removes the worker and force-stops the
 process group. `Manager::terminate_all` broadcasts the same operation, waits
-two seconds, and removes every worker. Watchdog cleanup uses the same removal
-path when `uv` exits.
+two seconds, and removes every worker. Watchdog cleanup and session end use the
+same removal path. Removal happens once: concurrent watchdog, session,
+termination, and shutdown attempts are idempotent, and the first records the
+reason (`process exited`, `disconnected`, `protocol violation`, `terminated`,
+or `manager shutdown`) in the removal log.
 
 Removal aborts the protocol task, kills and reaps the process group, removes the
 socket, then permits each output reader up to 250 ms to drain final bytes.
@@ -280,7 +286,8 @@ are protocol errors.
 | `error` | Python → Rust | Carries a `data.message` execution or dispatch failure. |
 | `log` | Python → Rust | Carries developer-selected structured log data. |
 
-A known operation sent in the wrong direction closes that socket connection.
+A known operation sent in the wrong direction is a protocol violation: the
+Manager closes the connection and removes the worker.
 A custom envelope has no `x_op` and is valid in either direction. Structured
 `log` envelopes are distinct from process stdout/stderr: they use normal
 message routing and have a reply-capable callback context.

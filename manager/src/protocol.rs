@@ -53,9 +53,9 @@ const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 const SESSION_QUEUE_CAPACITY: usize = 64;
 
 /// Abort an owned helper task when its owning scope ends or is cancelled.
-struct AbortOnDrop(JoinHandle<()>);
+struct AbortOnDrop<T>(JoinHandle<T>);
 
-impl Drop for AbortOnDrop {
+impl<T> Drop for AbortOnDrop<T> {
     fn drop(&mut self) {
         self.0.abort();
     }
@@ -564,8 +564,8 @@ pub(crate) struct WorkerHandle {
 
 /// Process-lifetime tasks removed as one unit during cleanup.
 ///
-/// The socket session can reconnect; stdout/stderr readers remain singular for
-/// the lifetime of the process.
+/// The socket session serves exactly one connection; stdout/stderr readers
+/// remain singular for the lifetime of the process.
 struct WorkerTasks {
     session: JoinHandle<()>,
     stdout: JoinHandle<()>,
@@ -657,6 +657,34 @@ struct WorkerSession {
     mailer: Arc<Mailer>,
     logger: Arc<Scribbler>,
     limits: ProtocolLimits,
+    ended: mpsc::UnboundedSender<(String, ExitReason)>,
+}
+
+/// Why a registered worker was removed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ExitReason {
+    /// The `uv` process exited on its own.
+    Exited,
+    /// The caller requested termination.
+    Terminated,
+    /// The connection closed or failed.
+    Disconnected,
+    /// The worker sent an invalid frame or envelope.
+    ProtocolViolation,
+    /// The Manager is shutting down.
+    ManagerShutdown,
+}
+
+impl ExitReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Exited => "process exited",
+            Self::Terminated => "terminated",
+            Self::Disconnected => "disconnected",
+            Self::ProtocolViolation => "protocol violation",
+            Self::ManagerShutdown => "manager shutdown",
+        }
+    }
 }
 
 /// Kill the complete process group when possible, then reap the stored child.
@@ -843,6 +871,9 @@ pub(crate) struct ControlPlane {
     queue: QueueLimits,
     /// Manager-wide byte budget for admitted, unwritten outbound frames.
     budget: Arc<Semaphore>,
+    /// Sessions report their terminal reason here; the monitor removes them.
+    ended_tx: mpsc::UnboundedSender<(String, ExitReason)>,
+    ended_rx: Mutex<Option<mpsc::UnboundedReceiver<(String, ExitReason)>>>,
 }
 
 impl ControlPlane {
@@ -856,6 +887,9 @@ impl ControlPlane {
         let mailer = Arc::new(Mailer {
             workers: workers.clone(),
         });
+        // Each session reports at most once, so this channel holds at most
+        // one entry per registered worker.
+        let (ended_tx, ended_rx) = mpsc::unbounded_channel();
 
         Arc::new(Self {
             closed: AtomicBool::new(false),
@@ -871,6 +905,8 @@ impl ControlPlane {
             limits,
             queue,
             budget: Arc::new(Semaphore::new(queue.queued_bytes)),
+            ended_tx,
+            ended_rx: Mutex::new(Some(ended_rx)),
         })
     }
 
@@ -887,17 +923,34 @@ impl ControlPlane {
         if monitor.is_some() || self.closed.load(Ordering::Acquire) {
             return;
         }
+        let Some(mut ended_rx) = self.ended_rx.lock().take() else {
+            return;
+        };
 
+        // The monitor owns every asynchronous removal: dead processes found
+        // by the watchdog and sessions reporting that their connection ended.
         let control_plane = Arc::downgrade(self);
         *monitor = Some(tokio::spawn(async move {
             let mut tick = interval(Duration::from_secs(interval_secs));
             loop {
-                tick.tick().await;
+                let ended = tokio::select! {
+                    _ = tick.tick() => None,
+                    ended = ended_rx.recv() => ended,
+                };
                 let Some(control_plane) = control_plane.upgrade() else {
                     break;
                 };
-                for worker_id in control_plane.watchdog.dead_worker_ids().await {
-                    control_plane.remove_worker(&worker_id).await;
+                match ended {
+                    Some((worker_id, reason)) => {
+                        control_plane.remove_worker(&worker_id, reason).await;
+                    }
+                    None => {
+                        for worker_id in control_plane.watchdog.dead_worker_ids().await {
+                            control_plane
+                                .remove_worker(&worker_id, ExitReason::Exited)
+                                .await;
+                        }
+                    }
                 }
             }
         }));
@@ -1019,6 +1072,7 @@ impl ControlPlane {
             mailer: self.mailer.clone(),
             logger: self.logger.clone(),
             limits: self.limits,
+            ended: self.ended_tx.clone(),
         }));
         let stdout = tokio::spawn(capture_worker_output(
             stdout,
@@ -1077,7 +1131,7 @@ impl ControlPlane {
         if send_result.is_ok() {
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
-        self.remove_worker(worker_id).await;
+        self.remove_worker(worker_id, ExitReason::Terminated).await;
         send_result
     }
 
@@ -1087,23 +1141,34 @@ impl ControlPlane {
 
         let worker_ids: Vec<_> = self.workers.read().keys().cloned().collect();
         for worker_id in worker_ids {
-            self.remove_worker(&worker_id).await;
+            self.remove_worker(&worker_id, ExitReason::Terminated).await;
         }
     }
 
-    async fn remove_worker(&self, worker_id: &str) {
+    /// Remove a worker once, stopping its process group and releasing its
+    /// tasks, socket file, and route.
+    ///
+    /// Watchdog, session end, termination, and shutdown can race to remove
+    /// the same worker; the first caller wins and records the reason, later
+    /// callers return `false`.
+    async fn remove_worker(&self, worker_id: &str, reason: ExitReason) -> bool {
         let tasks = self.sessions.lock().remove(worker_id);
         if let Some(tasks) = &tasks {
             tasks.session.abort();
         }
 
         let handle = self.workers.write().remove(worker_id);
+        let removed = handle.is_some();
         if let Some(mut handle) = handle {
             force_stop_worker(&mut handle);
             let _ = std::fs::remove_file(&handle.sock_path);
             self.logger.info_with(
                 "ControlPlane",
-                &format!("Removed worker '{}'", handle.identity.name),
+                &format!(
+                    "Removed worker '{}' ({})",
+                    handle.identity.name,
+                    reason.as_str()
+                ),
             );
         }
 
@@ -1111,6 +1176,7 @@ impl ControlPlane {
             Self::finish_output_task(tasks.stdout).await;
             Self::finish_output_task(tasks.stderr).await;
         }
+        removed
     }
 
     async fn finish_output_task(mut task: JoinHandle<()>) {
@@ -1140,7 +1206,19 @@ impl ControlPlane {
         }
     }
 
+    /// Serve the worker's single connection, then report why it ended.
+    ///
+    /// There is no reconnect: once the connection closes or violates the
+    /// protocol, the monitor removes the worker, which fails pending sends
+    /// and stops the process group. The session never removes itself.
     async fn run_session(session: WorkerSession) {
+        let worker_id = session.worker_id.clone();
+        let ended = session.ended.clone();
+        let reason = Self::serve_connection(session).await;
+        let _ = ended.send((worker_id, reason));
+    }
+
+    async fn serve_connection(session: WorkerSession) -> ExitReason {
         let WorkerSession {
             control_plane,
             listener,
@@ -1151,98 +1229,99 @@ impl ControlPlane {
             mailer,
             logger,
             limits,
+            ended: _,
         } = session;
-        let outbound_rx = Arc::new(tokio::sync::Mutex::new(outbound_rx));
-        loop {
-            let (stream, _) = match listener.accept().await {
-                Ok(connection) => connection,
-                Err(error) => {
-                    logger.error_with(
-                        "ControlPlane",
-                        &format!("{worker_id} Accept error: {error}"),
-                    );
-                    break;
-                }
-            };
+        let stream = match listener.accept().await {
+            Ok((stream, _)) => stream,
+            Err(error) => {
+                logger.error_with(
+                    "ControlPlane",
+                    &format!("{worker_id} Accept error: {error}"),
+                );
+                return ExitReason::Disconnected;
+            }
+        };
+        drop(listener);
 
-            // A dedicated task owns every receive operation until it completes,
-            // so selecting on outbound work can never drop a partially read
-            // frame. Only complete envelopes cross this bounded channel.
-            let (mut read_half, write_half) = stream.into_split();
-            let (inbound_tx, mut inbound_rx) = mpsc::channel::<Envelope>(SESSION_QUEUE_CAPACITY);
-            let reader_logger = logger.clone();
-            let reader = tokio::spawn(async move {
-                while let Some(envelope) =
-                    Self::recv_envelope(&reader_logger, &mut read_half, &limits).await
-                {
-                    if inbound_tx.send(envelope).await.is_err() {
-                        break;
-                    }
-                }
-            });
-            // Aborting the session (cleanup) drops this guard and the reader.
-            let _reader = AbortOnDrop(reader);
-
-            // The writer owns the write half so a write blocked on a busy peer
-            // never stops inbound dispatch. A partially written frame is never
-            // retried: either task ending tears down the whole connection.
-            let writer = tokio::spawn(Self::run_writer(
-                worker_id.clone(),
-                write_half,
-                outbound_rx.clone(),
-                logger.clone(),
-            ));
-            let mut writer = AbortOnDrop(writer);
-
+        // A dedicated task owns every receive operation until it completes,
+        // so selecting on outbound work can never drop a partially read
+        // frame. Only complete envelopes cross this bounded channel.
+        let (mut read_half, write_half) = stream.into_split();
+        let (inbound_tx, mut inbound_rx) = mpsc::channel::<Envelope>(SESSION_QUEUE_CAPACITY);
+        let reader_logger = logger.clone();
+        let reader = tokio::spawn(async move {
             loop {
-                tokio::select! {
-                    received = inbound_rx.recv() => {
-                        let Some(mut envelope) = received else {
-                            break;
-                        };
-                        if let Err(error) = envelope.validate_worker_to_manager() {
-                            logger.error_with("Protocol", &error.to_string());
-                            break;
-                        }
-                        envelope.stamp_trusted(&worker_id, &socket_path);
-
-                        let inbound = InboundEnvelope {
-                            envelope,
-                            worker_id: worker_id.clone(),
-                            mailer: mailer.clone(),
-                        };
-                        let Some(control_plane) = control_plane.upgrade() else {
-                            return;
-                        };
-                        let global_handler = control_plane.global_handler.read().clone();
-                        drop(control_plane);
-                        if let Some(handler) = global_handler {
-                            handler(inbound.clone());
-                        }
-                        if let Some(handler) = &worker_handler {
-                            handler(inbound);
+                match Self::recv_envelope(&reader_logger, &mut read_half, &limits).await {
+                    Ok(envelope) => {
+                        if inbound_tx.send(envelope).await.is_err() {
+                            return ExitReason::Disconnected;
                         }
                     }
-                    _ = &mut writer.0 => break,
+                    Err(reason) => return reason,
                 }
+            }
+        });
+        // Aborting the session (cleanup) drops this guard and the reader.
+        let mut reader = AbortOnDrop(reader);
+
+        // The writer owns the write half so a write blocked on a busy peer
+        // never stops inbound dispatch. A partially written frame is never
+        // retried: either task ending tears down the whole connection.
+        let writer = tokio::spawn(Self::run_writer(
+            worker_id.clone(),
+            write_half,
+            outbound_rx,
+            logger.clone(),
+        ));
+        let mut writer = AbortOnDrop(writer);
+
+        loop {
+            tokio::select! {
+                received = inbound_rx.recv() => {
+                    let Some(mut envelope) = received else {
+                        return (&mut reader.0).await.unwrap_or(ExitReason::Disconnected);
+                    };
+                    if let Err(error) = envelope.validate_worker_to_manager() {
+                        logger.error_with("Protocol", &error.to_string());
+                        return ExitReason::ProtocolViolation;
+                    }
+                    envelope.stamp_trusted(&worker_id, &socket_path);
+
+                    let inbound = InboundEnvelope {
+                        envelope,
+                        worker_id: worker_id.clone(),
+                        mailer: mailer.clone(),
+                    };
+                    let Some(control_plane) = control_plane.upgrade() else {
+                        return ExitReason::ManagerShutdown;
+                    };
+                    let global_handler = control_plane.global_handler.read().clone();
+                    drop(control_plane);
+                    if let Some(handler) = global_handler {
+                        handler(inbound.clone());
+                    }
+                    if let Some(handler) = &worker_handler {
+                        handler(inbound);
+                    }
+                }
+                _ = &mut writer.0 => return ExitReason::Disconnected,
             }
         }
     }
 
     /// Write admitted frames in order until the route closes or a write fails.
     ///
-    /// The shared receiver is held only while this connection's writer runs;
-    /// aborting the writer releases it for a later connection. A frame whose
-    /// deadline passed while queued is discarded unwritten. A deadline that
-    /// interrupts a write leaves delivery unknown, so the connection closes
-    /// rather than continue on a possibly corrupted stream.
+    /// A frame whose deadline passed while queued is discarded unwritten. A
+    /// deadline that interrupts a write leaves delivery unknown, so the
+    /// connection closes rather than continue on a possibly corrupted stream.
+    /// Frames still queued when the connection ends are dropped, which fails
+    /// their receipts.
     async fn run_writer(
         worker_id: String,
         mut write_half: tokio::net::unix::OwnedWriteHalf,
-        outbound_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<OutboundFrame>>>,
+        mut outbound_rx: mpsc::Receiver<OutboundFrame>,
         logger: Arc<Scribbler>,
     ) {
-        let mut outbound_rx = outbound_rx.lock().await;
         while let Some(entry) = outbound_rx.recv().await {
             let OutboundFrame {
                 frame,
@@ -1278,21 +1357,21 @@ impl ControlPlane {
         std::future::pending::<()>().await;
     }
 
-    /// Read and decode one envelope, logging why a connection must close.
+    /// Read and decode one envelope, or classify why the connection ends.
     ///
-    /// A malformed, oversized, truncated, or stalled frame ends only the
-    /// current socket connection.
+    /// A clean close or I/O failure is a disconnect; a malformed, oversized,
+    /// stalled, or undecodable frame is a protocol violation.
     async fn recv_envelope<R>(
         logger: &Scribbler,
         stream: &mut R,
         limits: &ProtocolLimits,
-    ) -> Option<Envelope>
+    ) -> Result<Envelope, ExitReason>
     where
         R: AsyncRead + Unpin,
     {
         let payload = match read_frame(stream, limits).await {
             Ok(Some(payload)) => payload,
-            Ok(None) => return None,
+            Ok(None) | Err(FrameError::Truncated) => return Err(ExitReason::Disconnected),
             Err(FrameError::Io(error)) => {
                 match error.kind() {
                     std::io::ErrorKind::ConnectionReset => {
@@ -1306,25 +1385,22 @@ impl ControlPlane {
                         &format!("Read error: {error} (kind: {:?})", error.kind()),
                     ),
                 }
-                return None;
+                return Err(ExitReason::Disconnected);
             }
             Err(error) => {
                 logger.error_with("Protocol", &error.to_string());
-                return None;
+                return Err(ExitReason::ProtocolViolation);
             }
         };
 
-        match serde_json::from_slice(&payload) {
-            Ok(envelope) => Some(envelope),
-            Err(error) => {
-                let raw = String::from_utf8_lossy(&payload);
-                logger.error_with(
-                    "Protocol",
-                    &format!("JSON envelope error: {error}\n  Raw: {raw}"),
-                );
-                None
-            }
-        }
+        serde_json::from_slice(&payload).map_err(|error| {
+            let raw = String::from_utf8_lossy(&payload);
+            logger.error_with(
+                "Protocol",
+                &format!("JSON envelope error: {error}\n  Raw: {raw}"),
+            );
+            ExitReason::ProtocolViolation
+        })
     }
 }
 
@@ -2133,6 +2209,93 @@ mod tests {
         assert!(control_plane.sessions.lock().is_empty());
         assert!(control_plane.monitor.lock().is_none());
         assert_eq!(unsafe { libc::kill(pid as libc::pid_t, 0) }, -1);
+    }
+
+    /// Wait until the monitor has removed `worker_id`.
+    async fn wait_for_removal(control_plane: &Arc<ControlPlane>, worker_id: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while control_plane.workers.read().contains_key(worker_id) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "worker '{worker_id}' was not removed"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    fn process_alive(pid: u32) -> bool {
+        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn disconnect_removes_worker_and_fails_pending_sends() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let control_plane = test_control_plane(ProtocolLimits::default());
+        let stream = register_worker(&control_plane, directory.path(), "worker", None).await;
+        let pid = control_plane.workers.read()["worker"].child.id();
+        let sock_path = directory.path().join("worker.sock");
+
+        // The peer never reads: the first large frame blocks the writer and
+        // the rest stay queued behind it.
+        let large = Envelope::new(
+            Meta::new(),
+            object(json!({ "blob": "b".repeat(1024 * 1024) })),
+        )
+        .unwrap();
+        let receipts: Vec<_> = (0..4)
+            .map(|_| control_plane.try_send("worker", large.clone()).unwrap())
+            .collect();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drop(stream);
+
+        for receipt in receipts {
+            let result = timeout(Duration::from_secs(2), receipt.wait())
+                .await
+                .expect("pending sends must fail once the worker is gone");
+            assert!(result.is_err());
+        }
+        wait_for_removal(&control_plane, "worker").await;
+        assert!(!sock_path.exists());
+        assert!(!process_alive(pid));
+        assert!(matches!(
+            control_plane.send("worker", numbered(1)).await,
+            Err(RunpyError::WorkerExited { .. })
+        ));
+        control_plane.shutdown_now();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn malformed_frame_is_a_protocol_violation_that_stops_the_process_group() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let control_plane = test_control_plane(ProtocolLimits::default());
+        let mut stream = register_worker(&control_plane, directory.path(), "worker", None).await;
+        let pid = control_plane.workers.read()["worker"].child.id();
+
+        stream.write_all(&header(9)).await.unwrap();
+        stream.write_all(b"not json!").await.unwrap();
+
+        wait_for_removal(&control_plane, "worker").await;
+        assert!(!process_alive(pid));
+        control_plane.shutdown_now();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_removals_clean_up_exactly_once() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let control_plane = test_control_plane(ProtocolLimits::default());
+        let _stream = register_worker(&control_plane, directory.path(), "worker", None).await;
+
+        let (first, second, third) = tokio::join!(
+            control_plane.remove_worker("worker", ExitReason::Exited),
+            control_plane.remove_worker("worker", ExitReason::Disconnected),
+            control_plane.remove_worker("worker", ExitReason::Terminated),
+        );
+        assert_eq!(
+            [first, second, third].iter().filter(|done| **done).count(),
+            1
+        );
+        assert!(control_plane.sessions.lock().is_empty());
+        control_plane.shutdown_now();
     }
 
     fn test_sender(
