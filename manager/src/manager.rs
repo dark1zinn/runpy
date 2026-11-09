@@ -300,6 +300,11 @@ impl Worker {
         for (key, value) in &self.env_vars {
             cmd.env(key, value);
         }
+        // Runpy-owned limits are applied after user variables so the worker
+        // always enforces exactly what the Manager enforces.
+        for (key, value) in control_plane.limits().worker_env() {
+            cmd.env(key, value);
+        }
         cmd.env("PYTHONUNBUFFERED", "1")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());

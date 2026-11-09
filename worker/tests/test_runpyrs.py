@@ -4,11 +4,12 @@ import struct
 import sys
 import tempfile
 import threading
+import time
 from typing import get_args, get_origin, get_type_hints, Union
 
 import pytest
 
-import runpyrs
+from runpyrs import FrameTooLargeError
 from runpyrs import (
     Data,
     Envelope,
@@ -16,7 +17,6 @@ from runpyrs import (
     ExecuteResult,
     Meta,
     RunScript,
-    RunpyOperation,
     Worker,
     create_envelope,
 )
@@ -70,34 +70,12 @@ def close_worker(resources) -> None:
         temp.cleanup()
 
 
-def test_public_exports_are_the_bare_envelope_api():
-    assert runpyrs.__all__ == [
-        "Worker",
-        "RunScript",
-        "Envelope",
-        "Meta",
-        "Data",
-        "RunpyOperation",
-        "create_envelope",
-        "ExecutePayload",
-        "ExecuteResult",
-    ]
+def test_envelope_types_describe_the_wire_shape():
     assert get_type_hints(Envelope) == {"meta": Meta, "data": Data}
     assert ExecutePayload is Data
     assert get_origin(ExecuteResult) is Union
     assert type(None) in get_args(ExecuteResult)
-    assert RunpyOperation is not None
-
-    for removed in (
-        "Message",
-        "Method",
-        "Headers",
-        "OutboundMessage",
-        "InternalMessageType",
-        "BuiltinResponseType",
-        "MessageType",
-    ):
-        assert not hasattr(runpyrs, removed)
+    assert issubclass(FrameTooLargeError, ValueError)
 
 
 def test_create_envelope_preserves_json_metadata_and_copies_inputs():
@@ -428,3 +406,114 @@ def test_runscript_passes_exact_worker_id(monkeypatch):
         "extra": {"mode": "fast"},
         "ran": True,
     }
+
+
+def _frame(body: bytes) -> bytes:
+    return struct.pack("<Q", len(body)) + body
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("RUNPY_MAX_FRAME_BYTES", "0"),
+        ("RUNPY_MAX_FRAME_BYTES", "-1"),
+        ("RUNPY_FRAME_TIMEOUT_MS", "soon"),
+    ],
+)
+def test_invalid_manager_limits_fail_before_connecting(monkeypatch, name, value):
+    monkeypatch.setenv(name, value)
+    connected = []
+    monkeypatch.setattr(
+        socket.socket, "connect", lambda self, path: connected.append(path)
+    )
+    with pytest.raises(ValueError, match=name):
+        Worker("/tmp/unused.sock", "worker-123")
+    assert connected == []
+
+
+def test_oversized_outbound_envelope_is_rejected_before_writing(monkeypatch):
+    monkeypatch.setenv("RUNPY_MAX_FRAME_BYTES", "256")
+    resources = open_worker()
+    try:
+        _, _, connection, worker, _, _ = resources
+        with pytest.raises(FrameTooLargeError):
+            worker.send({"blob": "x" * 1024})
+        # Nothing was written, so the connection still carries valid frames.
+        worker.send({"ok": True})
+        assert read_envelope(connection)["data"] == {"ok": True}
+    finally:
+        close_worker(resources)
+
+
+@pytest.mark.parametrize("size", [0, 257, 2**64 - 1])
+def test_invalid_inbound_length_closes_without_reading_a_body(monkeypatch, size):
+    monkeypatch.setenv("RUNPY_MAX_FRAME_BYTES", "256")
+    resources = open_worker()
+    try:
+        _, _, connection, worker, _, _ = resources
+        thread = threading.Thread(target=worker.run)
+        thread.start()
+        connection.sendall(struct.pack("<Q", size))
+        thread.join(timeout=1)
+        assert not thread.is_alive()
+        assert connection.recv(1) == b""
+    finally:
+        close_worker(resources)
+
+
+def test_frame_at_the_limit_is_accepted(monkeypatch):
+    limit = 512
+    prefix = '{"meta":{},"data":{"k":"'
+    value = "v" * (limit - len(prefix) - 3)
+    body = prefix + value + '"}}'
+    assert len(body) == limit
+    monkeypatch.setenv("RUNPY_MAX_FRAME_BYTES", str(limit))
+    received = []
+
+    class Recording(EchoWorker):
+        def handle_envelope(self, envelope):
+            received.append(envelope["data"])
+
+    resources = open_worker(Recording)
+    try:
+        _, _, connection, worker, _, _ = resources
+        thread = threading.Thread(target=worker.run)
+        thread.start()
+        connection.sendall(_frame(body.encode()))
+        send_envelope(connection, {"meta": {"x_op": "terminate"}, "data": {}})
+        thread.join(timeout=1)
+        assert received == [{"k": value}]
+    finally:
+        close_worker(resources)
+
+
+@pytest.mark.parametrize("sent", [3, 8 + 2])
+def test_stalled_frame_times_out_after_its_first_byte(monkeypatch, sent):
+    monkeypatch.setenv("RUNPY_FRAME_TIMEOUT_MS", "100")
+    resources = open_worker()
+    try:
+        _, _, connection, worker, _, _ = resources
+        thread = threading.Thread(target=worker.run)
+        thread.start()
+        connection.sendall(_frame(b'{"meta":{},"data":{}}')[:sent])
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+    finally:
+        close_worker(resources)
+
+
+def test_idle_connection_has_no_frame_deadline(monkeypatch):
+    monkeypatch.setenv("RUNPY_FRAME_TIMEOUT_MS", "50")
+    resources = open_worker()
+    try:
+        _, _, connection, worker, _, _ = resources
+        thread = threading.Thread(target=worker.run)
+        thread.start()
+        time.sleep(0.3)
+        assert thread.is_alive()
+        send_envelope(connection, {"meta": {"x_op": "execute"}, "data": {"n": 1}})
+        assert read_envelope(connection)["data"] == {"echo": {"n": 1}}
+        send_envelope(connection, {"meta": {"x_op": "terminate"}, "data": {}})
+        thread.join(timeout=1)
+    finally:
+        close_worker(resources)

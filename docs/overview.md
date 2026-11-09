@@ -194,6 +194,22 @@ Each socket frame consists of:
 1. an unsigned 64-bit little-endian payload length;
 2. exactly that many UTF-8 JSON bytes.
 
+Both peers bound every frame. The default maximum JSON body is 8 MiB
+(`DEFAULT_MAX_FRAME_BYTES`); a zero-length body or a declared length above the
+limit closes the connection before any body is allocated. Outbound envelopes
+are serialized into a single buffer that stops growing at the limit, so an
+oversized envelope is rejected without writing anything and the connection
+stays usable. Once a frame's first byte arrives, the rest of the frame must
+complete within the frame timeout (default 30 seconds,
+`DEFAULT_FRAME_TIMEOUT`); an idle connection waiting for the first byte has no
+deadline. A stalled frame closes the connection.
+
+Configure both values with `ProtocolLimits` and `Manager::with_limits`. The
+Manager passes them to every worker as `RUNPY_MAX_FRAME_BYTES` and
+`RUNPY_FRAME_TIMEOUT_MS` after applying user environment variables, so both
+peers always enforce the same limits. Keep bulk data in files or external
+storage and pass references in envelopes.
+
 On the Manager, each connection is full duplex. A dedicated reader task owns
 the read half and completes every frame before handing the decoded envelope to
 the session, so a frame split across arbitrary socket reads is reassembled

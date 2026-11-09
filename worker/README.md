@@ -75,6 +75,18 @@ arguments. Additional `--key=value` arguments become `Worker.extra`.
 - `run()` closes the connection on malformed frames, invalid reserved
   metadata, or a wrong-direction operation.
 
+### Frame limits
+
+The worker enforces the limits the Manager passes in `RUNPY_MAX_FRAME_BYTES`
+(maximum JSON body, default 8 MiB) and `RUNPY_FRAME_TIMEOUT_MS` (time to
+finish a frame after its first byte, default 30 seconds). A non-positive or
+non-numeric value raises `ValueError` before the socket is opened. `send`,
+`log`, and results are encoded before anything is written: a body above the
+limit raises `FrameTooLargeError` (a `ValueError`), and NaN or infinite numbers
+raise `ValueError`, leaving the connection usable. An inbound frame that is
+empty, oversized, or stalled closes the connection. Keep bulk data outside
+envelopes.
+
 ## Envelope model
 
 Every message is exactly two objects:

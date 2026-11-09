@@ -2,9 +2,9 @@
 
 import json
 import socket
-import struct
 from typing import Dict, Optional
 
+from ._protocol import FrameLimits, decode_body, encode_frame, recv_frame
 from .utils import (
     Data,
     Envelope,
@@ -64,12 +64,15 @@ class Worker:
             extra: Parsed ``--key=value`` arguments.
 
         Raises:
-            ValueError: If ``name`` is empty.
+            ValueError: If ``name`` is empty or a Manager-supplied frame limit
+                in ``RUNPY_MAX_FRAME_BYTES``/``RUNPY_FRAME_TIMEOUT_MS`` is not
+                a positive integer.
             OSError: If socket creation, connection, or the initial send fails.
         """
         if not name:
             raise ValueError("Worker ID is required")
 
+        self._limits = FrameLimits.from_env()
         self.__ok = False
         self.__cycles = 0
         self.__exec_payload: Optional[Data] = None
@@ -87,13 +90,13 @@ class Worker:
         self.__ok = True
         self._send_operation("ready", {})
 
-    def _send_bytes(self, payload: bytes) -> None:
-        """Write one 8-byte little-endian length-prefixed payload.
+    def _send_bytes(self, frame: bytes) -> None:
+        """Write one complete pre-encoded frame.
 
         Any write failure marks the receive loop as closed and is re-raised.
         """
         try:
-            self.stream.sendall(struct.pack("<Q", len(payload)) + payload)
+            self.stream.sendall(frame)
         except Exception:
             self.__ok = False
             raise
@@ -102,13 +105,15 @@ class Worker:
         """Copy, trust-stamp, serialize, and send one complete envelope.
 
         Caller-provided ``x_wid`` and ``x_spath`` values are overwritten with
-        this connection's Manager-supplied identity and socket path.
+        this connection's Manager-supplied identity and socket path. Encoding
+        happens before any byte is written, so an oversized or non-finite
+        envelope raises ``ValueError`` and leaves the connection usable.
         """
         meta = dict(envelope["meta"])
         meta["x_wid"] = self.name
         meta["x_spath"] = self.__sock_path
         stamped: Envelope = {"meta": meta, "data": dict(envelope["data"])}
-        self._send_bytes(json.dumps(stamped, separators=(",", ":")).encode("utf-8"))
+        self._send_bytes(encode_frame(stamped, self._limits.max_frame_bytes))
 
     def _send_operation(
         self,
@@ -196,47 +201,20 @@ class Worker:
 
         return None
 
-    @staticmethod
-    def _recv_exact(
-        stream: socket.socket,
-        size: int,
-        *,
-        allow_clean_close: bool = False,
-    ) -> Optional[bytes]:
-        """Read exactly ``size`` bytes from a socket.
-
-        A clean close before any bytes returns ``None`` only when
-        ``allow_clean_close`` is true. Mid-frame closure raises
-        ``ConnectionError``.
-        """
-        chunks = bytearray()
-        while len(chunks) < size:
-            chunk = stream.recv(size - len(chunks))
-            if not chunk:
-                if allow_clean_close and not chunks:
-                    return None
-                raise ConnectionError("Connection closed during a frame")
-            chunks.extend(chunk)
-        return bytes(chunks)
-
     def _recv_envelope(self) -> Optional[Envelope]:
         """Read, decode, and validate one Manager-to-worker frame.
 
         The frame uses an 8-byte little-endian payload size followed by UTF-8
-        JSON. Invalid encoding, JSON, shape, metadata, or operation direction
-        raises ``ValueError``.
+        JSON, bounded by the Manager-supplied size and partial-frame deadline.
+        Invalid size, encoding, JSON, shape, metadata, or operation direction
+        raises ``ValueError``; a stalled frame raises ``TimeoutError``.
         """
-        size_data = self._recv_exact(self.stream, 8, allow_clean_close=True)
-        if size_data is None:
+        payload = recv_frame(self.stream, self._limits)
+        if payload is None:
             return None
 
-        size = struct.unpack("<Q", size_data)[0]
-        payload = self._recv_exact(self.stream, size)
-        if payload is None:
-            raise ConnectionError("Connection closed before envelope payload")
-
         try:
-            decoded = json.loads(payload.decode("utf-8"))
+            decoded = decode_body(payload)
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
             raise ValueError(f"Invalid JSON envelope: {error}") from error
 

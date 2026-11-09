@@ -17,6 +17,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, interval, timeout};
 
+use crate::config::ProtocolLimits;
 use crate::manager::WorkerIdentity;
 use crate::scribbler::Scribbler;
 use crate::watchdog::WatchdogService;
@@ -511,6 +512,7 @@ struct WorkerSession {
     outbound_rx: mpsc::Receiver<Envelope>,
     mailer: Arc<Mailer>,
     logger: Arc<Scribbler>,
+    limits: ProtocolLimits,
 }
 
 /// Kill the complete process group when possible, then reap the stored child.
@@ -693,10 +695,11 @@ pub(crate) struct ControlPlane {
     mailer: Arc<Mailer>,
     logger: Arc<Scribbler>,
     monitor: Mutex<Option<JoinHandle<()>>>,
+    limits: ProtocolLimits,
 }
 
 impl ControlPlane {
-    pub(crate) fn new(logger: Arc<Scribbler>) -> Arc<Self> {
+    pub(crate) fn new(logger: Arc<Scribbler>, limits: ProtocolLimits) -> Arc<Self> {
         let workers = Arc::new(RwLock::new(HashMap::new()));
         let watchdog = WatchdogService::new(workers.clone(), logger.clone());
         let mailer = Arc::new(Mailer {
@@ -715,7 +718,12 @@ impl ControlPlane {
             mailer,
             logger,
             monitor: Mutex::new(None),
+            limits,
         })
+    }
+
+    pub(crate) fn limits(&self) -> ProtocolLimits {
+        self.limits
     }
 
     pub(crate) fn logger(&self) -> &Scribbler {
@@ -851,6 +859,7 @@ impl ControlPlane {
             outbound_rx,
             mailer: self.mailer.clone(),
             logger: self.logger.clone(),
+            limits: self.limits,
         }));
         let stdout = tokio::spawn(capture_worker_output(
             stdout,
@@ -980,6 +989,7 @@ impl ControlPlane {
             outbound_rx,
             mailer,
             logger,
+            limits,
         } = session;
         let outbound_rx = Arc::new(tokio::sync::Mutex::new(outbound_rx));
         loop {
@@ -1001,7 +1011,8 @@ impl ControlPlane {
             let (inbound_tx, mut inbound_rx) = mpsc::channel::<Envelope>(SESSION_QUEUE_CAPACITY);
             let reader_logger = logger.clone();
             let reader = tokio::spawn(async move {
-                while let Some(envelope) = Self::recv_envelope(&reader_logger, &mut read_half).await
+                while let Some(envelope) =
+                    Self::recv_envelope(&reader_logger, &mut read_half, &limits).await
                 {
                     if inbound_tx.send(envelope).await.is_err() {
                         break;
@@ -1019,6 +1030,7 @@ impl ControlPlane {
                 socket_path.clone(),
                 write_half,
                 outbound_rx.clone(),
+                limits,
                 logger.clone(),
             ));
             let mut writer = AbortOnDrop(writer);
@@ -1061,20 +1073,32 @@ impl ControlPlane {
     /// Write queued envelopes until the route closes or a write fails.
     ///
     /// The shared receiver is held only while this connection's writer runs;
-    /// aborting the writer releases it for a later connection.
+    /// aborting the writer releases it for a later connection. An envelope
+    /// that cannot be encoded within the frame limit is rejected without
+    /// touching the socket, so the connection stays usable.
     async fn run_writer(
         worker_id: String,
         socket_path: String,
         mut write_half: tokio::net::unix::OwnedWriteHalf,
         outbound_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<Envelope>>>,
+        limits: ProtocolLimits,
         logger: Arc<Scribbler>,
     ) {
         let mut outbound_rx = outbound_rx.lock().await;
-        while let Some(envelope) = outbound_rx.recv().await {
-            if let Err(error) =
-                Self::write_stamped_envelope(&worker_id, &socket_path, &mut write_half, envelope)
-                    .await
-            {
+        while let Some(mut envelope) = outbound_rx.recv().await {
+            if let Err(error) = envelope.validate_manager_to_worker() {
+                logger.error_with("ControlPlane", &format!("{worker_id} Send error: {error}"));
+                continue;
+            }
+            envelope.stamp_trusted(&worker_id, &socket_path);
+            let frame = match encode_frame(&envelope, limits.max_frame_bytes()) {
+                Ok(frame) => frame,
+                Err(error) => {
+                    logger.error_with("ControlPlane", &format!("{worker_id} Send error: {error}"));
+                    continue;
+                }
+            };
+            if let Err(error) = write_frame(&mut write_half, &frame).await {
                 logger.error_with("ControlPlane", &format!("{worker_id} Send error: {error}"));
                 return;
             }
@@ -1084,49 +1108,46 @@ impl ControlPlane {
         std::future::pending::<()>().await;
     }
 
-    /// Read one little-endian length-prefixed JSON envelope.
+    /// Read and decode one envelope, logging why a connection must close.
     ///
-    /// A malformed body or I/O failure ends only the current socket connection;
-    /// the outer session loop can accept a reconnect from the same process.
-    async fn recv_envelope<R>(logger: &Scribbler, stream: &mut R) -> Option<Envelope>
+    /// A malformed, oversized, truncated, or stalled frame ends only the
+    /// current socket connection.
+    async fn recv_envelope<R>(
+        logger: &Scribbler,
+        stream: &mut R,
+        limits: &ProtocolLimits,
+    ) -> Option<Envelope>
     where
         R: AsyncRead + Unpin,
     {
-        let mut size_buf = [0_u8; 8];
-        if let Err(error) = stream.read_exact(&mut size_buf).await {
-            match error.kind() {
-                std::io::ErrorKind::UnexpectedEof => {}
-                std::io::ErrorKind::ConnectionReset => {
-                    logger.debug_with("Socket", "Connection reset by peer");
+        let payload = match read_frame(stream, limits).await {
+            Ok(Some(payload)) => payload,
+            Ok(None) => return None,
+            Err(FrameError::Io(error)) => {
+                match error.kind() {
+                    std::io::ErrorKind::ConnectionReset => {
+                        logger.debug_with("Socket", "Connection reset by peer");
+                    }
+                    std::io::ErrorKind::BrokenPipe => {
+                        logger.debug_with("Socket", "Broken pipe - peer closed unexpectedly");
+                    }
+                    _ => logger.error_with(
+                        "Socket",
+                        &format!("Read error: {error} (kind: {:?})", error.kind()),
+                    ),
                 }
-                std::io::ErrorKind::BrokenPipe => {
-                    logger.debug_with("Socket", "Broken pipe - peer closed unexpectedly");
-                }
-                _ => logger.error_with(
-                    "Socket",
-                    &format!("Read error: {error} (kind: {:?})", error.kind()),
-                ),
+                return None;
             }
-            return None;
-        }
+            Err(error) => {
+                logger.error_with("Protocol", &error.to_string());
+                return None;
+            }
+        };
 
-        let envelope_size = u64::from_le_bytes(size_buf) as usize;
-        let mut envelope_buf = vec![0_u8; envelope_size];
-        if let Err(error) = stream.read_exact(&mut envelope_buf).await {
-            logger.error_with(
-                "Socket",
-                &format!(
-                    "Error reading envelope body: {error} (kind: {:?})",
-                    error.kind()
-                ),
-            );
-            return None;
-        }
-
-        match serde_json::from_slice(&envelope_buf) {
+        match serde_json::from_slice(&payload) {
             Ok(envelope) => Some(envelope),
             Err(error) => {
-                let raw = String::from_utf8_lossy(&envelope_buf);
+                let raw = String::from_utf8_lossy(&payload);
                 logger.error_with(
                     "Protocol",
                     &format!("JSON envelope error: {error}\n  Raw: {raw}"),
@@ -1135,28 +1156,147 @@ impl ControlPlane {
             }
         }
     }
+}
 
-    /// Validate direction, overwrite trusted routing fields, and write one
-    /// little-endian length-prefixed JSON envelope.
-    async fn write_stamped_envelope<W>(
-        worker_id: &str,
-        socket_path: &str,
-        stream: &mut W,
-        mut envelope: Envelope,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
-    where
-        W: AsyncWrite + Unpin,
-    {
-        envelope.validate_manager_to_worker()?;
-        envelope.stamp_trusted(worker_id, socket_path);
+/// Size of the little-endian length header that precedes every frame body.
+const FRAME_HEADER_BYTES: usize = 8;
 
-        let payload = serde_json::to_vec(&envelope)?;
-        let size = (payload.len() as u64).to_le_bytes();
-        stream.write_all(&size).await?;
-        stream.write_all(&payload).await?;
-        stream.flush().await?;
+/// Why a frame could not be read or encoded.
+#[derive(Debug)]
+enum FrameError {
+    Io(std::io::Error),
+    Empty,
+    TooLarge { size: u64, limit: usize },
+    Truncated,
+    TimedOut,
+    Encode(serde_json::Error),
+}
+
+impl fmt::Display for FrameError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(error) => write!(f, "socket I/O failed: {error}"),
+            Self::Empty => write!(f, "frame declares an empty body"),
+            Self::TooLarge { size, limit } => {
+                write!(
+                    f,
+                    "frame body of {size} bytes exceeds the {limit}-byte limit"
+                )
+            }
+            Self::Truncated => write!(f, "connection closed in the middle of a frame"),
+            Self::TimedOut => write!(f, "frame did not complete before the frame timeout"),
+            Self::Encode(error) => write!(f, "envelope could not be encoded: {error}"),
+        }
+    }
+}
+
+impl From<std::io::Error> for FrameError {
+    fn from(error: std::io::Error) -> Self {
+        if error.kind() == std::io::ErrorKind::UnexpectedEof {
+            Self::Truncated
+        } else {
+            Self::Io(error)
+        }
+    }
+}
+
+/// Read one frame body, enforcing size and partial-frame deadline.
+///
+/// Returns `Ok(None)` for a clean close before any byte. Waiting for the
+/// first byte is unbounded; once it arrives the rest of the frame must finish
+/// within `frame_timeout`. The declared length is validated before any body
+/// allocation, so a hostile header cannot exhaust memory.
+async fn read_frame<R>(
+    stream: &mut R,
+    limits: &ProtocolLimits,
+) -> Result<Option<Vec<u8>>, FrameError>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut header = [0_u8; FRAME_HEADER_BYTES];
+    loop {
+        match stream.read(&mut header[..1]).await {
+            Ok(0) => return Ok(None),
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(FrameError::Io(error)),
+        }
+    }
+
+    let rest = async {
+        stream.read_exact(&mut header[1..]).await?;
+        let size = u64::from_le_bytes(header);
+        if size == 0 {
+            return Err(FrameError::Empty);
+        }
+        let length = usize::try_from(size)
+            .ok()
+            .filter(|length| *length <= limits.max_frame_bytes())
+            .ok_or(FrameError::TooLarge {
+                size,
+                limit: limits.max_frame_bytes(),
+            })?;
+        let mut payload = vec![0_u8; length];
+        stream.read_exact(&mut payload).await?;
+        Ok(payload)
+    };
+    match timeout(limits.frame_timeout(), rest).await {
+        Ok(result) => result.map(Some),
+        Err(_) => Err(FrameError::TimedOut),
+    }
+}
+
+/// `io::Write` sink that refuses to grow a frame past its body limit.
+struct LimitedFrame {
+    buffer: Vec<u8>,
+    limit: usize,
+}
+
+impl std::io::Write for LimitedFrame {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.buffer.len() - FRAME_HEADER_BYTES + bytes.len() > self.limit {
+            return Err(std::io::Error::other("frame limit exceeded"));
+        }
+        self.buffer.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
     }
+}
+
+/// Serialize header and body into one buffer without exceeding `limit`.
+///
+/// Serialization stops at the limit instead of materializing an arbitrarily
+/// large body first.
+fn encode_frame(envelope: &Envelope, limit: usize) -> Result<Vec<u8>, FrameError> {
+    let mut sink = LimitedFrame {
+        buffer: vec![0_u8; FRAME_HEADER_BYTES],
+        limit,
+    };
+    if let Err(error) = serde_json::to_writer(&mut sink, envelope) {
+        return Err(if error.is_io() {
+            FrameError::TooLarge {
+                size: (sink.buffer.len() - FRAME_HEADER_BYTES) as u64,
+                limit,
+            }
+        } else {
+            FrameError::Encode(error)
+        });
+    }
+    let size = (sink.buffer.len() - FRAME_HEADER_BYTES) as u64;
+    sink.buffer[..FRAME_HEADER_BYTES].copy_from_slice(&size.to_le_bytes());
+    Ok(sink.buffer)
+}
+
+/// Write one pre-encoded frame with a single buffered write.
+async fn write_frame<W>(stream: &mut W, frame: &[u8]) -> Result<(), FrameError>
+where
+    W: AsyncWrite + Unpin,
+{
+    stream.write_all(frame).await.map_err(FrameError::Io)?;
+    stream.flush().await.map_err(FrameError::Io)
 }
 
 struct Mailer {
@@ -1266,7 +1406,7 @@ mod tests {
         UnixStream::connect(sock_path).await.unwrap()
     }
 
-    async fn write_frame(stream: &mut UnixStream, envelope: &Envelope) {
+    async fn write_envelope(stream: &mut UnixStream, envelope: &Envelope) {
         let payload = serde_json::to_vec(envelope).unwrap();
         stream
             .write_all(&(payload.len() as u64).to_le_bytes())
@@ -1276,7 +1416,7 @@ mod tests {
         stream.flush().await.unwrap();
     }
 
-    async fn read_frame(stream: &mut UnixStream) -> Envelope {
+    async fn read_envelope(stream: &mut UnixStream) -> Envelope {
         let mut size = [0_u8; 8];
         stream.read_exact(&mut size).await.unwrap();
         let mut payload = vec![0_u8; u64::from_le_bytes(size) as usize];
@@ -1337,6 +1477,160 @@ mod tests {
         assert!(!records[1].truncated);
         assert_eq!(records[2].line, "�\\u{1b}A");
         assert!(!records[2].truncated);
+    }
+
+    fn limits(max_frame_bytes: usize, frame_timeout: Duration) -> ProtocolLimits {
+        ProtocolLimits::new(max_frame_bytes, frame_timeout).unwrap()
+    }
+
+    fn header(size: u64) -> [u8; 8] {
+        size.to_le_bytes()
+    }
+
+    #[tokio::test]
+    async fn frame_reader_accepts_bodies_up_to_the_limit() {
+        let (mut writer, mut reader) = tokio::io::duplex(1024);
+        let limits = limits(16, Duration::from_secs(1));
+        writer.write_all(&header(16)).await.unwrap();
+        writer.write_all(&[b'a'; 16]).await.unwrap();
+        writer.write_all(&header(1)).await.unwrap();
+        writer.write_all(b"b").await.unwrap();
+        drop(writer);
+
+        assert_eq!(
+            read_frame(&mut reader, &limits).await.unwrap().unwrap(),
+            [b'a'; 16]
+        );
+        assert_eq!(
+            read_frame(&mut reader, &limits).await.unwrap().unwrap(),
+            b"b"
+        );
+        assert!(read_frame(&mut reader, &limits).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn frame_reader_rejects_empty_and_oversized_headers_before_allocating() {
+        for (size, expect_too_large) in [(0_u64, false), (17, true), (u64::MAX, true)] {
+            let (mut writer, mut reader) = tokio::io::duplex(64);
+            // No body follows: an oversized header must fail immediately
+            // rather than wait for (or allocate) the declared body.
+            writer.write_all(&header(size)).await.unwrap();
+            let result = timeout(
+                Duration::from_secs(1),
+                read_frame(&mut reader, &limits(16, Duration::from_secs(30))),
+            )
+            .await
+            .expect("header validation must not wait for a body");
+            match result {
+                Err(FrameError::TooLarge {
+                    size: rejected,
+                    limit,
+                }) => {
+                    assert!(expect_too_large);
+                    assert_eq!((rejected, limit), (size, 16));
+                }
+                Err(FrameError::Empty) => assert!(!expect_too_large),
+                other => panic!("unexpected result for size {size}: {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn frame_reader_reports_truncation_at_every_boundary() {
+        let mut frame = header(4).to_vec();
+        frame.extend_from_slice(b"body");
+        for cut in 1..frame.len() {
+            let (mut writer, mut reader) = tokio::io::duplex(64);
+            writer.write_all(&frame[..cut]).await.unwrap();
+            drop(writer);
+            let result = read_frame(&mut reader, &limits(16, Duration::from_secs(1))).await;
+            assert!(
+                matches!(result, Err(FrameError::Truncated)),
+                "cut at {cut}: {result:?}"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn frame_deadline_starts_at_first_byte_and_covers_header_and_body() {
+        let limits = limits(16, Duration::from_secs(5));
+
+        // Stalled header.
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        writer.write_all(&header(4)[..3]).await.unwrap();
+        let result = read_frame(&mut reader, &limits).await;
+        assert!(matches!(result, Err(FrameError::TimedOut)), "{result:?}");
+
+        // Stalled body.
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        writer.write_all(&header(4)).await.unwrap();
+        writer.write_all(b"bo").await.unwrap();
+        let result = read_frame(&mut reader, &limits).await;
+        assert!(matches!(result, Err(FrameError::TimedOut)), "{result:?}");
+        drop(writer);
+
+        // An idle connection far longer than the deadline is still healthy.
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        let read = tokio::spawn(async move { read_frame(&mut reader, &limits).await });
+        tokio::time::sleep(Duration::from_secs(600)).await;
+        writer.write_all(&header(2)).await.unwrap();
+        writer.write_all(b"ok").await.unwrap();
+        assert_eq!(read.await.unwrap().unwrap().unwrap(), b"ok");
+    }
+
+    #[test]
+    fn frame_encoder_writes_one_buffer_and_stops_at_the_limit() {
+        let envelope =
+            Envelope::new(Meta::new(), object(json!({ "blob": "x".repeat(64) }))).unwrap();
+        let body = serde_json::to_vec(&envelope).unwrap();
+
+        let frame = encode_frame(&envelope, body.len()).unwrap();
+        assert_eq!(frame[..8], header(body.len() as u64));
+        assert_eq!(frame[8..], body[..]);
+
+        let error = encode_frame(&envelope, body.len() - 1).unwrap_err();
+        assert!(matches!(error, FrameError::TooLarge { limit, .. } if limit == body.len() - 1));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn oversized_outbound_envelope_is_rejected_without_closing_the_connection() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let control_plane = ControlPlane::new(test_logger(), limits(256, Duration::from_secs(5)));
+        let mut stream = register_worker(&control_plane, directory.path(), "worker", None).await;
+
+        let oversized =
+            Envelope::new(Meta::new(), object(json!({ "blob": "x".repeat(1024) }))).unwrap();
+        let small = Envelope::new(Meta::new(), object(json!({ "ok": true }))).unwrap();
+        control_plane.send("worker", oversized).await.unwrap();
+        control_plane.send("worker", small).await.unwrap();
+
+        let received = timeout(Duration::from_secs(1), read_envelope(&mut stream))
+            .await
+            .unwrap();
+        assert_eq!(received.data()["ok"], true);
+        control_plane.shutdown_now();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn oversized_inbound_header_closes_the_connection_without_dispatch() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let control_plane = ControlPlane::new(test_logger(), limits(256, Duration::from_secs(5)));
+        let (called_tx, called_rx) = std_mpsc::channel();
+        let handler: MessageHandler = Arc::new(move |_| {
+            called_tx.send(()).unwrap();
+        });
+        let mut stream =
+            register_worker(&control_plane, directory.path(), "worker", Some(handler)).await;
+
+        stream.write_all(&header(u64::MAX)).await.unwrap();
+        let mut byte = [0_u8; 1];
+        let read = timeout(Duration::from_secs(1), stream.read(&mut byte))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(read, 0, "the Manager must close the connection");
+        assert!(called_rx.try_recv().is_err());
+        control_plane.shutdown_now();
     }
 
     #[test]
@@ -1422,7 +1716,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn shared_router_uses_live_handler_and_replies_to_originating_workers() {
         let directory = tempfile::TempDir::new().unwrap();
-        let control_plane = ControlPlane::new(test_logger());
+        let control_plane = ControlPlane::new(test_logger(), ProtocolLimits::default());
         let mut first = register_worker(&control_plane, directory.path(), "worker-a", None).await;
         let mut second = register_worker(&control_plane, directory.path(), "worker-b", None).await;
         let (observed_tx, observed_rx) = std_mpsc::channel();
@@ -1443,13 +1737,13 @@ mod tests {
                 "data": {"source": source}
             }))
             .unwrap();
-            write_frame(stream, &inbound).await;
+            write_envelope(stream, &inbound).await;
         }
 
-        let first_reply = timeout(Duration::from_secs(1), read_frame(&mut first))
+        let first_reply = timeout(Duration::from_secs(1), read_envelope(&mut first))
             .await
             .unwrap();
-        let second_reply = timeout(Duration::from_secs(1), read_frame(&mut second))
+        let second_reply = timeout(Duration::from_secs(1), read_envelope(&mut second))
             .await
             .unwrap();
         assert_eq!(first_reply.meta()["x_wid"], "worker-a");
@@ -1480,7 +1774,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn wrong_direction_closes_connection_without_dispatch() {
         let directory = tempfile::TempDir::new().unwrap();
-        let control_plane = ControlPlane::new(test_logger());
+        let control_plane = ControlPlane::new(test_logger(), ProtocolLimits::default());
         let (called_tx, called_rx) = std_mpsc::channel();
         let handler: MessageHandler = Arc::new(move |_| {
             called_tx.send(()).unwrap();
@@ -1488,7 +1782,7 @@ mod tests {
         let mut stream =
             register_worker(&control_plane, directory.path(), "worker", Some(handler)).await;
 
-        write_frame(&mut stream, &Envelope::execute(Data::new())).await;
+        write_envelope(&mut stream, &Envelope::execute(Data::new())).await;
         let mut byte = [0_u8; 1];
         let result = timeout(Duration::from_secs(1), stream.read_exact(&mut byte))
             .await
@@ -1504,7 +1798,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn outbound_activity_preserves_partially_received_frames() {
         let directory = tempfile::TempDir::new().unwrap();
-        let control_plane = ControlPlane::new(test_logger());
+        let control_plane = ControlPlane::new(test_logger(), ProtocolLimits::default());
         let (observed_tx, observed_rx) = std_mpsc::channel();
         let handler: MessageHandler = Arc::new(move |inbound| {
             observed_tx.send(inbound.envelope.data().clone()).unwrap();
@@ -1543,7 +1837,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            let outbound = timeout(Duration::from_secs(1), read_frame(&mut stream))
+            let outbound = timeout(Duration::from_secs(1), read_envelope(&mut stream))
                 .await
                 .unwrap();
             assert_eq!(outbound.data()["outbound"], index);
@@ -1566,7 +1860,7 @@ mod tests {
     async fn blocked_outbound_write_keeps_draining_inbound_frames() {
         const INBOUND_FRAMES: usize = 400;
         let directory = tempfile::TempDir::new().unwrap();
-        let control_plane = ControlPlane::new(test_logger());
+        let control_plane = ControlPlane::new(test_logger(), ProtocolLimits::default());
         let received = Arc::new(AtomicUsize::new(0));
         let handler_received = received.clone();
         let handler: MessageHandler = Arc::new(move |_| {
@@ -1641,7 +1935,7 @@ mod tests {
     #[test]
     fn registration_starts_monitoring_after_synchronous_construction() {
         let directory = tempfile::TempDir::new().unwrap();
-        let control_plane = ControlPlane::new(test_logger());
+        let control_plane = ControlPlane::new(test_logger(), ProtocolLimits::default());
         assert!(control_plane.monitor.lock().is_none());
 
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1658,7 +1952,7 @@ mod tests {
     #[tokio::test]
     async fn registration_after_shutdown_stops_child_and_removes_socket() {
         let directory = tempfile::TempDir::new().unwrap();
-        let control_plane = ControlPlane::new(test_logger());
+        let control_plane = ControlPlane::new(test_logger(), ProtocolLimits::default());
         let sock_path = directory.path().join("worker.sock");
         let listener = UnixListener::bind(&sock_path).unwrap();
         let socket_path = sock_path.to_string_lossy().into_owned();

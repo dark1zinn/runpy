@@ -5,6 +5,7 @@ implements the socket lifecycle, and :func:`RunScript` is the script bootstrap
 invoked by the Rust Manager.
 """
 
+from ._protocol import FrameTooLargeError
 from .worker import Worker
 from .runScript import RunScript
 from .utils import (
@@ -27,4 +28,5 @@ __all__ = [
     "create_envelope",
     "ExecutePayload",
     "ExecuteResult",
+    "FrameTooLargeError",
 ]

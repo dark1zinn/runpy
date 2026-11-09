@@ -96,6 +96,7 @@
 //! Dropping [`Manager`] synchronously force-stops remaining process groups and
 //! removes their socket files.
 
+mod config;
 mod integrity;
 mod manager;
 mod protocol;
@@ -110,6 +111,7 @@ use crate::integrity::IntegrityChecker;
 use crate::protocol::ControlPlane;
 
 // ── Public re-exports ──────────────────────────────────────────────────
+pub use config::{DEFAULT_FRAME_TIMEOUT, DEFAULT_MAX_FRAME_BYTES, ProtocolLimits};
 pub use manager::{Worker, WorkerIdentity};
 pub use protocol::{
     Data, Envelope, EnvelopeError, InboundEnvelope, MessageHandler, Meta, WorkerOutput,
@@ -169,13 +171,29 @@ impl Manager {
     /// manager.check_integrity().expect("configured runtime is valid");
     /// ```
     pub fn with_uv_path(scripts_path: &str, uv_path: &str) -> Self {
+        Self::with_limits(scripts_path, uv_path, ProtocolLimits::default())
+    }
+
+    /// Create a Manager with an explicit `uv` executable and frame limits.
+    ///
+    /// The same limits apply to Manager reads and writes and are propagated
+    /// to every managed worker through its environment.
+    ///
+    /// ```no_run
+    /// use runpy::{Manager, ProtocolLimits};
+    /// use std::time::Duration;
+    ///
+    /// let limits = ProtocolLimits::new(1024 * 1024, Duration::from_secs(10)).unwrap();
+    /// let manager = Manager::with_limits("worker", "uv", limits);
+    /// ```
+    pub fn with_limits(scripts_path: &str, uv_path: &str, limits: ProtocolLimits) -> Self {
         let logger = Arc::new(Scribbler::new());
         let integrity = Arc::new(IntegrityChecker::new(scripts_path, uv_path, logger.clone()));
         if let Err(error) = integrity.perform_check() {
             logger.error_with("Manager", &format!("Integrity check failed: {error}"));
         }
 
-        let control_plane = ControlPlane::new(logger.clone());
+        let control_plane = ControlPlane::new(logger.clone(), limits);
         if tokio::runtime::Handle::try_current().is_ok() {
             control_plane.start_monitoring(5);
         }
