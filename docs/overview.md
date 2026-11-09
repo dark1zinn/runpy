@@ -194,11 +194,14 @@ Each socket frame consists of:
 1. an unsigned 64-bit little-endian payload length;
 2. exactly that many UTF-8 JSON bytes.
 
-On the Manager, a dedicated reader task owns each connection's read half and
-completes every frame before handing the decoded envelope to the session. The
-session therefore waits for complete envelopes and outbound work without ever
-cancelling a partially read frame: a frame split across arbitrary socket reads
-is reassembled exactly, even while the Manager is sending to the same worker.
+On the Manager, each connection is full duplex. A dedicated reader task owns
+the read half and completes every frame before handing the decoded envelope to
+the session, so a frame split across arbitrary socket reads is reassembled
+exactly, even while the Manager is sending to the same worker. A separate writer
+task owns the write half: a write blocked on a busy worker never stops inbound
+dispatch, so large frames can flow in both directions at once. If either task
+fails, the whole connection is closed; a partially written frame is never
+retried.
 
 The JSON value must contain exactly two fields, both objects:
 
