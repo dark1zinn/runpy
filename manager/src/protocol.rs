@@ -93,6 +93,8 @@ pub enum EnvelopeError {
         /// Human-readable expected message direction.
         direction: &'static str,
     },
+    /// The envelope nests containers deeper than the protocol allows.
+    TooDeep,
 }
 
 impl fmt::Display for EnvelopeError {
@@ -116,6 +118,11 @@ impl fmt::Display for EnvelopeError {
             } => write!(
                 f,
                 "Runpy operation '{operation}' is invalid for {direction} envelopes"
+            ),
+            Self::TooDeep => write!(
+                f,
+                "envelope nesting exceeds the maximum depth of {}",
+                crate::strict_json::MAX_JSON_DEPTH
             ),
         }
     }
@@ -274,6 +281,17 @@ impl Envelope {
 
     fn validate_worker_to_manager(&self) -> Result<(), EnvelopeError> {
         validate_direction(self.operation(), WORKER_OPERATIONS, "worker-to-manager")
+    }
+
+    /// Reject envelopes nested deeper than the strict JSON profile allows,
+    /// counting the envelope object itself.
+    fn validate_depth(&self) -> Result<(), EnvelopeError> {
+        let deepest = 1 + crate::strict_json::object_depth(&self.meta)
+            .max(crate::strict_json::object_depth(&self.data));
+        if deepest > crate::strict_json::MAX_JSON_DEPTH {
+            return Err(EnvelopeError::TooDeep);
+        }
+        Ok(())
     }
 }
 
@@ -502,6 +520,7 @@ impl MessageSender {
 
     fn encode(&self, mut envelope: Envelope) -> Result<(Vec<u8>, u32), RunpyError> {
         envelope.validate_manager_to_worker()?;
+        envelope.validate_depth()?;
         envelope.stamp_trusted(&self.worker_id, &self.socket_path);
         let frame =
             encode_frame(&envelope, self.limits.max_frame_bytes()).map_err(
@@ -1900,10 +1919,14 @@ impl ControlPlane {
             }
         };
 
-        serde_json::from_slice(&payload).map_err(|error| {
-            logger.error_with("Protocol", &invalid_body_diagnostic(&error, &payload));
-            ExitReason::ProtocolViolation
-        })
+        // Strict profile first (depth scan, duplicate keys), then the
+        // envelope's own shape and metadata validation.
+        crate::strict_json::parse_strict(&payload)
+            .and_then(|value| serde_json::from_value(value).map_err(|error| error.to_string()))
+            .map_err(|error| {
+                logger.error_with("Protocol", &invalid_body_diagnostic(&error, &payload));
+                ExitReason::ProtocolViolation
+            })
     }
 }
 
@@ -1916,7 +1939,7 @@ const INVALID_BODY_EXCERPT: usize = 1024;
 /// most [`INVALID_BODY_EXCERPT`] sanitized bytes. The body may be large,
 /// binary, contain terminal control sequences, or carry sensitive data, so it
 /// is never logged whole.
-fn invalid_body_diagnostic(error: &serde_json::Error, payload: &[u8]) -> String {
+fn invalid_body_diagnostic(error: &dyn fmt::Display, payload: &[u8]) -> String {
     let excerpt = &payload[..payload.len().min(INVALID_BODY_EXCERPT)];
     format!(
         "JSON envelope error: {error} ({} bytes); first {} bytes: {}",
@@ -2221,6 +2244,57 @@ mod tests {
                 && record.stream == WorkerOutputStream::Stdout
                 && !record.truncated
         }));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ambiguous_or_too_deep_inbound_json_is_a_violation() {
+        let mut too_deep = String::from(r#"{"meta": {}, "data": {"a": "#);
+        too_deep.push_str(&"[".repeat(crate::strict_json::MAX_JSON_DEPTH));
+        too_deep.push_str(&"]".repeat(crate::strict_json::MAX_JSON_DEPTH));
+        too_deep.push_str("}}");
+        for (name, body) in [
+            (
+                "duplicate",
+                r#"{"meta": {"k": 1, "k": 2}, "data": {}}"#.to_string(),
+            ),
+            ("deep", too_deep),
+        ] {
+            let directory = tempfile::TempDir::new().unwrap();
+            let control_plane = test_control_plane(ProtocolLimits::default());
+            let mut stream = register_worker(&control_plane, directory.path(), name, None).await;
+            stream
+                .write_all(&(body.len() as u64).to_le_bytes())
+                .await
+                .unwrap();
+            stream.write_all(body.as_bytes()).await.unwrap();
+            wait_for_removal(&control_plane, name).await;
+            control_plane.shutdown_now();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn too_deep_outbound_envelopes_are_rejected_before_writing() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let control_plane = test_control_plane(ProtocolLimits::default());
+        let mut stream = register_worker(&control_plane, directory.path(), "worker", None).await;
+        let mut value = json!(1);
+        // Envelope (1) + data (2) + 62 nested arrays reaches the limit.
+        for _ in 0..crate::strict_json::MAX_JSON_DEPTH - 2 {
+            value = json!([value]);
+        }
+        let at_limit = Envelope::new(Meta::new(), object(json!({ "v": value.clone() }))).unwrap();
+        let too_deep = Envelope::new(Meta::new(), object(json!({ "v": [value] }))).unwrap();
+
+        assert!(matches!(
+            control_plane.send("worker", too_deep).await,
+            Err(RunpyError::InvalidEnvelope(EnvelopeError::TooDeep))
+        ));
+        control_plane.send("worker", at_limit).await.unwrap();
+        let received = timeout(Duration::from_secs(2), read_envelope(&mut stream))
+            .await
+            .unwrap();
+        assert!(received.data().contains_key("v"));
+        control_plane.shutdown_now();
     }
 
     #[test]

@@ -513,6 +513,24 @@ key beginning with `x_` is reserved by Runpy. Public custom-envelope builders
 reject such keys. At each outbound transport edge, Runpy stamps `x_wid` and
 `x_spath`; incoming values supplied by a peer are not trusted.
 
+### Strict JSON profile
+
+Both peers apply the same JSON rules in both directions, because RFC 8259
+leaves duplicate names undefined and lets implementations limit nesting:
+
+- Any object, at any level, with a repeated key (after decoding escapes) is
+  rejected. Distinct Unicode spellings, such as precomposed and combining
+  forms, are different keys.
+- Containers may nest at most 64 levels, counting the envelope itself (so
+  `meta` and `data` are level 2). Deeper bodies are rejected by a linear,
+  string-aware scan before any recursive parsing.
+- NaN and infinite numbers are rejected.
+
+An inbound violation closes the connection. An outbound envelope that is too
+deep fails before anything is written: Rust returns
+`InvalidEnvelope(EnvelopeError::TooDeep)`, Python raises `ValueError`, and the
+connection stays usable.
+
 ### Reserved metadata
 
 | Key | Meaning |

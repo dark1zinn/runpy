@@ -22,6 +22,8 @@ from .utils import Data, Envelope, Meta, create_envelope
 DEFAULT_MAX_FRAME_BYTES = 8 * 1024 * 1024
 DEFAULT_FRAME_TIMEOUT_MS = 30_000
 PROTOCOL_VERSION = 1
+#: Deepest container nesting accepted, including the top-level envelope.
+MAX_JSON_DEPTH = 64
 
 #: Every operation the protocol defines.
 RUNPY_OPERATIONS = frozenset(
@@ -90,9 +92,14 @@ def encode_frame(value: object, max_frame_bytes: int) -> bytes:
 
     Raises:
         FrameTooLargeError: If the body would exceed ``max_frame_bytes``.
-        ValueError: If ``value`` contains NaN or infinite numbers.
+        ValueError: If ``value`` contains NaN or infinite numbers or nests
+            deeper than :data:`MAX_JSON_DEPTH`.
         TypeError: If ``value`` is not JSON serializable.
     """
+    if value_depth(value) > MAX_JSON_DEPTH:
+        raise ValueError(
+            f"Envelope nesting exceeds the maximum depth of {MAX_JSON_DEPTH}"
+        )
     frame = bytearray(_HEADER.size)
     for chunk in _ENCODER.iterencode(value):
         encoded = chunk.encode("utf-8")
@@ -109,9 +116,71 @@ def _reject_constant(name: str) -> object:
     raise ValueError(f"Non-finite JSON number '{name}' is not allowed")
 
 
+def _reject_duplicates(pairs: list) -> dict:
+    result: dict = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"Duplicate JSON object key '{key}'")
+        result[key] = value
+    return result
+
+
+def check_depth(payload: bytes) -> None:
+    """Reject bodies nested deeper than :data:`MAX_JSON_DEPTH` in one scan.
+
+    Brackets inside strings, including escaped quotes, are ignored, so the
+    check runs before any recursive parsing.
+    """
+    depth = 0
+    in_string = False
+    escaped = False
+    for byte in payload:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif byte == 0x5C:  # backslash
+                escaped = True
+            elif byte == 0x22:  # quote
+                in_string = False
+        elif byte == 0x22:
+            in_string = True
+        elif byte in (0x7B, 0x5B):  # { [
+            depth += 1
+            if depth > MAX_JSON_DEPTH:
+                raise ValueError(
+                    f"JSON nesting exceeds the maximum depth of {MAX_JSON_DEPTH}"
+                )
+        elif byte in (0x7D, 0x5D):  # } ]
+            depth = max(depth - 1, 0)
+
+
+def value_depth(value: object) -> int:
+    """Container nesting of ``value``, computed without recursion."""
+    deepest = 0
+    pending = [(value, 1)]
+    while pending:
+        item, level = pending.pop()
+        if isinstance(item, dict):
+            deepest = max(deepest, level)
+            pending.extend((child, level + 1) for child in item.values())
+        elif isinstance(item, (list, tuple)):
+            deepest = max(deepest, level)
+            pending.extend((child, level + 1) for child in item)
+    return deepest
+
+
 def decode_body(payload: bytes) -> object:
-    """Decode a UTF-8 JSON body, rejecting NaN and infinite numbers."""
-    return json.loads(payload.decode("utf-8"), parse_constant=_reject_constant)
+    """Decode a UTF-8 JSON body under the strict profile.
+
+    Rejects nesting deeper than :data:`MAX_JSON_DEPTH`, duplicate object keys
+    at any level, and NaN or infinite numbers, all with ``ValueError``.
+    """
+    check_depth(payload)
+    return json.loads(
+        payload.decode("utf-8"),
+        parse_constant=_reject_constant,
+        object_pairs_hook=_reject_duplicates,
+    )
 
 
 def _recv_until(stream: socket.socket, size: int, deadline: float) -> bytes:

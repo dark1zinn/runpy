@@ -93,6 +93,7 @@ mod protocol;
 mod request;
 mod scheduler;
 mod scribbler;
+mod strict_json;
 mod watchdog;
 
 use std::collections::HashMap;

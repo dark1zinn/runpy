@@ -107,3 +107,6 @@ is now the null device by default instead of the Manager's stdin.
   to workers that do not advertise the `cancel` capability.
 - `RunpyError` gains `Cancelled { request_id }`; exhaustive matches must
   handle it.
+- Both peers enforce a strict JSON profile: duplicate object keys at any level
+  and nesting deeper than 64 containers (counting the envelope) are rejected
+  in both directions. `EnvelopeError` gains `TooDeep`.
