@@ -762,6 +762,16 @@ Enable the repository hook once per clone:
 git config --local core.hooksPath .githooks
 ```
 
+The hook runs only quick checks (formatting, Clippy, Ruff) and only for the
+languages whose inputs are staged. It exports the index with
+`git checkout-index` into a private snapshot under the Git directory and
+checks that, so it validates exactly the commit: unstaged edits and untracked
+files never affect the result, deletions and renames are seen, and unmerged
+entries are rejected. It never stashes, resets, or writes to the working tree
+or index. Build caches (`target/`, a uv environment under the Git directory)
+are reused; source files are not. Behavior tests run in CI, not in the hook;
+`tests/hooks` proves these guarantees against disposable clones.
+
 Run Rust validation from the repository root:
 
 ```bash
@@ -784,9 +794,10 @@ Applications install pinned Git revisions instead (see the
 Run Python validation from the repository root:
 
 ```bash
-uv run --frozen --python 3.10 ruff format --check worker/src/runpyrs worker/tests examples/playground/worker/my_script.py
-uv run --frozen --python 3.10 ruff check worker/src/runpyrs worker/tests examples/playground/worker/my_script.py
+uv run --frozen --python 3.10 ruff format --check worker/src/runpyrs worker/tests tests examples/playground/worker/my_script.py
+uv run --frozen --python 3.10 ruff check worker/src/runpyrs worker/tests tests examples/playground/worker/my_script.py
 uv run --frozen --python 3.10 --package runpyrs --extra dev pytest worker/tests
+uv run --frozen --python 3.10 pytest tests/hooks
 ```
 
 `tests/protocol_vectors.json` holds wire vectors that both languages must

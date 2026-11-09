@@ -23,3 +23,7 @@ target
 # Others
 .direnv
 sockets
+
+# Python caches
+__pycache__/
+.pytest_cache/

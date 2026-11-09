@@ -183,6 +183,10 @@ Enable the pre-commit hook once per clone:
 git config --local core.hooksPath .githooks
 ```
 
+The hook runs quick format and lint checks on a snapshot of the staged tree,
+never on unstaged edits; behavior tests run in CI (see the
+[overview](docs/overview.md#development-and-validation)).
+
 Run Rust checks:
 
 ```bash
@@ -198,9 +202,10 @@ SDK, so `uv` must be on `PATH`.
 Run Python checks:
 
 ```bash
-uv run --frozen --python 3.10 ruff format --check worker/src/runpyrs worker/tests examples/playground/worker/my_script.py
-uv run --frozen --python 3.10 ruff check worker/src/runpyrs worker/tests examples/playground/worker/my_script.py
+uv run --frozen --python 3.10 ruff format --check worker/src/runpyrs worker/tests tests examples/playground/worker/my_script.py
+uv run --frozen --python 3.10 ruff check worker/src/runpyrs worker/tests tests examples/playground/worker/my_script.py
 uv run --frozen --python 3.10 --package runpyrs --extra dev pytest worker/tests
+uv run --frozen --python 3.10 pytest tests/hooks
 ```
 
 Run the integration playground:

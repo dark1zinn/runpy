@@ -38,7 +38,7 @@ jobs:
               - '**/.ruff.toml'
               - '.githooks/pre-commit'
               - '.github/workflows/python-quality.yml'
-              - 'tests/protocol_vectors.json'
+              - 'tests/**'
 
   quality:
     name: Python quality
@@ -62,6 +62,7 @@ jobs:
           uv run --frozen --python 3.10 ruff format --check
           worker/src/runpyrs
           worker/tests
+          tests
           examples/playground/worker/my_script.py
 
       - name: Run Ruff
@@ -69,9 +70,13 @@ jobs:
           uv run --frozen --python 3.10 ruff check
           worker/src/runpyrs
           worker/tests
+          tests
           examples/playground/worker/my_script.py
 
       - name: Run tests
         run: >-
           uv run --frozen --python 3.10 --package runpyrs --extra dev
           pytest worker/tests
+
+      - name: Test the pre-commit hook
+        run: uv run --frozen --python 3.10 pytest tests/hooks
