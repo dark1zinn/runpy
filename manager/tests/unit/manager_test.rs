@@ -57,7 +57,7 @@ stream.connect(sock_path)
 def send(meta, data):
     body = json.dumps({"meta": meta, "data": data}).encode()
     stream.sendall(struct.pack("<Q", len(body)) + body)
-send({"x_op": "ready"}, {"protocol_version": 1, "capabilities": ["requests"]})
+send({"x_op": "ready"}, {"protocol_version": int(os.environ.get("FAKE_PROTOCOL_VERSION", "1")), "capabilities": ["requests"]})
 def read(size):
     data = b""
     while len(data) < size:
@@ -250,12 +250,15 @@ async fn unusable_socket_parents_are_rejected() {
         Err(RunpyError::InvalidConfig(message)) if message.contains("too long")
     ));
 
+    // APFS rejects non-UTF-8 names (EILSEQ), so such a parent cannot exist
+    // on macOS; the check applies where the filesystem allows one.
     let non_utf8 = tmp.path().join(std::ffi::OsStr::from_bytes(b"bad-\xff"));
-    fs::create_dir(&non_utf8).unwrap();
-    assert!(matches!(
-        Manager::builder(&scripts).uv_path(&uv).socket_parent(&non_utf8).build().await,
-        Err(RunpyError::InvalidConfig(message)) if message.contains("UTF-8")
-    ));
+    if fs::create_dir(&non_utf8).is_ok() {
+        assert!(matches!(
+            Manager::builder(&scripts).uv_path(&uv).socket_parent(&non_utf8).build().await,
+            Err(RunpyError::InvalidConfig(message)) if message.contains("UTF-8")
+        ));
+    }
 
     assert!(matches!(
         Manager::builder(&scripts)
@@ -478,7 +481,7 @@ async fn spawn_waits_for_ready_and_fails_cleanly_otherwise() {
 case "$RUNPY_TEST_MODE" in
   silent) exec sleep 300 ;;
   exit) exit 3 ;;
-  version) sed -i 's/"protocol_version": 1/"protocol_version": 99/' "$FAKE_WORKER" ;;
+  version) export FAKE_PROTOCOL_VERSION=99 ;;
 esac
 exec python3 "$FAKE_WORKER" "$@""#,
             pid_file.display()

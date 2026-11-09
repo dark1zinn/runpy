@@ -124,7 +124,7 @@ impl Sampler {
                 *cpu += process.cpu_usage();
             }
             sample.process_count += 1;
-            sample.stopped &= process.status() == ProcessStatus::Stop;
+            sample.stopped &= is_stopped(*pid, process);
         }
         for (group, sample) in &mut samples {
             let complete = self
@@ -138,6 +138,35 @@ impl Sampler {
         self.previous = members;
         samples
     }
+}
+
+/// Whether `pid` is stopped by job control (for example `SIGSTOP`).
+///
+/// sysinfo 0.37 on macOS reads a process's BSD status only when it first sees
+/// the process and afterwards reports its first thread's run state, which a
+/// stop (a task suspension) does not change, so read the BSD status directly.
+#[cfg(target_os = "macos")]
+fn is_stopped(pid: Pid, _process: &sysinfo::Process) -> bool {
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: proc_pidinfo writes at most `size` bytes into `info` and
+    // returns how many it wrote; the struct is only read when complete.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid.as_u32() as libc::c_int,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    written == size && unsafe { info.assume_init() }.pbi_status == libc::SSTOP
+}
+
+/// Whether `pid` is stopped by job control (for example `SIGSTOP`).
+#[cfg(not(target_os = "macos"))]
+fn is_stopped(_pid: Pid, process: &sysinfo::Process) -> bool {
+    process.status() == ProcessStatus::Stop
 }
 
 /// Shared process monitor owned by a [`crate::Manager`].
