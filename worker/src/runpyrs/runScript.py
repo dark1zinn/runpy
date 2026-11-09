@@ -1,5 +1,6 @@
 """Command-line bootstrap used by scripts launched from the Rust Manager."""
 
+import os
 import sys
 
 from typing import Dict, Type
@@ -26,12 +27,18 @@ def _fail(message: str) -> None:
     """Write a diagnostic to stderr when possible, then exit with status 1.
 
     A closed or broken stderr must not hide the failure status, so write
-    errors are ignored.
+    errors are ignored. A failed write leaves the text buffered in the
+    stream, and the interpreter retries that flush at shutdown, where a second
+    failure turns the exit status into 120; the broken stream is therefore
+    replaced before exiting.
     """
     try:
         print(message, file=sys.stderr, flush=True)
     except (OSError, ValueError, AttributeError):
-        pass
+        try:
+            sys.stderr = open(os.devnull, "w")
+        except OSError:
+            sys.stderr = None
     sys.exit(1)
 
 
