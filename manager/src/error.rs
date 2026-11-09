@@ -1,8 +1,19 @@
 //! Typed errors returned by Runpy operations.
 
 use std::fmt;
+use std::path::PathBuf;
 
 use crate::protocol::EnvelopeError;
+
+/// Why a worker script name was rejected.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum InvalidScriptReason {
+    /// The name contains a path separator or is not a plain file stem.
+    NotSingleComponent,
+    /// No `<script>.py` exists at the resolved path.
+    NotFound(PathBuf),
+}
 
 /// Operation stage at which a deadline expired.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -42,6 +53,27 @@ impl fmt::Display for TimeoutStage {
 pub enum RunpyError {
     /// A configuration value or call sequence is invalid.
     InvalidConfig(String),
+    /// A worker script name cannot be launched.
+    InvalidScript {
+        /// Script name as given, without `.py`.
+        script: String,
+        /// Why the script was rejected.
+        reason: InvalidScriptReason,
+    },
+    /// The configured scripts directory cannot be used.
+    ScriptsDirectory {
+        /// Configured scripts directory.
+        path: PathBuf,
+        /// Underlying filesystem error.
+        source: std::io::Error,
+    },
+    /// The configured `uv` executable is missing or failed its version check.
+    UvUnavailable {
+        /// Configured `uv` path or command name.
+        path: PathBuf,
+        /// What went wrong.
+        detail: String,
+    },
     /// An envelope violated reserved metadata or operation direction rules.
     InvalidEnvelope(EnvelopeError),
     /// An encoded envelope would exceed the configured frame size.
@@ -62,7 +94,7 @@ pub enum RunpyError {
         /// Trusted worker identity.
         worker_id: String,
     },
-    /// A socket operation failed.
+    /// A socket, pipe, or process operation failed.
     Io(std::io::Error),
     /// An envelope could not be serialized.
     Encode(serde_json::Error),
@@ -72,6 +104,25 @@ impl fmt::Display for RunpyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidConfig(message) => write!(f, "invalid configuration: {message}"),
+            Self::InvalidScript { script, reason } => match reason {
+                InvalidScriptReason::NotSingleComponent => write!(
+                    f,
+                    "worker script '{script}' must be a single path component"
+                ),
+                InvalidScriptReason::NotFound(path) => write!(
+                    f,
+                    "worker script '{script}' does not exist at '{}'",
+                    path.display()
+                ),
+            },
+            Self::ScriptsDirectory { path, source } => write!(
+                f,
+                "scripts directory '{}' is unusable: {source}",
+                path.display()
+            ),
+            Self::UvUnavailable { path, detail } => {
+                write!(f, "uv at '{}' is unavailable: {detail}", path.display())
+            }
             Self::InvalidEnvelope(error) => write!(f, "invalid envelope: {error}"),
             Self::FrameTooLarge { size, limit } => write!(
                 f,
@@ -83,7 +134,7 @@ impl fmt::Display for RunpyError {
             Self::WorkerExited { worker_id } => {
                 write!(f, "worker '{worker_id}' is not running")
             }
-            Self::Io(error) => write!(f, "socket I/O failed: {error}"),
+            Self::Io(error) => write!(f, "I/O failed: {error}"),
             Self::Encode(error) => write!(f, "envelope could not be encoded: {error}"),
         }
     }
@@ -93,6 +144,7 @@ impl std::error::Error for RunpyError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::InvalidEnvelope(error) => Some(error),
+            Self::ScriptsDirectory { source, .. } => Some(source),
             Self::Io(error) => Some(error),
             Self::Encode(error) => Some(error),
             _ => None,

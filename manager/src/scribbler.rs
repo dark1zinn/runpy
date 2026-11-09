@@ -15,12 +15,13 @@
 //!
 //! ## Usage
 //!
-//! ```ignore
-//! let manager = runpy::Manager::new("./scripts");
+//! ```no_run
+//! # fn demo(manager: &runpy::Manager) {
 //! let log = manager.logger();
 //! log.info("Worker started");
 //! log.debug("Connection established");
 //! log.error("Failed to connect");
+//! # }
 //! ```
 
 use chrono::Local;
@@ -108,11 +109,10 @@ impl LogLevel {
 /// defaults to `info`. Presence of `NO_COLOR` disables ANSI colors.
 ///
 /// ```no_run
-/// use runpy::Manager;
-///
-/// let manager = Manager::new("worker");
+/// # fn demo(manager: &runpy::Manager) {
 /// let logger = manager.logger();
 /// logger.info_with("Startup", "manager created");
+/// # }
 /// ```
 #[derive(Debug, Clone)]
 pub struct Scribbler {
@@ -195,8 +195,9 @@ impl Scribbler {
     /// Log an untagged error unless logging is off.
     ///
     /// ```no_run
-    /// # let manager = runpy::Manager::new("worker");
+    /// # fn demo(manager: &runpy::Manager) {
     /// manager.logger().error("worker launch failed");
+    /// # }
     /// ```
     pub fn error(&self, message: &str) {
         self.log(LogLevel::Error, None, message);
@@ -205,8 +206,9 @@ impl Scribbler {
     /// Log an error with a component tag.
     ///
     /// ```no_run
-    /// # let manager = runpy::Manager::new("worker");
+    /// # fn demo(manager: &runpy::Manager) {
     /// manager.logger().error_with("Worker", "launch failed");
+    /// # }
     /// ```
     pub fn error_with(&self, component: &str, message: &str) {
         self.log(LogLevel::Error, Some(component), message);
@@ -215,8 +217,9 @@ impl Scribbler {
     /// Log an untagged warning when warning output is enabled.
     ///
     /// ```no_run
-    /// # let manager = runpy::Manager::new("worker");
+    /// # fn demo(manager: &runpy::Manager) {
     /// manager.logger().warning("worker stderr was non-empty");
+    /// # }
     /// ```
     pub fn warning(&self, message: &str) {
         self.log(LogLevel::Warning, None, message);
@@ -225,8 +228,9 @@ impl Scribbler {
     /// Log a warning with a component tag.
     ///
     /// ```no_run
-    /// # let manager = runpy::Manager::new("worker");
+    /// # fn demo(manager: &runpy::Manager) {
     /// manager.logger().warning_with("Watchdog", "worker exited");
+    /// # }
     /// ```
     pub fn warning_with(&self, component: &str, message: &str) {
         self.log(LogLevel::Warning, Some(component), message);
@@ -235,8 +239,9 @@ impl Scribbler {
     /// Log untagged operational information when info output is enabled.
     ///
     /// ```no_run
-    /// # let manager = runpy::Manager::new("worker");
+    /// # fn demo(manager: &runpy::Manager) {
     /// manager.logger().info("worker connected");
+    /// # }
     /// ```
     pub fn info(&self, message: &str) {
         self.log(LogLevel::Info, None, message);
@@ -245,8 +250,9 @@ impl Scribbler {
     /// Log operational information with a component tag.
     ///
     /// ```no_run
-    /// # let manager = runpy::Manager::new("worker");
+    /// # fn demo(manager: &runpy::Manager) {
     /// manager.logger().info_with("Protocol", "worker ready");
+    /// # }
     /// ```
     pub fn info_with(&self, component: &str, message: &str) {
         self.log(LogLevel::Info, Some(component), message);
@@ -255,8 +261,9 @@ impl Scribbler {
     /// Log untagged diagnostics when debug or verbose output is enabled.
     ///
     /// ```no_run
-    /// # let manager = runpy::Manager::new("worker");
+    /// # fn demo(manager: &runpy::Manager) {
     /// manager.logger().debug("indexed worker scripts");
+    /// # }
     /// ```
     pub fn debug(&self, message: &str) {
         self.log(LogLevel::Debug, None, message);
@@ -265,8 +272,9 @@ impl Scribbler {
     /// Log diagnostics with a component tag.
     ///
     /// ```no_run
-    /// # let manager = runpy::Manager::new("worker");
+    /// # fn demo(manager: &runpy::Manager) {
     /// manager.logger().debug_with("Integrity", "check complete");
+    /// # }
     /// ```
     pub fn debug_with(&self, component: &str, message: &str) {
         self.log(LogLevel::Debug, Some(component), message);
@@ -275,8 +283,9 @@ impl Scribbler {
     /// Log untagged trace detail only when verbose output is enabled.
     ///
     /// ```no_run
-    /// # let manager = runpy::Manager::new("worker");
+    /// # fn demo(manager: &runpy::Manager) {
     /// manager.logger().verbose("received envelope");
+    /// # }
     /// ```
     pub fn verbose(&self, message: &str) {
         self.log(LogLevel::Verbose, None, message);
@@ -285,8 +294,9 @@ impl Scribbler {
     /// Log trace detail with a component tag.
     ///
     /// ```no_run
-    /// # let manager = runpy::Manager::new("worker");
+    /// # fn demo(manager: &runpy::Manager) {
     /// manager.logger().verbose_with("Protocol", "frame decoded");
+    /// # }
     /// ```
     pub fn verbose_with(&self, component: &str, message: &str) {
         self.log(LogLevel::Verbose, Some(component), message);
@@ -297,8 +307,9 @@ impl Scribbler {
     /// Log a visually emphasized success message at info level.
     ///
     /// ```no_run
-    /// # let manager = runpy::Manager::new("worker");
+    /// # fn demo(manager: &runpy::Manager) {
     /// manager.logger().success("worker spawned");
+    /// # }
     /// ```
     pub fn success(&self, message: &str) {
         if self.should_log(LogLevel::Info) {
@@ -317,8 +328,9 @@ impl Scribbler {
     /// Log a numbered progress step at info level.
     ///
     /// ```no_run
-    /// # let manager = runpy::Manager::new("worker");
+    /// # fn demo(manager: &runpy::Manager) {
     /// manager.logger().step(2, "starting workers");
+    /// # }
     /// ```
     pub fn step(&self, step: u32, message: &str) {
         if self.should_log(LogLevel::Info) {
@@ -337,8 +349,9 @@ impl Scribbler {
     /// Log a visual separator when info output is enabled.
     ///
     /// ```no_run
-    /// # let manager = runpy::Manager::new("worker");
+    /// # fn demo(manager: &runpy::Manager) {
     /// manager.logger().separator();
+    /// # }
     /// ```
     pub fn separator(&self) {
         if self.should_log(LogLevel::Info) {

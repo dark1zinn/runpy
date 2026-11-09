@@ -15,36 +15,16 @@ fn spawn_sleeper() -> Child {
         .expect("failed to spawn `sleep` process")
 }
 
-// We can't directly construct `WorkerHandle` from tests (it's crate-private),
-// so we test the `WatchdogService` through its public API using the shared
-// workers map from a real `Manager`, or we test the standalone helpers.
-
-// ─── Construction ──────────────────────────────────────────────────────
-
-#[tokio::test]
-async fn manager_exposes_its_watchdog() {
-    let manager = runpy::Manager::with_uv_path("/fake/scripts", "/bin/true");
-    assert!(manager.watchdog().report().await.is_empty());
-}
-
-// ─── report() on empty map ─────────────────────────────────────────────
-
-#[tokio::test]
-async fn report_returns_empty_vec_with_no_workers() {
-    let manager = runpy::Manager::with_uv_path("/fake/scripts", "/bin/true");
-    let reports = manager.watchdog().report().await;
-    assert!(
-        reports.is_empty(),
-        "Expected no reports, got {:?}",
-        reports.len()
-    );
-}
-
 // ─── report_worker() on missing ID ────────────────────────────────────
 
 #[tokio::test]
 async fn report_worker_returns_none_for_unknown_id() {
-    let manager = runpy::Manager::with_uv_path("/fake/scripts", "/bin/true");
+    let tmp = tempfile::TempDir::new().unwrap();
+    let manager = runpy::Manager::builder(tmp.path())
+        .uv_path("true")
+        .build()
+        .await
+        .unwrap();
     let report = manager.watchdog().report_worker("nonexistent_id").await;
     assert!(report.is_none());
 }

@@ -38,19 +38,24 @@ Manager
 
 ### Manager
 
-`Manager` is the composition root. It owns the integrity checker, logger, and
-one shared `ControlPlane`. Dropping it synchronously shuts down registered
-workers, removes their sockets, and aborts protocol/output tasks. A Manager
-also exposes the global message handler, output observer, logger, watchdog,
-broadcast, and all-worker termination APIs.
+`Manager` is the composition root, created with `Manager::builder(scripts)`.
+It owns the integrity checker, logger, and one shared `ControlPlane`. Dropping
+it synchronously shuts down registered workers, removes their sockets, and
+aborts protocol/output tasks. A Manager also exposes the global message
+handler, output observer, logger, watchdog, broadcast, and all-worker
+termination APIs.
 
-### Worker facade
+### WorkerBuilder and Worker
 
-`Manager::worker("name")` returns a lightweight `Worker`. Before `spawn`, it is
-a builder for environment variables, `--key=value` arguments, and a per-worker
-message handler. After `spawn`, it is a remote handle for messaging and
-termination. It stores weak references to Manager-owned services, so operations
-fail when the Manager has already been dropped. One facade can spawn only once.
+`Manager::worker("name")` returns a `WorkerBuilder`: immutable configuration
+for environment variables, `--key=value` arguments, working directory, stdin,
+and a per-worker message handler. Setters consume and return the builder, and
+it is cheap to clone, so one template can launch many workers.
+`WorkerBuilder::spawn` consumes it and returns a running `Worker` handle for
+messaging and termination. Configuration and running state are separate types,
+so a running worker cannot be reconfigured and a builder cannot be messaged.
+Both hold weak references to Manager-owned services: after the Manager is
+dropped they return `RunpyError::ManagerClosed`.
 
 ### IntegrityChecker
 
@@ -84,58 +89,70 @@ terminal writes and callbacks off Tokio runtime workers.
 
 ## End-to-end lifecycle
 
-### 1. Construct a Manager
+### 1. Build a Manager
 
 ```rust
 use runpy::Manager;
+use std::time::Duration;
 
-let manager = Manager::new("worker");
+let manager = Manager::builder("worker")
+    .uv_path("/opt/runpy/bin/uv") // default: `uv` from PATH
+    .send_timeout(Duration::from_secs(5))
+    .build()
+    .await?;
 ```
 
-`Manager::new` uses `uv` from `PATH`; `Manager::with_uv_path` accepts another
-executable. Construction performs the integrity check and logs a failure rather
-than returning `Result`. Call `Manager::check_integrity` when startup must fail
-explicitly. `Worker::spawn` also runs the check and returns any failure.
+`build` validates every setting before creating resources, then checks that
+`uv --version` succeeds and that the scripts directory exists. Failures are
+typed: `InvalidConfig` (also returned outside a Tokio runtime),
+`UvUnavailable`, and `ScriptsDirectory`. `Manager::check_integrity` repeats
+the runtime checks later. The Watchdog monitor starts during `build`.
 
-The Watchdog monitor starts immediately when construction occurs inside a
-Tokio runtime. If construction occurs outside one, the first worker
-registration starts it.
+| Setter | Default | Meaning |
+| --- | --- | --- |
+| `uv_path` | `uv` | Executable that launches workers. |
+| `max_frame_bytes` | 8 MiB | Maximum JSON body per frame, both directions. |
+| `frame_timeout` | 30 s | Time to finish a frame after its first byte. |
+| `outbound_capacity` | 64 | Admitted frames per worker awaiting the writer. |
+| `queued_bytes` | 16 MiB | Manager-wide encoded bytes awaiting a write; must hold one maximum frame. |
+| `send_timeout` | 5 s | Deadline for outbound admission plus the write. |
+| `shutdown_grace` | 2 s | Time a worker gets to exit after termination starts. |
 
-### 2. Configure a Worker facade
+### 2. Configure a WorkerBuilder
 
 ```rust
-use runpy::Manager;
-
-let manager = Manager::new("worker");
-let mut worker = manager.worker("my_worker");
-worker
+let builder = manager
+    .worker("my_worker")
     .env("API_BASE", "https://example.com")
     .arg("mode", "fast");
 ```
 
 The script name omits `.py`. Repeated environment or argument keys replace the
-prior value. Runpy later forces `PYTHONUNBUFFERED=1`, even if the builder sets a
-different value.
+prior value. Runpy later forces `PYTHONUNBUFFERED=1` and its frame-limit
+variables, even if the builder sets different values. `cwd(dir)` overrides the
+working directory; `stdin(StdinMode::Inherit)` lets a worker read the
+Manager's stdin, which is otherwise the null device.
 
 ### 3. Spawn the process
 
-`Worker::spawn` revalidates `uv` and the scripts directory, canonicalizes
-runtime paths, verifies the root-level script file, creates a unique identity
-and socket under `/tmp/runpy`, and starts:
+`WorkerBuilder::spawn` revalidates `uv` and the scripts directory,
+canonicalizes runtime paths, verifies the root-level script file, creates a
+unique identity and socket under `/tmp/runpy`, and starts:
 
 ```text
 uv run --no-project [--locked] --script <script.py> <socket-path> <worker-id> [--key=value ...]
 ```
 
 `--locked` is present only when `<script.py>.lock` exists. The process working
-directory is the parent of the scripts directory, and that parent is supplied
-as `PYTHONPATH`. Stdout and stderr are piped. On Unix the `uv` process starts a
-new process group so termination covers its Python descendant.
+directory defaults to the parent of the scripts directory, and that parent is
+supplied as `PYTHONPATH` unless the builder overrides it. Stdin is the null
+device by default; stdout and stderr are piped. On Unix the `uv` process starts
+a new process group so termination covers its Python descendant.
 
-A successful `spawn` returns the trusted generated worker ID. Registration
-owns the child, socket, session task, both output tasks, and sender. Failures
-after process creation kill and reap the process group and remove the socket.
-A second `spawn` call on the same facade returns an error.
+A successful `spawn` returns a `Worker` whose `id()` is the trusted generated
+worker ID. A bad script name fails with `InvalidScript`. Registration owns the
+child, socket, session task, both output tasks, and sender. Failures after
+process creation kill and reap the process group and remove the socket.
 
 ### 4. Connect and announce readiness
 
@@ -249,7 +266,7 @@ complete within the frame timeout (default 30 seconds,
 `DEFAULT_FRAME_TIMEOUT`); an idle connection waiting for the first byte has no
 deadline. A stalled frame closes the connection.
 
-Configure both values with `ProtocolLimits` and `Manager::with_limits`. The
+Configure both values with `ManagerBuilder::max_frame_bytes` and `frame_timeout`. The
 Manager passes them to every worker as `RUNPY_MAX_FRAME_BYTES` and
 `RUNPY_FRAME_TIMEOUT_MS` after applying user environment variables, so both
 peers always enforce the same limits. Keep bulk data in files or external
@@ -332,9 +349,8 @@ failed, and Runpy never terminates a worker based on captured text.
 Applications can observe the raw record:
 
 ```rust
-use runpy::{Manager, WorkerOutputStream};
+use runpy::WorkerOutputStream;
 
-let mut manager = Manager::new("worker");
 manager.on_worker_output(|output| match output.stream {
     WorkerOutputStream::Stdout => println!("{}: {}", output.worker_id, output.line),
     WorkerOutputStream::Stderr => eprintln!("{}: {}", output.worker_id, output.line),

@@ -82,8 +82,8 @@ fn object(value: Value) -> Data {
 }
 
 #[tokio::main]
-async fn main() {
-    let mut manager = Manager::new("worker");
+async fn main() -> Result<(), runpy::RunpyError> {
+    let manager = Manager::builder("worker").build().await?;
     let (finished_tx, mut finished_rx) = tokio::sync::mpsc::unbounded_channel();
     manager.on_message(move |inbound| {
         let operation = inbound
@@ -117,14 +117,14 @@ async fn main() {
         }
     });
 
-    let mut worker = manager.worker("my_worker");
-    let worker_id = worker.spawn().await.expect("worker should start");
-    println!("spawned {worker_id}");
+    let worker = manager.worker("my_worker").spawn().await?;
+    println!("spawned {}", worker.id());
     tokio::time::timeout(Duration::from_secs(30), finished_rx.recv())
         .await
         .expect("worker response timed out")
         .expect("worker response channel closed");
-    worker.terminate().await.expect("worker should stop");
+    worker.terminate().await?;
+    Ok(())
 }
 ```
 
@@ -143,9 +143,8 @@ the process group and socket when the worker terminates or the Manager drops.
 Process output is separate from structured socket envelopes:
 
 ```rust
-use runpy::{Manager, WorkerOutputStream};
+use runpy::WorkerOutputStream;
 
-let mut manager = Manager::new("worker");
 manager.on_worker_output(|output| match output.stream {
     WorkerOutputStream::Stdout => {
         println!("{}: {}", output.worker_id, output.line);
@@ -167,6 +166,8 @@ policy.
   output guarantees, Python execution model, and operations.
 - [Installation and worker setup](docs/installation.md) — Git dependencies,
   PEP 723 scripts, uv lockfiles, and Manager configuration.
+- [Migration guide](docs/migration.md) — breaking API and protocol changes
+  with their replacements.
 - [Python SDK guide](worker/README.md) — `runpyrs` setup and API.
 - [Playground](examples/playground/) — executable Rust/Python integration.
 - Rust API reference — generate locally with

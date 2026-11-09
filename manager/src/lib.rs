@@ -66,9 +66,8 @@
 //! }
 //!
 //! #[tokio::main]
-//! async fn main() {
-//!     let mut manager = Manager::new("worker");
-//!     manager.check_integrity().expect("valid runtime");
+//! async fn main() -> Result<(), runpy::RunpyError> {
+//!     let manager = Manager::builder("worker").build().await?;
 //!     let (finished_tx, mut finished_rx) = tokio::sync::mpsc::unbounded_channel();
 //!     manager.on_message(move |inbound| {
 //!         match inbound.envelope.meta().get("x_op").and_then(Value::as_str) {
@@ -86,14 +85,15 @@
 //!         }
 //!     });
 //!
-//!     let mut worker = manager.worker("my_worker");
-//!     let worker_id = worker.spawn().await.expect("worker starts");
-//!     println!("spawned {worker_id}");
+//!     let worker = manager.worker("my_worker").spawn().await?;
+//!     println!("spawned {}", worker.id());
 //!     tokio::time::timeout(Duration::from_secs(30), finished_rx.recv())
 //!         .await
 //!         .expect("worker response timed out")
 //!         .expect("worker response channel closed");
-//!     worker.terminate().await.expect("worker terminates");
+//!     worker.terminate().await?;
+//!     manager.terminate_all().await;
+//!     Ok(())
 //! }
 //! ```
 //!
@@ -111,15 +111,19 @@ mod watchdog;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
-use crate::config::QueueLimits;
+use crate::config::{ProtocolLimits, QueueLimits};
 use crate::integrity::IntegrityChecker;
 use crate::protocol::ControlPlane;
 
 // ── Public re-exports ──────────────────────────────────────────────────
-pub use config::{DEFAULT_FRAME_TIMEOUT, DEFAULT_MAX_FRAME_BYTES, ProtocolLimits};
-pub use error::{RunpyError, TimeoutStage};
-pub use manager::{Worker, WorkerIdentity};
+pub use config::{
+    DEFAULT_FRAME_TIMEOUT, DEFAULT_MAX_FRAME_BYTES, DEFAULT_OUTBOUND_CAPACITY,
+    DEFAULT_QUEUED_BYTES, DEFAULT_SEND_TIMEOUT, DEFAULT_SHUTDOWN_GRACE,
+};
+pub use error::{InvalidScriptReason, RunpyError, TimeoutStage};
+pub use manager::{StdinMode, Worker, WorkerBuilder, WorkerIdentity};
 pub use protocol::{
     Data, Envelope, EnvelopeError, InboundEnvelope, MessageHandler, Meta, SendReceipt,
     WorkerOutput, WorkerOutputHandler, WorkerOutputStream,
@@ -127,21 +131,173 @@ pub use protocol::{
 pub use scribbler::{LogLevel, Scribbler};
 pub use watchdog::{ProcessState, WatchdogService as Watchdog, WorkerReport};
 
+// ── Manager builder ────────────────────────────────────────────────────
+
+/// Validated configuration for a [`Manager`].
+///
+/// Every setter consumes and returns the builder. [`ManagerBuilder::build`]
+/// validates all values before creating any resource.
+///
+/// ```no_run
+/// use runpy::Manager;
+/// use std::time::Duration;
+///
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), runpy::RunpyError> {
+/// let manager = Manager::builder("worker")
+///     .uv_path("/opt/runpy/bin/uv")
+///     .max_frame_bytes(1024 * 1024)
+///     .send_timeout(Duration::from_secs(2))
+///     .build()
+///     .await?;
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Clone, Debug)]
+#[must_use = "a builder does nothing until `build` is awaited"]
+pub struct ManagerBuilder {
+    scripts: PathBuf,
+    uv_path: PathBuf,
+    max_frame_bytes: usize,
+    frame_timeout: Duration,
+    queue: QueueLimits,
+}
+
+impl ManagerBuilder {
+    /// Executable used to launch workers; defaults to `uv` from `PATH`.
+    ///
+    /// Relative multi-component paths are canonicalized when a worker spawns;
+    /// a single component such as `uv` is resolved by the operating system.
+    pub fn uv_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.uv_path = path.into();
+        self
+    }
+
+    /// Maximum JSON body per frame in both directions; default
+    /// [`DEFAULT_MAX_FRAME_BYTES`] (8 MiB).
+    pub fn max_frame_bytes(mut self, bytes: usize) -> Self {
+        self.max_frame_bytes = bytes;
+        self
+    }
+
+    /// Time allowed to finish a frame after its first byte; default
+    /// [`DEFAULT_FRAME_TIMEOUT`] (30 seconds).
+    pub fn frame_timeout(mut self, timeout: Duration) -> Self {
+        self.frame_timeout = timeout;
+        self
+    }
+
+    /// Admitted frames per worker waiting for the writer; default
+    /// [`DEFAULT_OUTBOUND_CAPACITY`] (64).
+    pub fn outbound_capacity(mut self, frames: usize) -> Self {
+        self.queue.outbound_capacity = frames;
+        self
+    }
+
+    /// Manager-wide bound on encoded outbound bytes awaiting a write; default
+    /// [`DEFAULT_QUEUED_BYTES`] (16 MiB). Must hold at least one maximum frame.
+    pub fn queued_bytes(mut self, bytes: usize) -> Self {
+        self.queue.queued_bytes = bytes;
+        self
+    }
+
+    /// Deadline covering outbound admission and the socket write; default
+    /// [`DEFAULT_SEND_TIMEOUT`] (5 seconds).
+    pub fn send_timeout(mut self, timeout: Duration) -> Self {
+        self.queue.send_timeout = timeout;
+        self
+    }
+
+    /// Time a worker gets to exit after termination starts; default
+    /// [`DEFAULT_SHUTDOWN_GRACE`] (2 seconds).
+    pub fn shutdown_grace(mut self, grace: Duration) -> Self {
+        self.queue.shutdown_grace = grace;
+        self
+    }
+
+    fn validate(&self) -> Result<ProtocolLimits, RunpyError> {
+        let limits = ProtocolLimits::new(self.max_frame_bytes, self.frame_timeout)
+            .map_err(RunpyError::InvalidConfig)?;
+        let queue = &self.queue;
+        if queue.outbound_capacity == 0 {
+            return Err(RunpyError::InvalidConfig(
+                "outbound_capacity must be greater than zero".to_string(),
+            ));
+        }
+        if queue.queued_bytes < limits.max_frame_bytes() + 8 {
+            return Err(RunpyError::InvalidConfig(format!(
+                "queued_bytes ({}) must hold at least one maximum frame ({} bytes)",
+                queue.queued_bytes,
+                limits.max_frame_bytes() + 8
+            )));
+        }
+        for (name, value) in [
+            ("send_timeout", queue.send_timeout),
+            ("shutdown_grace", queue.shutdown_grace),
+        ] {
+            if value.is_zero() {
+                return Err(RunpyError::InvalidConfig(format!(
+                    "{name} must be greater than zero"
+                )));
+            }
+        }
+        Ok(limits)
+    }
+
+    /// Validate the configuration, check `uv` and the scripts directory, and
+    /// start the Manager's services.
+    ///
+    /// # Errors
+    ///
+    /// [`RunpyError::InvalidConfig`] for an invalid value or when called
+    /// outside a Tokio runtime, [`RunpyError::UvUnavailable`] when `uv`
+    /// cannot run, and [`RunpyError::ScriptsDirectory`] when the scripts
+    /// directory is missing or not a directory.
+    pub async fn build(self) -> Result<Manager, RunpyError> {
+        let limits = self.validate()?;
+        if tokio::runtime::Handle::try_current().is_err() {
+            return Err(RunpyError::InvalidConfig(
+                "Manager::build must run inside a Tokio runtime".to_string(),
+            ));
+        }
+
+        let logger = Arc::new(Scribbler::new());
+        let integrity = Arc::new(IntegrityChecker::new(
+            self.scripts,
+            self.uv_path,
+            logger.clone(),
+        ));
+        integrity.perform_check()?;
+
+        let control_plane = ControlPlane::new(logger.clone(), limits, self.queue);
+        control_plane.start_monitoring(5);
+
+        Ok(Manager {
+            integrity,
+            logger,
+            control_plane,
+            socket_dir: PathBuf::from("/tmp/runpy"),
+        })
+    }
+}
+
 // ── Manager ────────────────────────────────────────────────────────────
 
 /// Top-level owner of Runpy services and managed worker processes.
 ///
-/// Construction performs an integrity check and logs any failure; use
-/// [`Manager::check_integrity`] when the caller needs a returned error. A
-/// Manager can be created outside a Tokio runtime, but asynchronous operations
-/// and worker registration require one.
+/// Create one with [`Manager::builder`]. The Manager owns every worker it
+/// spawns until explicit termination or Manager drop; [`Worker`] handles stop
+/// working once it is gone.
 ///
 /// ```no_run
 /// use runpy::Manager;
 ///
-/// let manager = Manager::new("worker");
-/// let logger = manager.logger();
-/// logger.info("manager ready");
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), runpy::RunpyError> {
+/// let manager = Manager::builder("worker").build().await?;
+/// manager.logger().info("manager ready");
+/// # Ok(())
+/// # }
 /// ```
 pub struct Manager {
     integrity: Arc<IntegrityChecker>,
@@ -151,82 +307,24 @@ pub struct Manager {
 }
 
 impl Manager {
-    /// Create a Manager that resolves `uv` from `PATH`.
-    ///
-    /// `scripts_path` is the directory containing `<worker-name>.py` files.
-    /// Integrity failures are logged and construction still succeeds.
-    ///
-    /// ```no_run
-    /// use runpy::Manager;
-    ///
-    /// let manager = Manager::new("worker");
-    /// manager.check_integrity().expect("uv and scripts are available");
-    /// ```
-    pub fn new(scripts_path: &str) -> Self {
-        Self::with_uv_path(scripts_path, "uv")
-    }
-
-    /// Create a Manager with an explicit `uv` executable.
-    ///
-    /// Relative multi-component paths are canonicalized when a worker spawns;
-    /// a single component such as `uv` is resolved by the operating system.
-    ///
-    /// ```no_run
-    /// use runpy::Manager;
-    ///
-    /// let manager = Manager::with_uv_path("worker", "/opt/runpy/bin/uv");
-    /// manager.check_integrity().expect("configured runtime is valid");
-    /// ```
-    pub fn with_uv_path(scripts_path: &str, uv_path: &str) -> Self {
-        Self::with_limits(scripts_path, uv_path, ProtocolLimits::default())
-    }
-
-    /// Create a Manager with an explicit `uv` executable and frame limits.
-    ///
-    /// The same limits apply to Manager reads and writes and are propagated
-    /// to every managed worker through its environment.
-    ///
-    /// ```no_run
-    /// use runpy::{Manager, ProtocolLimits};
-    /// use std::time::Duration;
-    ///
-    /// let limits = ProtocolLimits::new(1024 * 1024, Duration::from_secs(10)).unwrap();
-    /// let manager = Manager::with_limits("worker", "uv", limits);
-    /// ```
-    pub fn with_limits(scripts_path: &str, uv_path: &str, limits: ProtocolLimits) -> Self {
-        let logger = Arc::new(Scribbler::new());
-        let integrity = Arc::new(IntegrityChecker::new(scripts_path, uv_path, logger.clone()));
-        if let Err(error) = integrity.perform_check() {
-            logger.error_with("Manager", &format!("Integrity check failed: {error}"));
-        }
-
-        let control_plane = ControlPlane::new(logger.clone(), limits, QueueLimits::default());
-        if tokio::runtime::Handle::try_current().is_ok() {
-            control_plane.start_monitoring(5);
-        }
-
-        Self {
-            integrity,
-            logger,
-            control_plane,
-            socket_dir: PathBuf::from("/tmp/runpy"),
+    /// Start configuring a Manager for the directory containing
+    /// `<worker-name>.py` scripts.
+    pub fn builder(scripts: impl Into<PathBuf>) -> ManagerBuilder {
+        ManagerBuilder {
+            scripts: scripts.into(),
+            uv_path: PathBuf::from("uv"),
+            max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
+            frame_timeout: DEFAULT_FRAME_TIMEOUT,
+            queue: QueueLimits::default(),
         }
     }
 
-    /// Create a worker facade for a root-level script name without `.py`.
+    /// Start configuring a worker for a root-level script name without `.py`.
     ///
-    /// The facade is a builder before `spawn` and a remote handle afterward.
-    /// It cannot outlive the services owned by this Manager.
-    ///
-    /// ```no_run
-    /// use runpy::Manager;
-    ///
-    /// let manager = Manager::new("worker");
-    /// let mut worker = manager.worker("my_worker");
-    /// worker.env("MODE", "fast").arg("batch", "10");
-    /// ```
-    pub fn worker(&self, script: &str) -> Worker {
-        Worker::new(
+    /// The returned [`WorkerBuilder`] cannot outlive the services owned by
+    /// this Manager.
+    pub fn worker(&self, script: &str) -> WorkerBuilder {
+        WorkerBuilder::new(
             script,
             Arc::downgrade(&self.integrity),
             Arc::downgrade(&self.control_plane),
@@ -248,11 +346,12 @@ impl Manager {
     /// use runpy::Manager;
     ///
     /// # #[tokio::main]
-    /// # async fn main() {
-    /// let manager = Manager::new("worker");
+    /// # async fn main() -> Result<(), runpy::RunpyError> {
+    /// let manager = Manager::builder("worker").build().await?;
     /// for report in manager.watchdog().report().await {
     ///     println!("{}: {:?}", report.worker_name, report.state);
     /// }
+    /// # Ok(())
     /// # }
     /// ```
     pub fn watchdog(&self) -> &Watchdog {
@@ -265,16 +364,7 @@ impl Manager {
     /// every valid worker message. It executes synchronously in the protocol
     /// task and should return promptly. A panic is caught and logged; the
     /// worker handler and later messages still run.
-    ///
-    /// ```no_run
-    /// use runpy::Manager;
-    ///
-    /// let mut manager = Manager::new("worker");
-    /// manager.on_message(|inbound| {
-    ///     println!("{:?}", inbound.envelope);
-    /// });
-    /// ```
-    pub fn on_message<F>(&mut self, handler: F)
+    pub fn on_message<F>(&self, handler: F)
     where
         F: Fn(InboundEnvelope) + Send + Sync + 'static,
     {
@@ -290,14 +380,18 @@ impl Manager {
     /// ```no_run
     /// use runpy::{Manager, WorkerOutputStream};
     ///
-    /// let mut manager = Manager::new("worker");
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), runpy::RunpyError> {
+    /// let manager = Manager::builder("worker").build().await?;
     /// manager.on_worker_output(|output| {
     ///     if output.stream == WorkerOutputStream::Stderr {
     ///         eprintln!("{}: {}", output.worker_id, output.line);
     ///     }
     /// });
+    /// # Ok(())
+    /// # }
     /// ```
-    pub fn on_worker_output<F>(&mut self, handler: F)
+    pub fn on_worker_output<F>(&self, handler: F)
     where
         F: Fn(WorkerOutput) + Send + Sync + 'static,
     {
@@ -305,17 +399,8 @@ impl Manager {
             .set_worker_output_handler(Arc::new(handler));
     }
 
-    /// Re-run uv validation, socket-directory creation, and script indexing.
-    ///
-    /// Unlike Manager construction, this method returns validation failures.
-    ///
-    /// ```no_run
-    /// use runpy::Manager;
-    ///
-    /// let manager = Manager::new("worker");
-    /// manager.check_integrity().expect("runtime is ready");
-    /// ```
-    pub fn check_integrity(&self) -> Result<(), String> {
+    /// Re-run the `uv` and scripts-directory checks performed by `build`.
+    pub async fn check_integrity(&self) -> Result<(), RunpyError> {
         self.integrity.perform_check()
     }
 
@@ -323,19 +408,6 @@ impl Manager {
     ///
     /// The returned map is keyed by trusted worker ID and contains each
     /// worker's write outcome. An empty registry returns an empty map.
-    ///
-    /// ```no_run
-    /// use runpy::{Envelope, Manager};
-    ///
-    /// # #[tokio::main]
-    /// # async fn main() {
-    /// let manager = Manager::new("worker");
-    /// let results = manager.broadcast(Envelope::retry()).await;
-    /// for (worker_id, result) in results {
-    ///     println!("{worker_id}: {result:?}");
-    /// }
-    /// # }
-    /// ```
     pub async fn broadcast(&self, envelope: Envelope) -> HashMap<String, Result<(), RunpyError>> {
         self.control_plane.broadcast(envelope).await
     }
@@ -344,20 +416,10 @@ impl Manager {
     ///
     /// New sends are refused at once. `terminate` requests are delivered
     /// concurrently, and every process group is killed and reaped as soon as
-    /// it exits or at the latest two seconds after the call started, even when
-    /// a worker's queue is saturated. Sockets are removed and output readers
+    /// it exits or at the latest when the shutdown grace ends, even when a
+    /// worker's queue is saturated. Sockets are removed and output readers
     /// drain briefly.
-    ///
-    /// ```no_run
-    /// use runpy::Manager;
-    ///
-    /// # #[tokio::main]
-    /// # async fn main() {
-    /// let mut manager = Manager::new("worker");
-    /// manager.terminate_all().await;
-    /// # }
-    /// ```
-    pub async fn terminate_all(&mut self) {
+    pub async fn terminate_all(&self) {
         self.control_plane.terminate_all().await;
     }
 }

@@ -16,13 +16,13 @@ pub(crate) const ENV_FRAME_TIMEOUT_MS: &str = "RUNPY_FRAME_TIMEOUT_MS";
 const MAX_FRAME_BYTES_CEILING: usize = u32::MAX as usize - 8;
 
 /// Default bound on admitted outbound frames per worker connection.
-pub(crate) const DEFAULT_OUTBOUND_CAPACITY: usize = 64;
+pub const DEFAULT_OUTBOUND_CAPACITY: usize = 64;
 /// Default Manager-wide bound on encoded outbound bytes awaiting a write.
-pub(crate) const DEFAULT_QUEUED_BYTES: usize = 16 * 1024 * 1024;
+pub const DEFAULT_QUEUED_BYTES: usize = 16 * 1024 * 1024;
 /// Default deadline covering outbound admission and the socket write.
-pub(crate) const DEFAULT_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+pub const DEFAULT_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 /// Default time a worker gets to exit after termination starts.
-pub(crate) const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+pub const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
 /// Bounds on outbound memory and time shared by every worker route.
 #[derive(Clone, Copy, Debug)]
@@ -55,17 +55,8 @@ impl Default for QueueLimits {
 /// whose frame does not complete within `frame_timeout` after its first byte.
 /// An idle connection has no deadline. Managed workers receive the same values
 /// through `RUNPY_MAX_FRAME_BYTES` and `RUNPY_FRAME_TIMEOUT_MS`.
-///
-/// ```
-/// use runpy::ProtocolLimits;
-/// use std::time::Duration;
-///
-/// let limits = ProtocolLimits::new(1024 * 1024, Duration::from_secs(5)).unwrap();
-/// assert_eq!(limits.max_frame_bytes(), 1024 * 1024);
-/// assert!(ProtocolLimits::new(0, Duration::from_secs(5)).is_err());
-/// ```
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ProtocolLimits {
+pub(crate) struct ProtocolLimits {
     max_frame_bytes: usize,
     frame_timeout: Duration,
 }
@@ -76,7 +67,7 @@ impl ProtocolLimits {
     /// Returns an error when either value is zero, the frame size exceeds
     /// `u32::MAX - 8` bytes, or the timeout is shorter than one millisecond,
     /// which workers could not represent.
-    pub fn new(max_frame_bytes: usize, frame_timeout: Duration) -> Result<Self, String> {
+    pub(crate) fn new(max_frame_bytes: usize, frame_timeout: Duration) -> Result<Self, String> {
         if max_frame_bytes == 0 {
             return Err("max_frame_bytes must be greater than zero".to_string());
         }
@@ -116,6 +107,7 @@ impl ProtocolLimits {
     }
 }
 
+#[cfg(test)]
 impl Default for ProtocolLimits {
     fn default() -> Self {
         Self {

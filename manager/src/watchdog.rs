@@ -88,11 +88,7 @@ impl WatchdogService {
     /// platforms return `None`. `cpu_percent` is currently always `None`.
     ///
     /// ```no_run
-    /// use runpy::Manager;
-    ///
-    /// # #[tokio::main]
-    /// # async fn main() {
-    /// let manager = Manager::new("worker");
+    /// # async fn demo(manager: &runpy::Manager) {
     /// for report in manager.watchdog().report().await {
     ///     println!("{}: {:?}", report.worker_name, report.state);
     /// }
@@ -126,11 +122,7 @@ impl WatchdogService {
     /// Returns `None` when the worker is not registered.
     ///
     /// ```no_run
-    /// use runpy::Manager;
-    ///
-    /// # #[tokio::main]
-    /// # async fn main() {
-    /// let manager = Manager::new("worker");
+    /// # async fn demo(manager: &runpy::Manager) {
     /// if let Some(report) = manager.watchdog().report_worker("worker-id").await {
     ///     println!("pid {}", report.pid);
     /// }

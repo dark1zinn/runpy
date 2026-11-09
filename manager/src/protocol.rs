@@ -371,13 +371,14 @@ impl InboundEnvelope {
     /// ```no_run
     /// use runpy::{Data, Envelope, Manager, Meta};
     ///
-    /// let mut manager = Manager::new("worker");
+    /// # fn demo(manager: &Manager) {
     /// manager.on_message(|inbound| {
     ///     let reply = Envelope::new(Meta::new(), Data::new()).unwrap();
     ///     if let Err(error) = inbound.reply(reply) {
     ///         eprintln!("reply not admitted: {error}");
     ///     }
     /// });
+    /// # }
     /// ```
     pub fn reply(&self, envelope: Envelope) -> Result<SendReceipt, RunpyError> {
         self.mailer.route(&self.worker_id)?.try_send(envelope)
@@ -392,13 +393,14 @@ impl InboundEnvelope {
     /// ```no_run
     /// use runpy::{Data, Envelope, Manager, Meta};
     ///
-    /// let mut manager = Manager::new("worker");
+    /// # fn demo(manager: &Manager) {
     /// manager.on_message(|inbound| {
     ///     tokio::spawn(async move {
     ///         let reply = Envelope::new(Meta::new(), Data::new()).unwrap();
     ///         let _ = inbound.reply_async(reply).await;
     ///     });
     /// });
+    /// # }
     /// ```
     pub async fn reply_async(&self, envelope: Envelope) -> Result<(), RunpyError> {
         self.mailer.route(&self.worker_id)?.send(envelope).await
@@ -1013,13 +1015,17 @@ impl ControlPlane {
         socket_path: String,
         listener: UnixListener,
         worker_handler: Option<MessageHandler>,
-    ) -> Result<(), String> {
+    ) -> Result<(), RunpyError> {
         let worker_id = identity.name.clone();
         let process_group_id = child.id();
+        let missing = |stream: &str| {
+            RunpyError::Io(std::io::Error::other(format!(
+                "worker {stream} pipe was not configured"
+            )))
+        };
         let stdout = match child.stdout.take() {
-            Some(stdout) => ChildStdout::from_std(stdout)
-                .map_err(|error| format!("Failed to attach worker stdout to Tokio: {error}")),
-            None => Err("Worker stdout pipe was not configured".to_string()),
+            Some(stdout) => ChildStdout::from_std(stdout).map_err(RunpyError::Io),
+            None => Err(missing("stdout")),
         };
         let stdout = match stdout {
             Ok(stdout) => stdout,
@@ -1029,9 +1035,8 @@ impl ControlPlane {
             }
         };
         let stderr = match child.stderr.take() {
-            Some(stderr) => ChildStderr::from_std(stderr)
-                .map_err(|error| format!("Failed to attach worker stderr to Tokio: {error}")),
-            None => Err("Worker stderr pipe was not configured".to_string()),
+            Some(stderr) => ChildStderr::from_std(stderr).map_err(RunpyError::Io),
+            None => Err(missing("stderr")),
         };
         let stderr = match stderr {
             Ok(stderr) => stderr,
@@ -1060,7 +1065,7 @@ impl ControlPlane {
             drop(workers);
             drop(sessions);
             cleanup_unregistered_worker(&mut child, process_group_id, &sock_path);
-            return Err("Worker manager is shutting down".to_string());
+            return Err(RunpyError::ManagerClosed);
         }
 
         let output_sender = {
@@ -1076,7 +1081,7 @@ impl ControlPlane {
                         drop(workers);
                         drop(sessions);
                         cleanup_unregistered_worker(&mut child, process_group_id, &sock_path);
-                        return Err(error);
+                        return Err(RunpyError::Io(std::io::Error::other(error)));
                     }
                 };
                 *dispatcher = Some(new_dispatcher);
@@ -2380,7 +2385,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(error.contains("shutting down"));
+        assert!(matches!(error, RunpyError::ManagerClosed));
         assert!(!sock_path.exists());
         assert!(control_plane.workers.read().is_empty());
         assert!(control_plane.sessions.lock().is_empty());

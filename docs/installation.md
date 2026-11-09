@@ -17,7 +17,7 @@ For architecture, lifecycle, protocol, and operations details, see the
 - A Unix-like operating system with Unix domain sockets.
 - Rust and Cargo.
 - `uv` available on `PATH`, or at a path supplied to
-  `Manager::with_uv_path`.
+  `Manager::builder(...).uv_path(...)`.
 - Python 3.10 or newer for the `runpyrs` SDK. `uv` can install the Python
   version declared by each worker.
 
@@ -123,42 +123,27 @@ To exclude packages uploaded after a deployment cutoff, add uv's RFC 3339
 
 ## Configure the manager
 
-`Manager::new` resolves `uv` from `PATH` and accepts the directory containing
-worker scripts:
-
-```rust
-use runpy::Manager;
-
-let manager = Manager::new("worker");
-drop(manager);
-```
-
-Packaged deployments can provide an explicit executable:
-
-```rust
-use runpy::Manager;
-
-let manager = Manager::with_uv_path("worker", "/opt/runpy/bin/uv");
-drop(manager);
-```
-
-Runpy checks the configured executable and scripts directory during Manager
-construction. Construction logs an integrity failure; `Manager::check_integrity`
-and `Worker::spawn` return validation failures to the caller.
-
-The worker name passed to `Manager::worker` is a file stem, without `.py`:
+`Manager::builder` takes the directory containing worker scripts and resolves
+`uv` from `PATH` by default. `build` must be awaited inside a Tokio runtime:
 
 ```rust
 use runpy::Manager;
 
 #[tokio::main]
-async fn main() {
-    let manager = Manager::new("worker");
-    let mut worker = manager.worker("my_worker");
-    let worker_id = worker.spawn().await.expect("worker should start");
-    println!("spawned {worker_id}");
+async fn main() -> Result<(), runpy::RunpyError> {
+    let manager = Manager::builder("worker").build().await?;
+    // The worker name is a file stem, without `.py`.
+    let worker = manager.worker("my_worker").spawn().await?;
+    println!("spawned {}", worker.id());
+    worker.terminate().await?;
+    Ok(())
 }
 ```
+
+Packaged deployments can provide an explicit executable with
+`.uv_path("/opt/runpy/bin/uv")`. `build` fails with `UvUnavailable` when the
+executable cannot run and with `ScriptsDirectory` when the scripts directory is
+missing; `Manager::check_integrity` repeats these checks later.
 
 The effective command is:
 

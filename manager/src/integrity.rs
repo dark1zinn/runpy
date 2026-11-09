@@ -1,9 +1,10 @@
 use std::collections::HashSet;
 use std::io::ErrorKind;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
+use crate::error::RunpyError;
 use crate::scribbler::Scribbler;
 
 /// Private runtime validator shared by Manager and worker facades.
@@ -21,10 +22,10 @@ pub struct IntegrityChecker {
 }
 
 impl IntegrityChecker {
-    pub fn new(scripts: &str, uv_path: &str, logger: Arc<Scribbler>) -> Self {
+    pub fn new(scripts: PathBuf, uv_path: PathBuf, logger: Arc<Scribbler>) -> Self {
         Self {
-            uv_path: PathBuf::from(uv_path),
-            scripts_dir: PathBuf::from(scripts),
+            uv_path,
+            scripts_dir: scripts,
             registry: Mutex::new(HashSet::new()),
             logger,
         }
@@ -35,24 +36,30 @@ impl IntegrityChecker {
     ///
     /// The uv check requires only a successful `--version` exit; it does not
     /// parse or enforce a semantic version.
-    pub fn perform_check(&self) -> Result<(), String> {
+    pub fn perform_check(&self) -> Result<(), RunpyError> {
         self.validate_uv()?;
 
         // Socket creation is centralized under a stable Manager-owned
         // directory; individual Worker spawns own their socket file cleanup.
-        // Ensure socket directory exists
         let sock_dir = PathBuf::from("/tmp/runpy");
         if !sock_dir.exists() {
-            std::fs::create_dir_all(&sock_dir)
-                .map_err(|e| format!("Failed to create socket directory: {}", e))?;
+            std::fs::create_dir_all(&sock_dir).map_err(RunpyError::Io)?;
         }
 
-        // Validate scripts directory exists
-        if !self.scripts_dir.exists() {
-            return Err(format!(
-                "Scripts directory does not exist: '{}'",
-                self.scripts_dir.display()
-            ));
+        match std::fs::metadata(&self.scripts_dir) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => {
+                return Err(RunpyError::ScriptsDirectory {
+                    path: self.scripts_dir.clone(),
+                    source: std::io::Error::new(ErrorKind::NotADirectory, "not a directory"),
+                });
+            }
+            Err(source) => {
+                return Err(RunpyError::ScriptsDirectory {
+                    path: self.scripts_dir.clone(),
+                    source,
+                });
+            }
         }
 
         // Index Scripts
@@ -69,23 +76,25 @@ impl IntegrityChecker {
         scripts.contains(script)
     }
 
-    fn validate_uv(&self) -> Result<(), String> {
-        match Command::new(&self.uv_path).arg("--version").status() {
+    fn validate_uv(&self) -> Result<(), RunpyError> {
+        let unavailable = |detail: String| RunpyError::UvUnavailable {
+            path: self.uv_path.clone(),
+            detail,
+        };
+        match Command::new(&self.uv_path)
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+        {
             Ok(status) if status.success() => Ok(()),
-            Ok(status) => Err(format!(
-                "uv executable at '{}' returned non-zero status: {}",
-                self.uv_path.display(),
-                status
-            )),
-            Err(error) if error.kind() == ErrorKind::NotFound => Err(format!(
-                "uv executable not found at '{}'",
-                self.uv_path.display()
-            )),
-            Err(error) => Err(format!(
-                "Failed to execute uv at '{}': {}",
-                self.uv_path.display(),
-                error
-            )),
+            Ok(status) => Err(unavailable(format!(
+                "`--version` returned non-zero status: {status}"
+            ))),
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                Err(unavailable("executable not found".to_string()))
+            }
+            Err(error) => Err(unavailable(format!("failed to execute: {error}"))),
         }
     }
 

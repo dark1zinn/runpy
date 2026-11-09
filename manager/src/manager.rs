@@ -8,9 +8,9 @@ use std::process::Stdio;
 use std::sync::{Arc, Weak};
 use tokio::net::UnixListener;
 
-use crate::error::RunpyError;
+use crate::error::{InvalidScriptReason, RunpyError};
 use crate::integrity::IntegrityChecker;
-use crate::protocol::{ControlPlane, Envelope, MessageHandler, SendReceipt};
+use crate::protocol::{ControlPlane, Envelope, InboundEnvelope, MessageHandler, SendReceipt};
 
 // ── Worker Identity ────────────────────────────────────────────────────
 
@@ -53,46 +53,57 @@ impl WorkerIdentity {
     }
 }
 
-// ── Worker (user-facing) ───────────────────────────────────────────────
+// ── Worker configuration ───────────────────────────────────────────────
 
-/// Builder and remote handle for one Python worker.
+/// Standard input given to a worker process.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum StdinMode {
+    /// Connect stdin to the null device (default), so a worker can never
+    /// block on or consume the host's input.
+    #[default]
+    Null,
+    /// Inherit the Manager process's stdin.
+    Inherit,
+}
+
+/// Immutable configuration for launching one worker script.
 ///
-/// Configure environment, arguments, and a per-worker handler before
-/// [`Worker::spawn`]. A successful spawn stores the generated identity so the
-/// same value can call [`Worker::send_message`] and [`Worker::terminate`].
-/// The facade uses weak references to Manager-owned services and returns an
-/// error after its Manager is dropped.
+/// Created by [`crate::Manager::worker`]. Setters consume and return the
+/// builder; [`WorkerBuilder::spawn`] consumes it and returns a running
+/// [`Worker`]. A builder is cheap to clone, so one template can launch many
+/// workers.
 ///
 /// ```no_run
-/// use runpy::{Envelope, Manager};
+/// use runpy::Manager;
 ///
 /// # #[tokio::main]
-/// # async fn main() {
-/// let manager = Manager::new("worker");
-/// let mut worker = manager.worker("my_worker");
-/// worker
+/// # async fn main() -> Result<(), runpy::RunpyError> {
+/// let manager = Manager::builder("worker").build().await?;
+/// let worker = manager
+///     .worker("my_worker")
 ///     .env("MODE", "fast")
 ///     .arg("batch", "10")
-///     .on_message(|inbound| println!("{:?}", inbound.envelope));
-///
-/// worker.spawn().await.expect("worker starts");
-/// worker.send_message(Envelope::retry()).await.expect("message sent");
-/// worker.terminate().await.expect("worker stopped");
+///     .on_message(|inbound| println!("{:?}", inbound.envelope))
+///     .spawn()
+///     .await?;
+/// worker.terminate().await?;
+/// # Ok(())
 /// # }
 /// ```
-pub struct Worker {
+#[derive(Clone)]
+pub struct WorkerBuilder {
     script: String,
     integrity: Weak<IntegrityChecker>,
     control_plane: Weak<ControlPlane>,
     socket_dir: PathBuf,
     env_vars: HashMap<String, String>,
     extra_args: HashMap<String, String>,
+    cwd: Option<PathBuf>,
+    stdin: StdinMode,
     worker_handler: Option<MessageHandler>,
-    worker_id: Option<String>,
 }
 
-impl Worker {
-    /// Create a Worker facade backed by Manager-owned services.
+impl WorkerBuilder {
     pub(crate) fn new(
         script: &str,
         integrity: Weak<IntegrityChecker>,
@@ -106,23 +117,17 @@ impl Worker {
             socket_dir: socket_dir.to_path_buf(),
             env_vars: HashMap::new(),
             extra_args: HashMap::new(),
+            cwd: None,
+            stdin: StdinMode::default(),
             worker_handler: None,
-            worker_id: None,
         }
     }
 
     /// Set or replace an environment variable passed to `uv` and Python.
     ///
-    /// Runpy applies `PYTHONUNBUFFERED=1` after builder values, so that one key
-    /// cannot be overridden.
-    ///
-    /// ```no_run
-    /// # use runpy::Manager;
-    /// let manager = Manager::new("worker");
-    /// let mut worker = manager.worker("my_worker");
-    /// worker.env("API_BASE", "https://example.com");
-    /// ```
-    pub fn env(&mut self, key: &str, value: &str) -> &mut Self {
+    /// Runpy applies its own `PYTHONUNBUFFERED=1` and frame-limit variables
+    /// after builder values, so those keys cannot be overridden.
+    pub fn env(mut self, key: &str, value: &str) -> Self {
         self.env_vars.insert(key.to_string(), value.to_string());
         self
     }
@@ -130,14 +135,7 @@ impl Worker {
     /// Set or replace one extra `--key=value` worker argument.
     ///
     /// Python exposes recognized arguments through `Worker.extra`.
-    ///
-    /// ```no_run
-    /// # use runpy::Manager;
-    /// let manager = Manager::new("worker");
-    /// let mut worker = manager.worker("my_worker");
-    /// worker.arg("mode", "fast");
-    /// ```
-    pub fn arg(&mut self, key: &str, value: &str) -> &mut Self {
+    pub fn arg(mut self, key: &str, value: &str) -> Self {
         self.extra_args.insert(key.to_string(), value.to_string());
         self
     }
@@ -145,114 +143,95 @@ impl Worker {
     /// Merge multiple extra worker arguments.
     ///
     /// Values in `args` replace existing values for matching keys.
-    ///
-    /// ```no_run
-    /// use std::collections::HashMap;
-    /// # use runpy::Manager;
-    ///
-    /// let manager = Manager::new("worker");
-    /// let mut worker = manager.worker("my_worker");
-    /// worker.args(HashMap::from([
-    ///     ("mode".to_string(), "fast".to_string()),
-    ///     ("batch".to_string(), "10".to_string()),
-    /// ]));
-    /// ```
-    pub fn args(&mut self, args: HashMap<String, String>) -> &mut Self {
+    pub fn args(mut self, args: HashMap<String, String>) -> Self {
         self.extra_args.extend(args);
         self
     }
 
-    /// Replace the per-worker inbound-envelope handler.
+    /// Run the worker in `dir` instead of the scripts directory's parent.
+    ///
+    /// `PYTHONPATH` still points at the scripts directory's parent unless an
+    /// [`env`](Self::env) value overrides it.
+    pub fn cwd(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.cwd = Some(dir.into());
+        self
+    }
+
+    /// Choose the worker's standard input; the default is [`StdinMode::Null`].
+    pub fn stdin(mut self, mode: StdinMode) -> Self {
+        self.stdin = mode;
+        self
+    }
+
+    /// Set the per-worker inbound-envelope handler.
     ///
     /// For this worker, the current Manager-global handler runs first and this
-    /// handler runs second. The handler captured at spawn executes
-    /// synchronously in the protocol task and should return promptly.
-    ///
-    /// ```no_run
-    /// # use runpy::Manager;
-    /// let manager = Manager::new("worker");
-    /// let mut worker = manager.worker("my_worker");
-    /// worker.on_message(|inbound| {
-    ///     println!("{:?}", inbound.envelope.data());
-    /// });
-    /// ```
-    pub fn on_message<F>(&mut self, handler: F) -> &mut Self
+    /// handler second. It executes synchronously in the protocol task and
+    /// should return promptly; a panic is caught and logged.
+    pub fn on_message<F>(mut self, handler: F) -> Self
     where
-        F: Fn(crate::protocol::InboundEnvelope) + Send + Sync + 'static,
+        F: Fn(InboundEnvelope) + Send + Sync + 'static,
     {
         self.worker_handler = Some(Arc::new(handler));
         self
     }
 
-    /// Start the configured script and register it with the Manager.
+    /// Launch the configured script and register it with the Manager.
     ///
-    /// This re-runs integrity checks, requires the script name to be a single
-    /// path component and a root-level `<script>.py`,
-    /// creates a unique socket, and launches `uv run --no-project [--locked]
-    /// --script`. The returned string is the trusted worker ID. Registration
-    /// owns the child process group, protocol session, and output readers.
+    /// The script name must be a single path component naming a root-level
+    /// `<script>.py`. Runpy creates a unique socket and launches
+    /// `uv run --no-project [--locked] --script`. Registration owns the child
+    /// process group, protocol session, and output readers; failures after
+    /// the process starts kill and reap its group and remove the socket.
     ///
-    /// Errors include a dropped Manager, an invalid script name, failed
-    /// integrity/path validation, missing script, socket/spawn/pipe registration
-    /// failure, shutdown in progress, and attempting to spawn the same facade
-    /// twice. Post-spawn registration failures clean up the child process group
-    /// and socket.
+    /// # Errors
     ///
-    /// ```no_run
-    /// # use runpy::Manager;
-    /// # #[tokio::main]
-    /// # async fn main() {
-    /// let manager = Manager::new("worker");
-    /// let mut worker = manager.worker("my_worker");
-    /// let worker_id = worker.spawn().await.expect("worker starts");
-    /// println!("{worker_id}");
-    /// # }
-    /// ```
-    pub async fn spawn(&mut self) -> Result<String, String> {
-        if self.worker_id.is_some() {
-            return Err("Worker has already been spawned".to_string());
-        }
+    /// [`RunpyError::ManagerClosed`] after Manager drop or during shutdown,
+    /// [`RunpyError::InvalidScript`] for a bad or missing script,
+    /// [`RunpyError::ScriptsDirectory`] or [`RunpyError::UvUnavailable`] when
+    /// the runtime check fails, and [`RunpyError::Io`] when the socket,
+    /// process, or pipes cannot be set up.
+    pub async fn spawn(self) -> Result<Worker, RunpyError> {
         let script_name = Path::new(&self.script);
-        if script_name.file_name() != Some(script_name.as_os_str()) {
-            return Err("Worker script name must be a single path component".to_string());
+        if self.script.is_empty() || script_name.file_name() != Some(script_name.as_os_str()) {
+            return Err(RunpyError::InvalidScript {
+                script: self.script,
+                reason: InvalidScriptReason::NotSingleComponent,
+            });
         }
 
-        let integrity = self
-            .integrity
-            .upgrade()
-            .ok_or_else(|| "Worker manager is no longer available".to_string())?;
+        let integrity = self.integrity.upgrade().ok_or(RunpyError::ManagerClosed)?;
         let control_plane = self
             .control_plane
             .upgrade()
-            .ok_or_else(|| "Worker manager is no longer available".to_string())?;
+            .ok_or(RunpyError::ManagerClosed)?;
 
         integrity.perform_check()?;
-        let scripts_dir = integrity.scripts_dir.canonicalize().map_err(|error| {
-            format!(
-                "Failed to resolve scripts directory '{}': {}",
-                integrity.scripts_dir.display(),
-                error
-            )
+        let scripts_dir = integrity.scripts_dir.canonicalize().map_err(|source| {
+            RunpyError::ScriptsDirectory {
+                path: integrity.scripts_dir.clone(),
+                source,
+            }
         })?;
         let script_file = scripts_dir.join(format!("{}.py", self.script));
         if !script_file.is_file() {
-            return Err(format!(
-                "Worker script does not exist: '{}'",
-                script_file.display()
-            ));
+            return Err(RunpyError::InvalidScript {
+                script: self.script,
+                reason: InvalidScriptReason::NotFound(script_file),
+            });
         }
 
         let uv_path =
             if integrity.uv_path.is_absolute() || integrity.uv_path.components().count() == 1 {
                 integrity.uv_path.clone()
             } else {
-                integrity.uv_path.canonicalize().map_err(|error| {
-                    format!(
-                        "Failed to resolve uv executable '{}': {}",
-                        integrity.uv_path.display(),
-                        error
-                    )
-                })?
+                integrity
+                    .uv_path
+                    .canonicalize()
+                    .map_err(|error| RunpyError::UvUnavailable {
+                        path: integrity.uv_path.clone(),
+                        detail: format!("cannot resolve path: {error}"),
+                    })?
             };
         let lock_file = script_file.with_extension("py.lock");
 
@@ -260,16 +239,14 @@ impl Worker {
         let worker_id = identity.name.clone();
         let sock_path = self.socket_dir.join(&identity.sock_file);
         let _ = std::fs::remove_file(&sock_path);
-        let listener = UnixListener::bind(&sock_path).map_err(|error| {
-            format!(
-                "Failed to bind socket at '{}': {error}",
-                sock_path.display()
-            )
-        })?;
-        let socket_path = sock_path.to_str().map(str::to_owned).ok_or_else(|| {
+        let listener = UnixListener::bind(&sock_path).map_err(RunpyError::Io)?;
+        let Some(socket_path) = sock_path.to_str().map(str::to_owned) else {
             let _ = std::fs::remove_file(&sock_path);
-            format!("Socket path is not valid UTF-8: {}", sock_path.display())
-        })?;
+            return Err(RunpyError::InvalidConfig(format!(
+                "socket path is not valid UTF-8: {}",
+                sock_path.display()
+            )));
+        };
 
         control_plane.logger().debug_with(
             "Worker",
@@ -298,6 +275,9 @@ impl Worker {
             cmd.current_dir(parent);
             cmd.env("PYTHONPATH", parent);
         }
+        if let Some(cwd) = &self.cwd {
+            cmd.current_dir(cwd);
+        }
         for (key, value) in &self.env_vars {
             cmd.env(key, value);
         }
@@ -307,6 +287,10 @@ impl Worker {
             cmd.env(key, value);
         }
         cmd.env("PYTHONUNBUFFERED", "1")
+            .stdin(match self.stdin {
+                StdinMode::Null => Stdio::null(),
+                StdinMode::Inherit => Stdio::inherit(),
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         // A separate process group lets every uv/Python descendant be stopped
@@ -316,10 +300,13 @@ impl Worker {
 
         let child = cmd.spawn().map_err(|error| {
             let _ = std::fs::remove_file(&sock_path);
-            format!(
-                "Failed to start worker with uv '{}': {error}",
-                integrity.uv_path.display()
-            )
+            RunpyError::Io(std::io::Error::new(
+                error.kind(),
+                format!(
+                    "failed to start worker with uv '{}': {error}",
+                    integrity.uv_path.display()
+                ),
+            ))
         })?;
 
         control_plane
@@ -329,44 +316,61 @@ impl Worker {
                 sock_path,
                 socket_path,
                 listener,
-                self.worker_handler.clone(),
+                self.worker_handler,
             )
             .await?;
-        self.worker_id = Some(worker_id.clone());
         control_plane
             .logger()
             .success(&format!("Spawned worker: {worker_id}"));
-        Ok(worker_id)
+        Ok(Worker {
+            id: worker_id,
+            control_plane: self.control_plane,
+        })
+    }
+}
+
+// ── Running worker handle ──────────────────────────────────────────────
+
+/// Handle to one running worker process.
+///
+/// Returned by [`WorkerBuilder::spawn`]. Cloning is cheap; every clone
+/// addresses the same process. The Manager owns the process: after the
+/// Manager is dropped, operations return [`RunpyError::ManagerClosed`], and
+/// after the worker is removed they return [`RunpyError::WorkerExited`].
+#[derive(Clone, Debug)]
+pub struct Worker {
+    id: String,
+    control_plane: Weak<ControlPlane>,
+}
+
+impl Worker {
+    /// Trusted Manager-generated worker identity.
+    pub fn id(&self) -> &str {
+        &self.id
     }
 
     /// Send an envelope and wait until it is completely written.
     ///
     /// Waiting for outbound capacity and the socket write share the
     /// Manager's send deadline. Success means the frame reached the socket,
-    /// not that the worker processed it. Calling before a successful spawn,
-    /// after Manager drop, or after worker removal returns an error.
+    /// not that the worker processed it.
     ///
     /// ```no_run
-    /// use runpy::{Data, Envelope, Manager};
-    /// use serde_json::{json, Value};
+    /// use runpy::{Data, Envelope, Manager, Meta};
     ///
-    /// # fn object(value: Value) -> Data {
-    /// #     value.as_object().cloned().unwrap()
-    /// # }
     /// # #[tokio::main]
-    /// # async fn main() {
-    /// let manager = Manager::new("worker");
-    /// let mut worker = manager.worker("my_worker");
-    /// worker.spawn().await.unwrap();
+    /// # async fn main() -> Result<(), runpy::RunpyError> {
+    /// let manager = Manager::builder("worker").build().await?;
+    /// let worker = manager.worker("my_worker").spawn().await?;
     /// worker
-    ///     .send_message(Envelope::execute(object(json!({"task": "parse"}))))
-    ///     .await
-    ///     .unwrap();
+    ///     .send_message(Envelope::new(Meta::new(), Data::new())?)
+    ///     .await?;
+    /// worker.terminate().await?;
+    /// # Ok(())
     /// # }
     /// ```
     pub async fn send_message(&self, envelope: Envelope) -> Result<(), RunpyError> {
-        let (control_plane, worker_id) = self.route()?;
-        control_plane.send(worker_id, envelope).await
+        self.control_plane()?.send(&self.id, envelope).await
     }
 
     /// Admit an envelope without waiting, or fail with
@@ -374,57 +378,23 @@ impl Worker {
     ///
     /// The returned [`SendReceipt`] resolves when the frame is written or
     /// fails. Dropping the receipt does not cancel the send.
-    ///
-    /// ```no_run
-    /// use runpy::{Data, Envelope, Manager, Meta};
-    ///
-    /// # #[tokio::main]
-    /// # async fn main() {
-    /// let manager = Manager::new("worker");
-    /// let mut worker = manager.worker("my_worker");
-    /// worker.spawn().await.unwrap();
-    /// let receipt = worker
-    ///     .try_send_message(Envelope::new(Meta::new(), Data::new()).unwrap())
-    ///     .expect("capacity available");
-    /// receipt.wait().await.expect("frame written");
-    /// # }
-    /// ```
     pub fn try_send_message(&self, envelope: Envelope) -> Result<SendReceipt, RunpyError> {
-        let (control_plane, worker_id) = self.route()?;
-        control_plane.try_send(worker_id, envelope)
+        self.control_plane()?.try_send(&self.id, envelope)
     }
 
     /// Request graceful termination, then force process-group cleanup.
     ///
     /// New sends to this worker are refused at once. The worker is removed
-    /// when its process exits, and at the latest two seconds after the call
-    /// started, even if `terminate` could not be written. Cleanup always runs;
-    /// the result reports whether `terminate` was written. Calling before
-    /// spawn or after Manager drop returns an error.
-    ///
-    /// ```no_run
-    /// # use runpy::Manager;
-    /// # #[tokio::main]
-    /// # async fn main() {
-    /// let manager = Manager::new("worker");
-    /// let mut worker = manager.worker("my_worker");
-    /// worker.spawn().await.unwrap();
-    /// worker.terminate().await.unwrap();
-    /// # }
-    /// ```
+    /// when its process exits, and at the latest when the Manager's shutdown
+    /// grace ends, even if `terminate` could not be written. Cleanup always
+    /// runs; the result reports whether `terminate` was written.
     pub async fn terminate(&self) -> Result<(), RunpyError> {
-        let (control_plane, worker_id) = self.route()?;
-        control_plane.terminate_worker(worker_id).await
+        self.control_plane()?.terminate_worker(&self.id).await
     }
 
-    fn route(&self) -> Result<(Arc<ControlPlane>, &str), RunpyError> {
-        let worker_id = self.worker_id.as_deref().ok_or_else(|| {
-            RunpyError::InvalidConfig("worker has not been spawned yet".to_string())
-        })?;
-        let control_plane = self
-            .control_plane
+    fn control_plane(&self) -> Result<Arc<ControlPlane>, RunpyError> {
+        self.control_plane
             .upgrade()
-            .ok_or(RunpyError::ManagerClosed)?;
-        Ok((control_plane, worker_id))
+            .ok_or(RunpyError::ManagerClosed)
     }
 }
