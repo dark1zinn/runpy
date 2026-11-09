@@ -10,12 +10,24 @@ use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
-fn write_executable(tmp: &TempDir, name: &str, body: &str) -> PathBuf {
+/// Install an executable script without this process ever holding a
+/// writable descriptor to it.
+///
+/// Tests run on many threads, and a child forked concurrently by another
+/// test inherits every open descriptor until it execs. Executing a file that
+/// such a child still holds open for writing fails with `ETXTBSY`, so the
+/// final file is written by a separate `install` process instead.
+pub(crate) fn write_executable(tmp: &TempDir, name: &str, body: &str) -> PathBuf {
+    let source = tmp.path().join(format!(".{name}.source"));
+    fs::write(&source, body).unwrap();
     let path = tmp.path().join(name);
-    fs::write(&path, body).unwrap();
-    let mut permissions = fs::metadata(&path).unwrap().permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&path, permissions).unwrap();
+    let status = std::process::Command::new("install")
+        .args(["-m", "0755"])
+        .arg(&source)
+        .arg(&path)
+        .status()
+        .unwrap();
+    assert!(status.success(), "install {} failed", path.display());
     path
 }
 

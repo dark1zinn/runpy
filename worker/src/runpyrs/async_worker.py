@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import sys
 from types import TracebackType
-from typing import Dict, Optional, Set, Type
+from typing import Any, Coroutine, Dict, Optional, Set, Type
 
 from ._protocol import (
     PROTOCOL_VERSION,
@@ -203,8 +203,8 @@ class AsyncWorker:
 
     # -- Lifecycle -------------------------------------------------------------
 
-    def _spawn(self, coroutine) -> "asyncio.Task[None]":
-        task = asyncio.ensure_future(coroutine)
+    def _spawn(self, coroutine: Coroutine[Any, Any, None]) -> asyncio.Task[None]:
+        task = asyncio.get_running_loop().create_task(coroutine)
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
         return task

@@ -777,9 +777,8 @@ Run Rust validation from the repository root:
 ```bash
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-cargo test --workspace --all-features --locked -- --test-threads=1
-cargo test --doc -p runpy --locked
-cargo doc -p runpy --no-deps
+cargo test --workspace --all-features --locked
+RUSTDOCFLAGS="-D warnings" cargo doc -p runpy --no-deps --locked
 ```
 
 `cargo test` includes `manager/tests/end_to_end.rs`, which runs real `uv` and
@@ -796,10 +795,36 @@ Run Python validation from the repository root:
 ```bash
 uv run --frozen ruff format --check worker/src/runpyrs worker/tests tests examples/playground/worker/my_script.py
 uv run --frozen ruff check worker/src/runpyrs worker/tests tests examples/playground/worker/my_script.py
-uv run --frozen --all-packages pytest worker/tests tests/hooks
+uv run --frozen mypy
+uv run --frozen --all-packages pytest worker/tests tests/docs tests/hooks --doctest-modules worker/src/runpyrs
 # Against the minimum Python without replacing .venv:
 uv run --frozen --all-packages --isolated --python 3.10 pytest worker/tests
+# Build both packages and use them from outside the checkout:
+PACKAGE_SMOKE_ALLOW_DIRTY=1 scripts/package-smoke.sh
 ```
+
+mypy runs in strict mode (configured in `pyproject.toml`) over the SDK and
+the playground worker. `tests/docs` checks that local Markdown links and
+heading anchors resolve and that Python examples compile.
+
+### Continuous integration
+
+`.github/workflows/quality.yml` holds every correctness gate and is called by
+`ci.yml` on pull requests and pushes to `main`. No gate is path-filtered.
+The required status check is **CI success**, which always runs and fails
+unless all gates succeeded, so skipped or cancelled gates cannot pass.
+
+| Gate | Platforms |
+| --- | --- |
+| Rust fmt, Clippy, tests (parallel), docs with warnings denied | Linux: Rust 1.93.0 and stable; macOS: stable |
+| Real uv integration and playground | Linux and macOS × Python 3.10 and 3.14 |
+| Ruff, mypy strict, pytest, doctests, Markdown, hook tests | Linux × Python 3.10–3.14 |
+| `scripts/package-smoke.sh` | Linux |
+| actionlint | Linux |
+
+The declared minimum Rust is `rust-version = "1.93"`. The development shell
+job (`dev-shell.yml`) and the scheduled benchmarks are separate and not
+required.
 
 `tests/protocol_vectors.json` holds wire vectors that both languages must
 agree on: frame bodies (Unicode, reserved fields, direction, malformed JSON,

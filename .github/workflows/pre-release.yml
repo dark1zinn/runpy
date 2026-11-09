@@ -24,7 +24,7 @@ jobs:
             echo "::error::Tag '$TAG' does not match pre-release format vX.X.X-dev or vX.X.X-dev.X"
             exit 1
           fi
-          echo "TAG=$TAG" >> $GITHUB_ENV
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
           echo "✓ Valid pre-release tag: $TAG"
 
       - name: Create GitHub Pre-Release

@@ -1,16 +1,11 @@
+use crate::manager_test::write_executable;
 use runpy::{Manager, RunpyError};
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use tempfile::TempDir;
 
 fn write_fake_uv(tmp: &TempDir, body: &str) -> PathBuf {
-    let path = tmp.path().join("uv");
-    fs::write(&path, body).unwrap();
-    let mut permissions = fs::metadata(&path).unwrap().permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&path, permissions).unwrap();
-    path
+    write_executable(tmp, "uv", body)
 }
 
 fn scripts_dir(tmp: &TempDir) -> PathBuf {

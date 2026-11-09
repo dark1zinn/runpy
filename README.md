@@ -192,8 +192,8 @@ Run Rust checks:
 ```bash
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-cargo test --workspace --all-features --locked -- --test-threads=1
-cargo test --doc -p runpy --locked
+cargo test --workspace --all-features --locked
+RUSTDOCFLAGS="-D warnings" cargo doc -p runpy --no-deps --locked
 ```
 
 The Rust tests include end-to-end runs through real `uv` and the local Python
@@ -204,10 +204,15 @@ Run Python checks:
 ```bash
 uv run --frozen ruff format --check worker/src/runpyrs worker/tests tests examples/playground/worker/my_script.py
 uv run --frozen ruff check worker/src/runpyrs worker/tests tests examples/playground/worker/my_script.py
-uv run --frozen --all-packages pytest worker/tests tests/hooks
+uv run --frozen mypy
+uv run --frozen --all-packages pytest worker/tests tests/docs tests/hooks --doctest-modules worker/src/runpyrs
 # Against the minimum Python without replacing .venv:
 uv run --frozen --all-packages --isolated --python 3.10 pytest worker/tests
 ```
+
+CI runs these on the platform matrix described in the
+[overview](docs/overview.md#continuous-integration), plus
+`scripts/package-smoke.sh`.
 
 Run the integration playground:
 

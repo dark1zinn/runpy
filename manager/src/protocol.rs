@@ -4081,8 +4081,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn interrupted_write_times_out_and_closes_the_connection() {
         let directory = tempfile::TempDir::new().unwrap();
+        // Long enough to start writing even on a loaded host; the write
+        // itself can never finish because the peer never reads.
         let queue = QueueLimits {
-            send_timeout: Duration::from_millis(300),
+            send_timeout: Duration::from_secs(2),
             ..QueueLimits::default()
         };
         let control_plane = ControlPlane::new(test_logger(), ProtocolLimits::default(), queue);
@@ -4096,7 +4098,10 @@ mod tests {
         )
         .unwrap();
         let error = control_plane.send("worker", large).await.unwrap_err();
-        assert!(matches!(error, RunpyError::Timeout(TimeoutStage::Write)));
+        assert!(
+            matches!(error, RunpyError::Timeout(TimeoutStage::Write)),
+            "{error:?}"
+        );
 
         // Draining what was written ends in EOF: the stream is not reused.
         let mut sink = Vec::new();

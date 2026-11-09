@@ -23,7 +23,7 @@ jobs:
             echo "::error::Tag '$TAG' does not match release format vX.X.X"
             exit 1
           fi
-          echo "TAG=$TAG" >> $GITHUB_ENV
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
           echo "✓ Valid release tag: $TAG"
 
       - name: Create GitHub Release

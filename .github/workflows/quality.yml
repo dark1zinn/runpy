@@ -1,0 +1,150 @@
+name: Quality
+
+# Every correctness gate, callable from CI and the release workflows. There
+# are no path filters: cross-language integration always runs.
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  LOG: "off"
+
+jobs:
+  workflows:
+    name: Workflow syntax
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run actionlint
+        run: |
+          bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.11/scripts/download-actionlint.bash) 1.7.11
+          ./actionlint -color
+
+  rust:
+    name: Rust ${{ matrix.rust }} (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            rust: 1.93.0
+          - os: ubuntu-latest
+            rust: stable
+          - os: macos-latest
+            rust: stable
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+          components: rustfmt, clippy
+
+      # Rust tests run fake workers on python3 and real ones through uv.
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+      - name: Run tests
+        run: cargo test --workspace --all-features --locked
+
+      - name: Build documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc -p runpy --no-deps --locked
+
+  integration:
+    name: Integration (${{ matrix.os }}, Python ${{ matrix.python }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.10", "3.14"]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      UV_PYTHON: ${{ matrix.python }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Run real uv workers on the local SDK
+        run: cargo test -p runpy --test end_to_end --locked
+
+      - name: Run the playground
+        run: cargo run -p playground --locked
+
+  python:
+    name: Python ${{ matrix.python }}
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Check formatting
+        if: matrix.python == '3.10'
+        run: >-
+          uv run --frozen ruff format --check
+          worker/src/runpyrs worker/tests tests examples/playground/worker/my_script.py
+
+      - name: Run Ruff
+        if: matrix.python == '3.10'
+        run: >-
+          uv run --frozen ruff check
+          worker/src/runpyrs worker/tests tests examples/playground/worker/my_script.py
+
+      - name: Type-check the SDK and samples
+        run: uv run --frozen --all-packages --python ${{ matrix.python }} mypy --python-version ${{ matrix.python }}
+
+      - name: Run tests and doctests
+        run: >-
+          uv run --frozen --all-packages --python ${{ matrix.python }}
+          pytest worker/tests tests/docs tests/hooks --doctest-modules worker/src/runpyrs
+
+  packages:
+    name: Package smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Package and consume both packages
+        run: scripts/package-smoke.sh

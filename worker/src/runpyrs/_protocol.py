@@ -117,8 +117,8 @@ def _reject_constant(name: str) -> object:
     raise ValueError(f"Non-finite JSON number '{name}' is not allowed")
 
 
-def _reject_duplicates(pairs: list) -> dict:
-    result: dict = {}
+def _reject_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
     for key, value in pairs:
         if key in result:
             raise ValueError(f"Duplicate JSON object key '{key}'")
