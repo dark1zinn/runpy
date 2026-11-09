@@ -361,27 +361,35 @@ impl WorkerBuilder {
         };
         guard.armed = false;
         drop(guard);
-        match ready {
-            Some(LifecycleState::Ready { .. }) => {}
-            Some(_) => {
-                return Err(RunpyError::WorkerExited {
-                    worker_id: worker_id.clone(),
-                });
-            }
+        let failure = match ready {
+            Some(LifecycleState::Ready { .. }) => None,
+            Some(_) => Some(RunpyError::WorkerExited {
+                worker_id: worker_id.clone(),
+            }),
             None if tokio::time::Instant::now() < deadline => {
                 control_plane
                     .remove_worker(&worker_id, ExitReason::Exited)
                     .await;
-                return Err(RunpyError::WorkerExited {
+                Some(RunpyError::WorkerExited {
                     worker_id: worker_id.clone(),
-                });
+                })
             }
             None => {
                 control_plane
                     .remove_worker(&worker_id, ExitReason::StartupTimeout)
                     .await;
-                return Err(RunpyError::Timeout(TimeoutStage::Startup));
+                Some(RunpyError::Timeout(TimeoutStage::Startup))
             }
+        };
+        if let Some(error) = failure {
+            // The session or monitor may be removing the worker concurrently,
+            // in which case `remove_worker` above returned at once. `Exited`
+            // is published only after the process group is killed and the
+            // child reaped, so a failed spawn returns with cleanup complete.
+            let _ = observer
+                .wait_for(|state| matches!(state, LifecycleState::Exited(_)))
+                .await;
+            return Err(error);
         }
 
         control_plane
