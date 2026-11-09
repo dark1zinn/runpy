@@ -1125,17 +1125,25 @@ impl ControlPlane {
     /// all pools' minima would exceed `max_workers`.
     pub(crate) fn reserve_minima(&self, count: usize) -> Result<(), RunpyError> {
         let limit = self.queue.max_workers;
-        self.reserved_minima
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |reserved| {
-                reserved.checked_add(count).filter(|total| *total <= limit)
-            })
-            .map(|_| ())
-            .map_err(|reserved| {
-                RunpyError::InvalidConfig(format!(
+        // See `next_request_id` for why this is not `fetch_update`.
+        let mut reserved = self.reserved_minima.load(Ordering::Acquire);
+        loop {
+            let Some(total) = reserved.checked_add(count).filter(|total| *total <= limit) else {
+                return Err(RunpyError::InvalidConfig(format!(
                     "pool min_workers ({count}) plus minima already reserved ({reserved}) \
                      exceeds the Manager's max_workers ({limit})"
-                ))
-            })
+                )));
+            };
+            match self.reserved_minima.compare_exchange_weak(
+                reserved,
+                total,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(actual) => reserved = actual,
+            }
+        }
     }
 
     /// Return minima accounted by [`ControlPlane::reserve_minima`].
@@ -1384,10 +1392,23 @@ impl ControlPlane {
 
     /// Allocate a request ID, failing rather than wrapping when exhausted.
     pub(crate) fn next_request_id(&self) -> Result<RequestId, RunpyError> {
-        self.next_request
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |id| id.checked_add(1))
-            .map(RequestId::new)
-            .map_err(|_| RunpyError::InvalidConfig("request ID space exhausted".to_string()))
+        // A compare-exchange loop rather than `fetch_update`, which newer
+        // toolchains deprecate in favour of `try_update` (absent in 1.93).
+        let mut id = self.next_request.load(Ordering::Acquire);
+        loop {
+            let next = id.checked_add(1).ok_or_else(|| {
+                RunpyError::InvalidConfig("request ID space exhausted".to_string())
+            })?;
+            match self.next_request.compare_exchange_weak(
+                id,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(RequestId::new(id)),
+                Err(actual) => id = actual,
+            }
+        }
     }
 
     pub(crate) async fn send(&self, worker_id: &str, envelope: Envelope) -> Result<(), RunpyError> {
