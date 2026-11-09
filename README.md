@@ -192,6 +192,9 @@ cargo test --workspace --all-features --locked -- --test-threads=1
 cargo test --doc -p runpy --locked
 ```
 
+The Rust tests include end-to-end runs through real `uv` and the local Python
+SDK, so `uv` must be on `PATH`.
+
 Run Python checks:
 
 ```bash

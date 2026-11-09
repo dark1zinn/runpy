@@ -749,6 +749,15 @@ cargo test --doc -p runpy --locked
 cargo doc -p runpy --no-deps
 ```
 
+`cargo test` includes `manager/tests/end_to_end.rs`, which runs real `uv` and
+the Python SDK from this checkout: each test stages PEP 723 scripts whose only
+dependency is the local `worker/` package by absolute path, and asserts that
+`runpyrs` was imported from it. `uv` must be on `PATH`; the first run builds
+the package into uv's cache. The playground is likewise a repository
+development example: its script resolves `runpyrs` from `../../../worker`.
+Applications install pinned Git revisions instead (see the
+[installation guide](installation.md)).
+
 Run Python validation from the repository root:
 
 ```bash
