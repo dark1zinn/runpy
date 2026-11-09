@@ -2,7 +2,9 @@
 
 import json
 import socket
-from typing import Dict, Optional
+import threading
+from types import TracebackType
+from typing import Dict, Optional, Type
 
 from ._protocol import FrameLimits, decode_body, encode_frame, recv_frame
 from .utils import (
@@ -67,14 +69,15 @@ class Worker:
             ValueError: If ``name`` is empty or a Manager-supplied frame limit
                 in ``RUNPY_MAX_FRAME_BYTES``/``RUNPY_FRAME_TIMEOUT_MS`` is not
                 a positive integer.
-            OSError: If socket creation, connection, or the initial send fails.
+            OSError: If socket creation, connection, or the initial send
+                fails. The socket is closed before the error propagates.
         """
         if not name:
             raise ValueError("Worker ID is required")
 
         self._limits = FrameLimits.from_env()
         self.__ok = False
-        self.__cycles = 0
+        self.__send_lock = threading.Lock()
         self.__exec_payload: Optional[Data] = None
         self.__sock_path = sock
         self.name = name
@@ -83,23 +86,52 @@ class Worker:
         self.stream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             self.stream.connect(self.__sock_path)
-        except Exception:
-            self.stream.close()
+            self.__ok = True
+            self._send_operation("ready", {})
+        except BaseException:
+            self.close()
             raise
 
-        self.__ok = True
-        self._send_operation("ready", {})
+    def __enter__(self) -> "Worker":
+        return self
+
+    def __exit__(
+        self,
+        exc_type: Optional[Type[BaseException]],
+        exc: Optional[BaseException],
+        traceback: Optional[TracebackType],
+    ) -> None:
+        self.close()
+
+    def close(self) -> None:
+        """Close the connection; safe to call repeatedly and from any thread.
+
+        A receive loop blocked in another thread observes end-of-stream and
+        returns. Later sends raise ``ConnectionError``.
+        """
+        self.__ok = False
+        try:
+            self.stream.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        self.stream.close()
 
     def _send_bytes(self, frame: bytes) -> None:
-        """Write one complete pre-encoded frame.
+        """Write one complete pre-encoded frame atomically.
 
-        Any write failure marks the receive loop as closed and is re-raised.
+        A lock keeps frames from different threads from interleaving. A failed
+        write may have sent part of a frame, so it closes the connection and
+        every later send raises ``ConnectionError`` instead of writing onto a
+        corrupted stream.
         """
-        try:
-            self.stream.sendall(frame)
-        except Exception:
-            self.__ok = False
-            raise
+        with self.__send_lock:
+            if not self.__ok:
+                raise ConnectionError("Worker connection is closed")
+            try:
+                self.stream.sendall(frame)
+            except BaseException:
+                self.close()
+                raise
 
     def _send_envelope(self, envelope: Envelope) -> None:
         """Copy, trust-stamp, serialize, and send one complete envelope.
@@ -283,8 +315,7 @@ class Worker:
         """Dispatch one validated envelope to lifecycle or developer hooks."""
         operation = envelope["meta"].get("x_op")
         if operation == "terminate":
-            self.__ok = False
-            self.stream.close()
+            self.close()
             return
 
         if operation == "execute":
@@ -293,7 +324,6 @@ class Worker:
             return
 
         if operation == "retry":
-            self.__cycles += 1
             self._complete_execution(retry=True)
             return
 
@@ -308,20 +338,20 @@ class Worker:
         """Receive and dispatch envelopes until termination or protocol failure.
 
         ``terminate`` closes normally. A malformed frame or handler-level
-        protocol failure prints one diagnostic, marks the worker closed, and
-        closes the socket.
+        protocol failure prints one diagnostic and ends the loop. The
+        connection is always closed when the loop returns.
         """
 
-        while self.__ok:
-            try:
-                envelope = self._recv_envelope()
-                if envelope is None:
-                    self.__ok = False
-                    self.stream.close()
+        try:
+            while self.__ok:
+                try:
+                    envelope = self._recv_envelope()
+                    if envelope is None:
+                        break
+                    self._dispatch(envelope)
+                except Exception as error:
+                    if self.__ok:
+                        print(f"Protocol violation: {error}")
                     break
-                self._dispatch(envelope)
-            except Exception as error:
-                print(f"Protocol violation: {error}")
-                self.__ok = False
-                self.stream.close()
-                break
+        finally:
+            self.close()

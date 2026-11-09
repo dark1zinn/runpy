@@ -74,6 +74,15 @@ arguments. Additional `--key=value` arguments become `Worker.extra`.
 - `log(data, level=..., meta=...)` sends a structured `log` envelope.
 - `run()` closes the connection on malformed frames, invalid reserved
   metadata, or a wrong-direction operation.
+- `send` and `log` are thread-safe: a lock writes each frame atomically, so
+  background threads can report progress while `execute` runs. Hooks such as
+  `execute` and `handle_envelope` still run one at a time on the receive-loop
+  thread.
+- A failed socket write may have sent part of a frame, so it closes the
+  connection; later sends raise `ConnectionError` instead of corrupting the
+  stream.
+- `close()` is idempotent and safe from any thread. `Worker` is also a context
+  manager, and `run()` always closes the connection when it returns.
 
 ### Frame limits
 

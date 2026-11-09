@@ -384,9 +384,19 @@ Override `handle_envelope(envelope)` for custom envelopes. Use `send(data,
 meta=...)` for a custom response. Public builders copy the supplied objects and
 reject application metadata in the `x_` namespace.
 
-`run()` owns the receive loop. Malformed frames, invalid JSON, invalid reserved
-metadata, and wrong-direction operations are protocol violations: Python prints
-a diagnostic, marks the worker closed, and closes the socket.
+`run()` owns the receive loop. Malformed frames, invalid JSON, non-finite
+numbers, invalid reserved metadata, and wrong-direction operations are protocol
+violations: Python prints a diagnostic and ends the loop. `run()` always closes
+the connection when it returns.
+
+`send` and `log` may be called from any thread: a lock writes each frame
+atomically. Results and messages are encoded before any byte is written, so a
+non-finite number or oversized body raises `ValueError` and leaves the
+connection usable; an `execute` result that cannot be encoded becomes an
+`error` envelope. A failed socket write may leave a partial frame on the wire,
+so it closes the connection and later sends raise `ConnectionError`. The
+constructor closes its socket if connecting or sending `ready` fails. `close()`
+is idempotent, and `Worker` is a context manager.
 
 ### Structured log fallback
 

@@ -517,3 +517,149 @@ def test_idle_connection_has_no_frame_deadline(monkeypatch):
         thread.join(timeout=1)
     finally:
         close_worker(resources)
+
+
+def test_concurrent_sends_never_interleave_frames():
+    resources = open_worker()
+    try:
+        _, _, connection, worker, _, _ = resources
+        threads_count, per_thread = 8, 20
+        received = []
+
+        def reader():
+            for _ in range(threads_count * per_thread):
+                received.append(read_envelope(connection)["data"])
+
+        connection.settimeout(10)
+        reading = threading.Thread(target=reader)
+        reading.start()
+
+        def sender(index):
+            for sequence in range(per_thread):
+                worker.send(
+                    {"thread": index, "sequence": sequence, "blob": str(index) * 65536}
+                )
+
+        senders = [
+            threading.Thread(target=sender, args=(index,))
+            for index in range(threads_count)
+        ]
+        for thread in senders:
+            thread.start()
+        for thread in senders:
+            thread.join(timeout=10)
+        reading.join(timeout=10)
+
+        assert len(received) == threads_count * per_thread
+        for data in received:
+            assert data["blob"] == str(data["thread"]) * 65536
+        for index in range(threads_count):
+            sequences = [d["sequence"] for d in received if d["thread"] == index]
+            assert sequences == list(range(per_thread))
+    finally:
+        close_worker(resources)
+
+
+def test_ready_send_failure_closes_the_socket(monkeypatch):
+    with tempfile.TemporaryDirectory() as directory:
+        path = f"{directory}/worker.sock"
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(path)
+        listener.listen(1)
+        closed = []
+        original_close = socket.socket.close
+
+        def failing_sendall(self, data):
+            raise BrokenPipeError("peer gone")
+
+        def recording_close(self):
+            closed.append(self)
+            original_close(self)
+
+        monkeypatch.setattr(socket.socket, "sendall", failing_sendall)
+        monkeypatch.setattr(socket.socket, "close", recording_close)
+        try:
+            with pytest.raises(BrokenPipeError):
+                EchoWorker(path, "worker-123")
+            assert closed and all(sock.fileno() == -1 for sock in closed)
+        finally:
+            monkeypatch.undo()
+            listener.close()
+
+
+def test_failed_send_closes_the_transport_and_rejects_later_writes(monkeypatch):
+    resources = open_worker()
+    try:
+        _, _, connection, worker, _, _ = resources
+        calls = []
+
+        def failing_sendall(self, data):
+            calls.append(len(data))
+            raise ConnectionResetError("reset mid-frame")
+
+        monkeypatch.setattr(socket.socket, "sendall", failing_sendall)
+        with pytest.raises(ConnectionResetError):
+            worker.send({"first": True})
+        with pytest.raises(ConnectionError):
+            worker.send({"second": True})
+        monkeypatch.undo()
+
+        assert len(calls) == 1, "no write may follow a failed frame"
+        assert connection.recv(1) == b""
+    finally:
+        close_worker(resources)
+
+
+def test_non_finite_result_becomes_an_error_and_the_worker_stays_usable():
+    class NaNWorker(Worker):
+        def execute(self, data):
+            if data.get("bad"):
+                return {"value": float("nan")}
+            return {"value": 1.5}
+
+    resources = open_worker(NaNWorker)
+    try:
+        _, _, connection, worker, _, _ = resources
+        thread = threading.Thread(target=worker.run)
+        thread.start()
+        send_envelope(connection, {"meta": {"x_op": "execute"}, "data": {"bad": True}})
+        error = read_envelope(connection)
+        assert error["meta"]["x_op"] == "error"
+        assert "JSON compliant" in error["data"]["message"]
+
+        send_envelope(connection, {"meta": {"x_op": "execute"}, "data": {}})
+        assert read_envelope(connection)["data"] == {"value": 1.5}
+        send_envelope(connection, {"meta": {"x_op": "terminate"}, "data": {}})
+        thread.join(timeout=1)
+        assert not thread.is_alive()
+    finally:
+        close_worker(resources)
+
+
+def test_inbound_non_finite_number_is_a_protocol_violation():
+    resources = open_worker()
+    try:
+        _, _, connection, worker, _, _ = resources
+        thread = threading.Thread(target=worker.run)
+        thread.start()
+        connection.sendall(_frame(b'{"meta":{},"data":{"v":NaN}}'))
+        thread.join(timeout=1)
+        assert not thread.is_alive()
+        assert connection.recv(1) == b""
+    finally:
+        close_worker(resources)
+
+
+def test_close_is_idempotent_and_context_manager_closes():
+    resources = open_worker()
+    try:
+        _, _, connection, worker, _, _ = resources
+        with worker as entered:
+            assert entered is worker
+        assert worker.stream.fileno() == -1
+        worker.close()
+        with pytest.raises(ConnectionError):
+            worker.send({"after": "close"})
+        assert connection.recv(1) == b""
+    finally:
+        close_worker(resources)
