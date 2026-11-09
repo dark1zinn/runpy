@@ -169,16 +169,14 @@ async fn lost_minimum_worker_is_replaced_once_or_the_pool_closes() {
     // retrying in a loop.
     fs::write(fixture.tmp.path().join("launches.fail"), "").unwrap();
     unsafe { libc::kill(second as libc::pid_t, libc::SIGKILL) };
-    eventually(
-        async || {
-            matches!(
-                pool.submit(data(json!({})), LONG).await,
-                Err(RunpyError::PoolClosed)
-            )
-        },
-        "pool closing",
-    )
-    .await;
+    eventually(async || fixture.launches() == 3, "replacement attempt").await;
+    // Give the failed attempt time to close the pool, without submitting
+    // work that could itself start a process.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(matches!(
+        pool.submit(data(json!({})), LONG).await,
+        Err(RunpyError::PoolClosed)
+    ));
     assert_eq!(fixture.launches(), 3);
     pool.close().await;
 }

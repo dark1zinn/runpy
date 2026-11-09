@@ -1,195 +1,149 @@
-/// Unit tests for the WatchdogService (watchdog.rs).
-///
-/// Tests the watchdog's ability to inspect workers, generate reports,
-/// detect healthy/dead processes, and clean up dead entries.
-use runpy::{ProcessState, WorkerReport};
-use std::process::{Child, Command};
+//! Watchdog reports: sampled process-group resources and states.
 
-// ── Helpers ────────────────────────────────────────────────────────────
+use runpy::{Manager, ProcessState, WorkerReport};
+use std::fs;
+use std::time::{Duration, Instant};
+use tempfile::TempDir;
 
-/// Spawn a long-lived dummy process (`sleep 300`) that we can monitor.
-fn spawn_sleeper() -> Child {
-    Command::new("sleep")
-        .arg("300")
-        .spawn()
-        .expect("failed to spawn `sleep` process")
-}
-
-// ─── report_worker() on missing ID ────────────────────────────────────
+use crate::manager_test::{scripts_dir, uv_script};
 
 #[tokio::test]
 async fn report_worker_returns_none_for_unknown_id() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let manager = runpy::Manager::builder(tmp.path())
+    let tmp = TempDir::new().unwrap();
+    let manager = Manager::builder(tmp.path())
         .uv_path("true")
         .build()
         .await
         .unwrap();
-    let report = manager.watchdog().report_worker("nonexistent_id").await;
-    assert!(report.is_none());
+    assert!(manager.watchdog().report_worker("missing").await.is_none());
 }
 
-// ─── ProcessState variants ─────────────────────────────────────────────
-
-#[test]
-fn process_state_debug_format() {
-    let healthy = ProcessState::Healthy;
-    let dead = ProcessState::Dead;
-    let frozen = ProcessState::Frozen;
-    // Verify Debug is derived
-    assert_eq!(format!("{:?}", healthy), "Healthy");
-    assert_eq!(format!("{:?}", dead), "Dead");
-    assert_eq!(format!("{:?}", frozen), "Frozen");
-}
-
-#[test]
-fn process_state_clone() {
-    let state = ProcessState::Healthy;
-    let cloned = state.clone();
-    assert!(matches!(cloned, ProcessState::Healthy));
-}
-
-#[test]
-fn process_state_serializes_to_json() {
-    let state = ProcessState::Healthy;
-    let json = serde_json::to_string(&state).unwrap();
-    assert_eq!(json, "\"Healthy\"");
-
-    let dead = ProcessState::Dead;
-    let json = serde_json::to_string(&dead).unwrap();
-    assert_eq!(json, "\"Dead\"");
-}
-
-// ─── WorkerReport ──────────────────────────────────────────────────────
-
-#[test]
-fn worker_report_debug_format() {
-    let report = WorkerReport {
-        worker_name: "test_worker".into(),
-        pid: 12345,
-        state: ProcessState::Healthy,
-        memory_kb: Some(1024),
-        cpu_percent: None,
-    };
-    let debug = format!("{:?}", report);
-    assert!(debug.contains("test_worker"));
-    assert!(debug.contains("12345"));
-}
-
-#[test]
-fn worker_report_clone() {
-    let report = WorkerReport {
-        worker_name: "w1".into(),
-        pid: 100,
-        state: ProcessState::Dead,
-        memory_kb: None,
-        cpu_percent: Some(12.5),
-    };
-    let cloned = report.clone();
-    assert_eq!(cloned.worker_name, "w1");
-    assert_eq!(cloned.pid, 100);
-    assert!(matches!(cloned.state, ProcessState::Dead));
-    assert!(cloned.memory_kb.is_none());
-    assert_eq!(cloned.cpu_percent, Some(12.5));
-}
-
-#[test]
-fn worker_report_serializes_to_json() {
-    let report = WorkerReport {
-        worker_name: "scraper".into(),
-        pid: 999,
-        state: ProcessState::Healthy,
-        memory_kb: Some(2048),
-        cpu_percent: None,
-    };
-    let json = serde_json::to_string(&report).unwrap();
-    assert!(json.contains("\"worker_name\":\"scraper\""));
-    assert!(json.contains("\"pid\":999"));
-    assert!(json.contains("\"memory_kb\":2048"));
-    assert!(json.contains("\"cpu_percent\":null"));
-}
-
-#[test]
-fn worker_report_serializes_with_all_none() {
-    let report = WorkerReport {
-        worker_name: "minimal".into(),
-        pid: 1,
-        state: ProcessState::Frozen,
-        memory_kb: None,
-        cpu_percent: None,
-    };
-    let json = serde_json::to_string(&report).unwrap();
-    assert!(json.contains("\"Frozen\""));
-    assert!(json.contains("\"memory_kb\":null"));
-    assert!(json.contains("\"cpu_percent\":null"));
-}
-
-// ─── Integration-style: watchdog with a real spawned process ───────────
-// These tests use a real `sleep` process to verify /proc-based health checks.
-
-#[cfg(target_os = "linux")]
-mod linux_proc {
-    use super::*;
-
-    #[test]
-    fn proc_status_exists_for_own_process() {
-        let pid = std::process::id();
-        let status_path = format!("/proc/{}/status", pid);
+/// Poll the worker's report until `check` holds.
+async fn report_until(
+    manager: &Manager,
+    worker_id: &str,
+    check: impl Fn(&WorkerReport) -> bool,
+) -> WorkerReport {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let report = manager.watchdog().report_worker(worker_id).await.unwrap();
+        if check(&report) {
+            return report;
+        }
         assert!(
-            std::path::Path::new(&status_path).exists(),
-            "/proc/{}/status should exist for our own process",
-            pid
+            Instant::now() < deadline,
+            "report never matched: {report:?}"
         );
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
 
-    #[test]
-    fn proc_status_contains_vmrss_for_own_process() {
-        let pid = std::process::id();
-        let status = std::fs::read_to_string(format!("/proc/{}/status", pid)).unwrap();
-        assert!(
-            status.contains("VmRSS:"),
-            "Our own /proc/PID/status should contain VmRSS"
-        );
+const MIB: u64 = 1024 * 1024;
+
+/// Python snippet that touches `mib` MiB and then burns CPU.
+fn hog(mib: u64) -> String {
+    format!("python3 -c 'x = bytearray({mib} * 1024 * 1024)\nwhile True: pass'")
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn reports_aggregate_memory_and_cpu_of_the_whole_group() {
+    let tmp = TempDir::new().unwrap();
+    // A Python descendant in the worker's group allocates and burns CPU.
+    let uv = uv_script(
+        &tmp,
+        &format!("{} &\nexec python3 \"$FAKE_WORKER\" \"$@\"", hog(64)),
+    );
+    let scripts = scripts_dir(&tmp, &["hog"]);
+    let manager = Manager::builder(&scripts)
+        .uv_path(&uv)
+        .build()
+        .await
+        .unwrap();
+    let worker = manager.worker("hog").spawn().await.unwrap();
+
+    let report = report_until(&manager, worker.id(), |report| {
+        report.cpu_percent.is_some() && report.memory_bytes.unwrap_or(0) >= 64 * MIB
+    })
+    .await;
+    assert_eq!(report.state, ProcessState::Running);
+    assert!(report.process_count.unwrap() >= 2, "{report:?}");
+    assert!(report.cpu_percent.unwrap() > 30.0, "{report:?}");
+    assert!(report.sampled_at.is_some());
+    worker.terminate().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn stopped_groups_are_reported_until_continued() {
+    let tmp = TempDir::new().unwrap();
+    let uv = uv_script(&tmp, "exec python3 \"$FAKE_WORKER\" \"$@\"");
+    let scripts = scripts_dir(&tmp, &["worker"]);
+    let manager = Manager::builder(&scripts)
+        .uv_path(&uv)
+        .build()
+        .await
+        .unwrap();
+    let worker = manager.worker("worker").spawn().await.unwrap();
+    let report = report_until(&manager, worker.id(), |report| {
+        report.state == ProcessState::Running
+    })
+    .await;
+
+    let group = -(report.pid as libc::pid_t);
+    unsafe { libc::kill(group, libc::SIGSTOP) };
+    report_until(&manager, worker.id(), |report| {
+        report.state == ProcessState::Stopped
+    })
+    .await;
+    unsafe { libc::kill(group, libc::SIGCONT) };
+    report_until(&manager, worker.id(), |report| {
+        report.state == ProcessState::Running
+    })
+    .await;
+    worker.terminate().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn processes_that_leave_the_group_are_excluded() {
+    let tmp = TempDir::new().unwrap();
+    let escaped_pid = tmp.path().join("escaped.pid");
+    // This descendant moves to its own process group before allocating.
+    let escape = format!(
+        "python3 -c 'import os, time; os.setpgid(0, 0); open(\"{}\", \"w\").write(str(os.getpid())); \
+         x = bytearray(256 * 1024 * 1024); time.sleep(300)' &",
+        escaped_pid.display()
+    );
+    let uv = uv_script(
+        &tmp,
+        &format!("{escape}\nexec python3 \"$FAKE_WORKER\" \"$@\""),
+    );
+    let scripts = scripts_dir(&tmp, &["worker"]);
+    let manager = Manager::builder(&scripts)
+        .uv_path(&uv)
+        .build()
+        .await
+        .unwrap();
+    let worker = manager.worker("worker").spawn().await.unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !escaped_pid.exists() {
+        assert!(Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    // Let the escaped process allocate, then wait for two fresh samples.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let report = report_until(&manager, worker.id(), |report| {
+        report.memory_bytes.is_some()
+    })
+    .await;
+    assert!(
+        report.memory_bytes.unwrap() < 200 * MIB,
+        "escaped memory was counted: {report:?}"
+    );
 
-    #[test]
-    fn proc_status_missing_for_nonexistent_pid() {
-        // PID 0 is the kernel scheduler — its /proc entry doesn't have VmRSS
-        // PID 2^31 - 1 is almost certainly not in use
-        let result = std::fs::read_to_string("/proc/2147483647/status");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn sleeper_process_has_proc_entry() {
-        let mut child = spawn_sleeper();
-        let pid = child.id();
-
-        let status_path = format!("/proc/{}/status", pid);
-        assert!(std::path::Path::new(&status_path).exists());
-
-        // Clean up
-        child.kill().ok();
-        child.wait().ok();
-    }
-
-    #[test]
-    fn dead_process_has_no_proc_entry() {
-        let mut child = spawn_sleeper();
-        let pid = child.id();
-
-        // Kill the process
-        child.kill().ok();
-        child.wait().ok();
-
-        // /proc entry should be gone (after wait reaps the zombie)
-        let status_path = format!("/proc/{}/status", pid);
-        // Give the OS a moment
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        assert!(
-            !std::path::Path::new(&status_path).exists(),
-            "/proc/{}/status should not exist after kill+wait",
-            pid
-        );
-    }
+    let pid: libc::pid_t = fs::read_to_string(&escaped_pid).unwrap().parse().unwrap();
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+    worker.terminate().await.unwrap();
 }

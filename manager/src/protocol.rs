@@ -62,6 +62,9 @@ const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 const SESSION_QUEUE_CAPACITY: usize = 64;
 /// How often termination checks whether a worker already exited.
 const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(20);
+/// How often the watchdog samples process-group resources; well above
+/// sysinfo's minimum CPU update interval on every platform.
+const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Abort an owned helper task when its owning scope ends or is cancelled.
 struct AbortOnDrop<T>(JoinHandle<T>);
@@ -1026,22 +1029,39 @@ impl ControlPlane {
 
         // The monitor owns every asynchronous removal: dead processes found
         // by the watchdog and sessions reporting that their connection ended.
+        // It also drives the watchdog's per-second resource sampling.
         let control_plane = Arc::downgrade(self);
         *monitor = Some(tokio::spawn(async move {
+            enum Event {
+                Check,
+                Sample,
+                Ended(Option<(String, ExitReason)>),
+            }
             let mut tick = interval(Duration::from_secs(interval_secs));
+            let mut sample_tick = interval(SAMPLE_INTERVAL);
+            sample_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
-                let ended = tokio::select! {
-                    _ = tick.tick() => None,
-                    ended = ended_rx.recv() => ended,
+                let event = tokio::select! {
+                    _ = tick.tick() => Event::Check,
+                    _ = sample_tick.tick() => Event::Sample,
+                    ended = ended_rx.recv() => Event::Ended(ended),
                 };
                 let Some(control_plane) = control_plane.upgrade() else {
                     break;
                 };
-                match ended {
-                    Some((worker_id, reason)) => {
+                match event {
+                    Event::Ended(Some((worker_id, reason))) => {
                         control_plane.remove_worker(&worker_id, reason).await;
                     }
-                    None => {
+                    Event::Ended(None) => break,
+                    Event::Sample => {
+                        // Sampling may wait on a blocking thread; do not keep
+                        // the control plane alive across it after Manager drop.
+                        let sample = control_plane.watchdog.sample();
+                        drop(control_plane);
+                        sample.await;
+                    }
+                    Event::Check => {
                         for worker_id in control_plane.watchdog.dead_worker_ids().await {
                             control_plane
                                 .remove_worker(&worker_id, ExitReason::Exited)

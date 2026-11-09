@@ -85,7 +85,7 @@ while True:
 ///
 /// `$FAKE_WORKER` names the worker script, so `body` can also start it itself
 /// (for example in the background) and end with its own `exit`.
-fn uv_script(tmp: &TempDir, body: &str) -> PathBuf {
+pub(crate) fn uv_script(tmp: &TempDir, body: &str) -> PathBuf {
     let worker = tmp.path().join("fake_worker.py");
     fs::write(&worker, FAKE_WORKER).unwrap();
     write_executable(

@@ -81,6 +81,11 @@ is now the null device by default instead of the Manager's stdin.
 - `spawn` fails with `Timeout(Startup)` when `ready` does not arrive within
   `startup_timeout`.
 
+- `ProcessState` is now `Running`, `Stopped`, `Exited`, or `Unknown` (the
+  former `Healthy`, `Frozen`, and `Dead` are removed). `WorkerReport` replaces
+  `memory_kb` with `memory_bytes` for the whole process group and adds
+  sampled `cpu_percent`, `process_count`, and `sampled_at`.
+
 ## Python SDK
 
 - Error envelopes carry `{"kind": "<exception type>", "message": "<text>"}`

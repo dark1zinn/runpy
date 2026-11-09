@@ -1,45 +1,151 @@
-use parking_lot::RwLock;
-use serde::Serialize;
-use std::collections::HashMap;
-use std::sync::Arc;
+//! Process monitoring: dead-worker detection and sampled resource reports.
 
+use parking_lot::{Mutex, RwLock};
+use serde::Serialize;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::time::SystemTime;
+use sysinfo::{Pid, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System};
+
+use crate::lifecycle::LifecycleState;
 use crate::protocol::WorkerHandle;
 use crate::scribbler::Scribbler;
 
-/// Health state reported for a registered worker process.
-#[derive(Debug, Clone, Serialize)]
+/// State of a worker's process group.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[non_exhaustive]
 pub enum ProcessState {
-    /// The process is currently observable.
-    Healthy,
-    /// Reserved state for a stopped-but-live process; not currently detected.
-    Frozen,
-    /// The process is no longer observable.
-    Dead,
+    /// At least one live member of the group is not stopped.
+    Running,
+    /// Every observed live member is stopped (for example by `SIGSTOP`).
+    Stopped,
+    /// The worker's `uv` process exited (authoritative, from Runpy's child
+    /// handle rather than PID existence).
+    Exited,
+    /// Not yet sampled, or no member could be observed (permissions or a
+    /// sampling race). Metrics are then `None`, never a fabricated zero.
+    Unknown,
 }
 
-/// One-point-in-time process report for a managed worker.
-#[derive(Debug, Clone, Serialize)]
+/// One-point-in-time report for a managed worker's process group.
+#[derive(Clone, Debug, Serialize)]
 pub struct WorkerReport {
     /// Trusted Manager-generated worker identity.
     pub worker_name: String,
-    /// Process ID of the stored `uv` parent.
+    /// Process ID of the `uv` parent; also the process group ID.
     pub pid: u32,
-    /// Current observable process state.
+    /// Current group state.
     pub state: ProcessState,
-    /// Linux resident set size in KiB, or `None` when unavailable.
-    pub memory_kb: Option<u64>,
-    /// CPU utilization; currently always `None` because sampling is not implemented.
+    /// Sum of resident memory of all live group members, in bytes. Pages
+    /// shared between members are counted once per member.
+    pub memory_bytes: Option<u64>,
+    /// Sum of group members' CPU usage over the last sampling interval, in
+    /// percent of one core (so it can exceed 100). `None` until two samples
+    /// of the same members exist.
     pub cpu_percent: Option<f32>,
+    /// Live processes found in the group, including `uv` and Python.
+    pub process_count: Option<usize>,
+    /// When the metrics were sampled.
+    pub sampled_at: Option<SystemTime>,
+}
+
+/// Aggregated metrics for one process group.
+#[derive(Clone, Debug)]
+struct GroupSample {
+    memory_bytes: u64,
+    cpu_percent: Option<f32>,
+    process_count: usize,
+    stopped: bool,
+    sampled_at: SystemTime,
+}
+
+/// Sampling state; one instance, used only on a blocking thread.
+struct Sampler {
+    system: System,
+    /// PIDs per group seen in the previous sample, to know when a CPU delta
+    /// covers every member.
+    previous: HashMap<u32, HashSet<Pid>>,
+}
+
+impl Sampler {
+    fn new() -> Self {
+        Self {
+            system: System::new(),
+            previous: HashMap::new(),
+        }
+    }
+
+    /// Refresh every process and aggregate the members of `groups`.
+    ///
+    /// Membership comes from `getpgid`, not sysinfo's user group. Zombies and
+    /// threads are skipped; a process that vanished mid-sample is skipped.
+    fn sample(&mut self, groups: &HashSet<u32>) -> HashMap<u32, GroupSample> {
+        self.system.refresh_processes_specifics(
+            ProcessesToUpdate::All,
+            true,
+            ProcessRefreshKind::nothing().with_cpu().with_memory(),
+        );
+        let sampled_at = SystemTime::now();
+        let mut members: HashMap<u32, HashSet<Pid>> = HashMap::new();
+        let mut samples: HashMap<u32, GroupSample> = HashMap::new();
+        for (pid, process) in self.system.processes() {
+            if process.thread_kind().is_some()
+                || matches!(
+                    process.status(),
+                    ProcessStatus::Zombie | ProcessStatus::Dead
+                )
+            {
+                continue;
+            }
+            // SAFETY: getpgid only reads the kernel's process table.
+            let group = unsafe { libc::getpgid(pid.as_u32() as libc::pid_t) };
+            let Ok(group) = u32::try_from(group) else {
+                continue;
+            };
+            if !groups.contains(&group) {
+                continue;
+            }
+            members.entry(group).or_default().insert(*pid);
+            let sample = samples.entry(group).or_insert(GroupSample {
+                memory_bytes: 0,
+                cpu_percent: Some(0.0),
+                process_count: 0,
+                stopped: true,
+                sampled_at,
+            });
+            sample.memory_bytes += process.memory();
+            if let Some(cpu) = sample.cpu_percent.as_mut() {
+                *cpu += process.cpu_usage();
+            }
+            sample.process_count += 1;
+            sample.stopped &= process.status() == ProcessStatus::Stop;
+        }
+        for (group, sample) in &mut samples {
+            let complete = self
+                .previous
+                .get(group)
+                .is_some_and(|previous| members[group].is_subset(previous));
+            if !complete {
+                sample.cpu_percent = None;
+            }
+        }
+        self.previous = members;
+        samples
+    }
 }
 
 /// Shared process monitor owned by a [`crate::Manager`].
 ///
-/// The background monitor checks child exit state every five seconds and asks
-/// the control plane to clean up dead workers. Public methods provide on-demand
-/// snapshots; they do not implement application retry or alert policy.
+/// The control plane's monitor asks it every five seconds for workers whose
+/// `uv` process exited, and every second samples each worker's process group
+/// on a blocking thread. Reports read the latest sample; they do not
+/// implement application retry or alert policy.
 pub struct WatchdogService {
     workers: Arc<RwLock<HashMap<String, WorkerHandle>>>,
     logger: Arc<Scribbler>,
+    sampler: Arc<Mutex<Sampler>>,
+    /// Latest sample per process group.
+    samples: Arc<RwLock<HashMap<u32, GroupSample>>>,
 }
 
 impl WatchdogService {
@@ -47,7 +153,12 @@ impl WatchdogService {
         workers: Arc<RwLock<HashMap<String, WorkerHandle>>>,
         logger: Arc<Scribbler>,
     ) -> Self {
-        Self { workers, logger }
+        Self {
+            workers,
+            logger,
+            sampler: Arc::new(Mutex::new(Sampler::new())),
+            samples: Arc::new(RwLock::new(HashMap::new())),
+        }
     }
 
     pub(crate) async fn dead_worker_ids(&self) -> Vec<String> {
@@ -82,98 +193,95 @@ impl WatchdogService {
         dead_ids
     }
 
-    /// Generate a snapshot for every currently registered worker.
+    /// Sample every registered worker's process group once.
     ///
-    /// Linux reports resident memory from `/proc/<pid>/status`; other
-    /// platforms return `None`. `cpu_percent` is currently always `None`.
+    /// The returned future owns what it needs, so callers can release the
+    /// control plane while it waits. Sampling runs on Tokio's blocking pool;
+    /// the single sampler is locked for the duration, so overlapping calls
+    /// queue instead of sampling twice.
+    pub(crate) fn sample(&self) -> impl Future<Output = ()> + Send + 'static {
+        let groups: HashSet<u32> = self
+            .workers
+            .read()
+            .values()
+            .map(|handle| handle.process_group_id)
+            .collect();
+        let sampler = self.sampler.clone();
+        let samples = self.samples.clone();
+        async move {
+            if groups.is_empty() {
+                samples.write().clear();
+                return;
+            }
+            if let Ok(sampled) =
+                tokio::task::spawn_blocking(move || sampler.lock().sample(&groups)).await
+            {
+                *samples.write() = sampled;
+            }
+        }
+    }
+
+    /// Generate a report for every currently registered worker.
+    ///
+    /// Metrics come from the latest per-second sample, so a worker spawned
+    /// moments ago reports `Unknown` until it is first sampled.
     ///
     /// ```no_run
     /// # async fn demo(manager: &runpy::Manager) {
     /// for report in manager.watchdog().report().await {
-    ///     println!("{}: {:?}", report.worker_name, report.state);
+    ///     println!(
+    ///         "{}: {:?}, {:?} bytes, {:?}% CPU",
+    ///         report.worker_name, report.state, report.memory_bytes, report.cpu_percent
+    ///     );
     /// }
     /// # }
     /// ```
     pub async fn report(&self) -> Vec<WorkerReport> {
         let workers = self.workers.read();
-        let mut reports = Vec::new();
-
-        for handle in workers.values() {
-            let pid = handle.child.id();
-            let state = match Self::read_proc_status(pid) {
-                Some(_) => ProcessState::Healthy,
-                None => ProcessState::Dead,
-            };
-
-            reports.push(WorkerReport {
-                worker_name: handle.identity.name.clone(),
-                pid,
-                state,
-                memory_kb: Self::read_proc_mem(pid),
-                cpu_percent: None, // Requires sampling delta over time — future work
-            });
-        }
-
-        reports
+        let samples = self.samples.read();
+        workers
+            .values()
+            .map(|handle| Self::build_report(handle, &samples))
+            .collect()
     }
 
-    /// Generate a snapshot for one trusted worker ID.
-    ///
-    /// Returns `None` when the worker is not registered.
+    /// Generate a report for one trusted worker ID, or `None` when the worker
+    /// is not registered.
     ///
     /// ```no_run
     /// # async fn demo(manager: &runpy::Manager) {
     /// if let Some(report) = manager.watchdog().report_worker("worker-id").await {
-    ///     println!("pid {}", report.pid);
+    ///     println!("pid {} uses {:?} bytes", report.pid, report.memory_bytes);
     /// }
     /// # }
     /// ```
     pub async fn report_worker(&self, worker_id: &str) -> Option<WorkerReport> {
         let workers = self.workers.read();
         let handle = workers.get(worker_id)?;
-        let pid = handle.child.id();
-        let state = match Self::read_proc_status(pid) {
-            Some(_) => ProcessState::Healthy,
-            None => ProcessState::Dead,
+        Some(Self::build_report(handle, &self.samples.read()))
+    }
+
+    fn build_report(handle: &WorkerHandle, samples: &HashMap<u32, GroupSample>) -> WorkerReport {
+        let exited = matches!(*handle.lifecycle.borrow(), LifecycleState::Exited(_));
+        let sample = if exited {
+            None
+        } else {
+            samples.get(&handle.process_group_id)
         };
-
-        Some(WorkerReport {
+        let state = match sample {
+            _ if exited => ProcessState::Exited,
+            Some(sample) if sample.stopped => ProcessState::Stopped,
+            Some(_) => ProcessState::Running,
+            None => ProcessState::Unknown,
+        };
+        WorkerReport {
             worker_name: handle.identity.name.clone(),
-            pid,
+            pid: handle.child.id(),
             state,
-            memory_kb: Self::read_proc_mem(pid),
-            cpu_percent: None,
-        })
-    }
-
-    // ── Platform-specific helpers ──────────────────────────────────────
-
-    #[cfg(target_os = "linux")]
-    fn read_proc_status(pid: u32) -> Option<String> {
-        std::fs::read_to_string(format!("/proc/{}/status", pid)).ok()
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    fn read_proc_status(pid: u32) -> Option<String> {
-        // Fallback: check if process exists via kill(pid, 0)
-        let ret = unsafe { libc::kill(pid as i32, 0) };
-        if ret == 0 { Some(String::new()) } else { None }
-    }
-
-    #[cfg(target_os = "linux")]
-    fn read_proc_mem(pid: u32) -> Option<u64> {
-        let status = std::fs::read_to_string(format!("/proc/{}/status", pid)).ok()?;
-        for line in status.lines() {
-            if line.starts_with("VmRSS:") {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                return parts.get(1)?.parse().ok();
-            }
+            memory_bytes: sample.map(|sample| sample.memory_bytes),
+            cpu_percent: sample.and_then(|sample| sample.cpu_percent),
+            process_count: sample.map(|sample| sample.process_count),
+            sampled_at: sample.map(|sample| sample.sampled_at),
         }
-        None
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    fn read_proc_mem(_pid: u32) -> Option<u64> {
-        None
     }
 }

@@ -675,15 +675,26 @@ disables logging. Component-tagged and untagged methods share the same filter.
 ### Watchdog reports
 
 The shared watchdog checks child exit state every five seconds and removes dead
-worker process groups. `report()` snapshots all registered workers;
-`report_worker(id)` returns one report or `None` when the ID is absent.
+worker process groups. Every second it also samples the resources of each
+registered worker's process group on a blocking thread. `report()` returns the
+latest snapshot for all registered workers; `report_worker(id)` returns one
+report or `None` when the ID is absent.
 
-A `WorkerReport` contains the trusted worker name, `uv` parent PID, state,
-resident memory, and CPU percentage. Current reports produce `Healthy` when the
-process is observable and `Dead` otherwise; `Frozen` is defined but not
-currently detected. Linux reads resident memory from `/proc/<pid>/status` in
-KiB. Other platforms report `memory_kb = None`. `cpu_percent` is currently
-always `None` because CPU sampling is not implemented.
+| Field | Meaning |
+| --- | --- |
+| `worker_name`, `pid` | Trusted worker ID and the `uv` parent PID, which is also the process group ID. |
+| `state` | `Running`, `Stopped` (every live member stopped, for example by `SIGSTOP`), `Exited` (from Runpy's own child handle, not PID existence), or `Unknown` (not yet sampled, or no member observable). |
+| `memory_bytes` | Sum of resident memory of all live group members, in bytes. Shared pages are counted once per member, so the sum can exceed real usage. |
+| `cpu_percent` | Sum of members' CPU over the last interval, in percent of one core (can exceed 100). `None` until the same members were sampled twice. |
+| `process_count` | Live members found: `uv`, Python, and their descendants. |
+| `sampled_at` | When the metrics were taken; reports are at most about a second old. |
+
+Membership is the worker's process group (`getpgid`), so a descendant that
+moves to its own group or session is not counted, and processes in other
+groups are never included. Zombies and threads are skipped. Metrics that
+cannot be read (sampling races, permissions) are reported as `None`, never as
+zero. Sampling refreshes the process table once per second, which costs a few
+milliseconds with typical process counts; it runs only while workers exist.
 
 The watchdog reports process state; application-level retry, alerting, and
 termination policy remains the caller's responsibility.
