@@ -2246,6 +2246,130 @@ mod tests {
         }));
     }
 
+    fn json_values() -> impl proptest::strategy::Strategy<Value = Value> {
+        use proptest::prelude::*;
+        let leaf = prop_oneof![
+            Just(Value::Null),
+            any::<bool>().prop_map(Value::Bool),
+            any::<i64>().prop_map(Value::from),
+            any::<u64>().prop_map(Value::from),
+            any::<f64>()
+                .prop_filter("finite", |value| value.is_finite())
+                .prop_map(Value::from),
+            any::<String>().prop_map(Value::String),
+        ];
+        leaf.prop_recursive(6, 48, 4, |inner| {
+            prop_oneof![
+                proptest::collection::vec(inner.clone(), 0..4).prop_map(Value::Array),
+                proptest::collection::btree_map(any::<String>(), inner, 0..4)
+                    .prop_map(|fields| Value::Object(fields.into_iter().collect())),
+            ]
+        })
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config {
+            cases: 128,
+            failure_persistence: None,
+            ..proptest::test_runner::Config::default()
+        })]
+
+        /// Any strict-profile envelope survives encoding, arbitrary write
+        /// segmentation, framing, and strict decoding unchanged.
+        #[test]
+        fn frames_round_trip_under_arbitrary_segmentation(
+            data in proptest::collection::btree_map(proptest::prelude::any::<String>(), json_values(), 0..5),
+            cuts in proptest::collection::vec(1_usize..17, 1..40),
+        ) {
+            let envelope = Envelope::new(Meta::new(), data.into_iter().collect()).unwrap();
+            let frame = encode_frame(&envelope, 1 << 20).unwrap();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let payload = runtime.block_on(async {
+                let (mut writer, mut reader) = tokio::io::duplex(64);
+                let sender = tokio::spawn(async move {
+                    let mut rest = frame.as_slice();
+                    for cut in cuts.iter().cycle() {
+                        if rest.is_empty() {
+                            break;
+                        }
+                        let (chunk, tail) = rest.split_at((*cut).min(rest.len()));
+                        writer.write_all(chunk).await.unwrap();
+                        tokio::task::yield_now().await;
+                        rest = tail;
+                    }
+                });
+                let payload = read_frame(&mut reader, &ProtocolLimits::default())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                sender.await.unwrap();
+                payload
+            });
+            let decoded: Envelope =
+                serde_json::from_value(crate::strict_json::parse_strict(&payload).unwrap()).unwrap();
+            proptest::prop_assert_eq!(decoded.data(), envelope.data());
+        }
+    }
+
+    fn hex(text: &str) -> Vec<u8> {
+        (0..text.len())
+            .step_by(2)
+            .map(|index| u8::from_str_radix(&text[index..index + 2], 16).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn frame_reader_accepts_exactly_the_shared_frames() {
+        let vectors: Value =
+            serde_json::from_str(include_str!("../../tests/protocol_vectors.json")).unwrap();
+        for frame in vectors["frames"].as_array().unwrap() {
+            let bytes = hex(frame["frame_hex"].as_str().unwrap());
+            let accepted = matches!(
+                read_frame(&mut bytes.as_slice(), &ProtocolLimits::default()).await,
+                Ok(Some(_))
+            );
+            assert_eq!(accepted, frame["valid"], "frame {}", frame["name"]);
+        }
+    }
+
+    /// Body for a "depth" vector: an envelope nested `depth` levels deep.
+    fn deep_body(depth: usize) -> String {
+        format!(
+            r#"{{"meta":{{}},"data":{{"v":{}{}}}}}"#,
+            "[".repeat(depth - 2),
+            "]".repeat(depth - 2)
+        )
+    }
+
+    #[test]
+    fn manager_accepts_exactly_the_shared_worker_vectors() {
+        let vectors: Value =
+            serde_json::from_str(include_str!("../../tests/protocol_vectors.json")).unwrap();
+        let mut checked = 0;
+        for vector in vectors["vectors"].as_array().unwrap() {
+            if vector["direction"] != "worker_to_manager" {
+                continue;
+            }
+            let body: Vec<u8> = if let Some(depth) = vector["depth"].as_u64() {
+                deep_body(depth as usize).into_bytes()
+            } else if let Some(text) = vector["body_hex"].as_str() {
+                hex(text)
+            } else {
+                vector["body"].as_str().unwrap().as_bytes().to_vec()
+            };
+            let accepted = crate::strict_json::parse_strict(&body)
+                .ok()
+                .and_then(|value| serde_json::from_value::<Envelope>(value).ok())
+                .is_some_and(|envelope| envelope.validate_worker_to_manager().is_ok());
+            assert_eq!(accepted, vector["valid"], "vector {}", vector["name"]);
+            checked += 1;
+        }
+        assert!(checked > 10);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn ambiguous_or_too_deep_inbound_json_is_a_violation() {
         let mut too_deep = String::from(r#"{"meta": {}, "data": {"a": "#);

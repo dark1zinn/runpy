@@ -6,5 +6,7 @@ mod manager_test;
 mod pool_test;
 #[path = "unit/protocol_test.rs"]
 mod protocol_test;
+#[path = "unit/resources_test.rs"]
+mod resources_test;
 #[path = "unit/watchdog_test.rs"]
 mod watchdog_test;

@@ -787,6 +787,18 @@ uv run --frozen --python 3.10 ruff check worker/src/runpyrs worker/tests example
 uv run --frozen --python 3.10 --package runpyrs --extra dev pytest worker/tests
 ```
 
+`tests/protocol_vectors.json` holds wire vectors that both languages must
+agree on: frame bodies (Unicode, reserved fields, direction, malformed JSON,
+non-finite numbers, depth, duplicate keys) and complete byte streams
+(malformed lengths, truncation). Each side checks the direction it receives.
+Property tests (proptest in Rust, Hypothesis in Python, both with
+deterministic seeds) generate bounded envelopes and arbitrary write
+segmentation and require exact round trips. Resource tests re-run the test
+binary in a child process, cycle 100 worker starts, requests, deaths, and
+stops plus saturated pools, and require sockets, workers, slots, child
+processes, and file descriptors to return to their baseline. These suites
+reduce risk; they do not prove the protocol robust.
+
 Exercise the complete system with:
 
 ```bash
