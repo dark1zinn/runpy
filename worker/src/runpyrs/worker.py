@@ -6,7 +6,13 @@ import threading
 from types import TracebackType
 from typing import Dict, Optional, Type
 
-from ._protocol import FrameLimits, decode_body, encode_frame, recv_frame
+from ._protocol import (
+    PROTOCOL_VERSION,
+    FrameLimits,
+    decode_body,
+    encode_frame,
+    recv_frame,
+)
 from .utils import (
     Data,
     Envelope,
@@ -56,7 +62,11 @@ class Worker:
         name: str,
         extra: Optional[Dict[str, str]] = None,
     ):
-        """Connect to the Manager and send the initial ``ready`` envelope.
+        """Connect to the Manager.
+
+        The ``ready`` envelope is sent by :meth:`run`, after the subclass has
+        finished constructing, so the Manager never sends work to a worker
+        that is still initializing.
 
         Args:
             sock: Manager-created Unix socket path.
@@ -67,8 +77,8 @@ class Worker:
             ValueError: If ``name`` is empty or a Manager-supplied frame limit
                 in ``RUNPY_MAX_FRAME_BYTES``/``RUNPY_FRAME_TIMEOUT_MS`` is not
                 a positive integer.
-            OSError: If socket creation, connection, or the initial send
-                fails. The socket is closed before the error propagates.
+            OSError: If socket creation or connection fails. The socket is
+                closed before the error propagates.
         """
         if not name:
             raise ValueError("Worker ID is required")
@@ -85,7 +95,6 @@ class Worker:
         try:
             self.stream.connect(self.__sock_path)
             self.__ok = True
-            self._send_operation("ready", {})
         except BaseException:
             self.close()
             raise
@@ -349,12 +358,15 @@ class Worker:
             self._send_exception(error)
 
     def run(self) -> None:
-        """Receive and dispatch envelopes until termination or failure.
+        """Announce readiness, then receive and dispatch envelopes until
+        termination or failure.
 
-        Returns normally after ``terminate``, after the Manager closes the
-        connection, or after :meth:`close` from another thread. A malformed
-        frame, invalid envelope, stalled frame, or socket failure raises the
-        underlying exception. The connection is always closed first.
+        The first frame sent is ``ready`` with this SDK's protocol version and
+        capabilities. Returns normally after ``terminate``, after the Manager
+        closes the connection, or after :meth:`close` from another thread. A
+        malformed frame, invalid envelope, stalled frame, or socket failure
+        raises the underlying exception. The connection is always closed
+        first.
 
         Raises:
             ValueError: For protocol violations such as invalid JSON, an
@@ -364,6 +376,10 @@ class Worker:
         """
 
         try:
+            self._send_operation(
+                "ready",
+                {"protocol_version": PROTOCOL_VERSION, "capabilities": []},
+            )
             while self.__ok:
                 try:
                     envelope = self._recv_envelope()

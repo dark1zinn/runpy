@@ -93,12 +93,6 @@ async fn main() -> Result<(), runpy::RunpyError> {
             .and_then(Value::as_str);
 
         match operation {
-            Some("ready") => {
-                let execute = Envelope::execute(object(json!({"task": "example"})));
-                if let Err(error) = inbound.reply(execute) {
-                    eprintln!("execute not sent: {error}");
-                }
-            }
             Some("done") => {
                 println!(
                     "result: {}",
@@ -117,13 +111,18 @@ async fn main() -> Result<(), runpy::RunpyError> {
         }
     });
 
+    // `spawn` returns once the worker reported `ready`.
     let worker = manager.worker("my_worker").spawn().await?;
     println!("spawned {}", worker.id());
+    worker
+        .send_message(Envelope::execute(object(json!({"task": "example"}))))
+        .await?;
     tokio::time::timeout(Duration::from_secs(30), finished_rx.recv())
         .await
         .expect("worker response timed out")
         .expect("worker response channel closed");
-    worker.terminate().await?;
+    let exit = worker.terminate().await?;
+    println!("worker stopped: {:?}", exit.reason);
     Ok(())
 }
 ```
@@ -134,9 +133,10 @@ Runpy starts:
 uv run --no-project [--locked] --script <worker.py> <socket-path> <worker-id>
 ```
 
-The worker sends `ready`, Rust replies with `execute`, and the Python return
-value arrives as `done`. Runpy owns trusted worker/socket metadata and cleans up
-the process group and socket when the worker terminates or the Manager drops.
+The worker sends a versioned `ready`, `spawn` returns, Rust sends `execute`,
+and the Python return value arrives as `done`. Runpy owns trusted worker/socket
+metadata and cleans up the process group and socket when the worker terminates
+or the Manager drops.
 
 ## Observe worker output
 

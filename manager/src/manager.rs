@@ -7,8 +7,9 @@ use std::process::Stdio;
 use std::sync::{Arc, Weak};
 use tokio::net::UnixListener;
 
-use crate::error::{InvalidScriptReason, RunpyError};
+use crate::error::{InvalidScriptReason, RunpyError, TimeoutStage};
 use crate::integrity::IntegrityChecker;
+use crate::lifecycle::{ExitReason, LifecycleReceiver, LifecycleState, WorkerExit, wait_for_exit};
 use crate::protocol::{ControlPlane, Envelope, InboundEnvelope, MessageHandler, SendReceipt};
 
 // ── Worker Identity ────────────────────────────────────────────────────
@@ -297,7 +298,7 @@ impl WorkerBuilder {
             ))
         })?;
 
-        control_plane
+        let lifecycle = control_plane
             .register_worker(
                 child,
                 identity,
@@ -307,13 +308,74 @@ impl WorkerBuilder {
                 self.worker_handler,
             )
             .await?;
+
+        // Until `ready` arrives, abandoning this future must not leave a
+        // registered process nobody can reach: the guard hands it to the
+        // monitor for removal.
+        let mut guard = StartupGuard {
+            control_plane: &control_plane,
+            worker_id: &worker_id,
+            armed: true,
+        };
+        // Wait for `ready`, but notice at once if the process exits first
+        // instead of waiting for the next watchdog tick.
+        let deadline = tokio::time::Instant::now() + integrity.startup_timeout;
+        let mut observer = lifecycle.clone();
+        let ready = tokio::select! {
+            state = observer.wait_for(|state| !matches!(state, LifecycleState::Starting)) => {
+                state.map(|state| state.clone()).ok()
+            }
+            () = control_plane.wait_for_exit(&worker_id, deadline) => None,
+        };
+        guard.armed = false;
+        drop(guard);
+        match ready {
+            Some(LifecycleState::Ready { .. }) => {}
+            Some(_) => {
+                return Err(RunpyError::WorkerExited {
+                    worker_id: worker_id.clone(),
+                });
+            }
+            None if tokio::time::Instant::now() < deadline => {
+                control_plane
+                    .remove_worker(&worker_id, ExitReason::Exited)
+                    .await;
+                return Err(RunpyError::WorkerExited {
+                    worker_id: worker_id.clone(),
+                });
+            }
+            None => {
+                control_plane
+                    .remove_worker(&worker_id, ExitReason::StartupTimeout)
+                    .await;
+                return Err(RunpyError::Timeout(TimeoutStage::Startup));
+            }
+        }
+
         control_plane
             .logger()
             .success(&format!("Spawned worker: {worker_id}"));
         Ok(Worker {
             id: worker_id,
             control_plane: self.control_plane,
+            lifecycle,
         })
+    }
+}
+
+/// Hands a worker to the monitor for removal if `spawn` is cancelled while
+/// waiting for `ready`.
+struct StartupGuard<'a> {
+    control_plane: &'a ControlPlane,
+    worker_id: &'a str,
+    armed: bool,
+}
+
+impl Drop for StartupGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.control_plane.abandon(self.worker_id);
+        }
     }
 }
 
@@ -321,20 +383,30 @@ impl WorkerBuilder {
 
 /// Handle to one running worker process.
 ///
-/// Returned by [`WorkerBuilder::spawn`]. Cloning is cheap; every clone
-/// addresses the same process. The Manager owns the process: after the
-/// Manager is dropped, operations return [`RunpyError::ManagerClosed`], and
-/// after the worker is removed they return [`RunpyError::WorkerExited`].
+/// Returned by [`WorkerBuilder::spawn`] once the worker reported `ready`.
+/// Cloning is cheap; every clone addresses the same process. The Manager
+/// owns the process: after the Manager is dropped, operations return
+/// [`RunpyError::ManagerClosed`], and after the worker is removed they return
+/// [`RunpyError::WorkerExited`]. [`Worker::wait`] keeps working after both.
 #[derive(Clone, Debug)]
 pub struct Worker {
     id: String,
     control_plane: Weak<ControlPlane>,
+    lifecycle: LifecycleReceiver,
 }
 
 impl Worker {
     /// Trusted Manager-generated worker identity.
     pub fn id(&self) -> &str {
         &self.id
+    }
+
+    /// Capabilities the worker advertised in `ready`; empty once it exits.
+    pub fn capabilities(&self) -> Vec<String> {
+        match &*self.lifecycle.borrow() {
+            LifecycleState::Ready { capabilities } => capabilities.to_vec(),
+            _ => Vec::new(),
+        }
     }
 
     /// Send an envelope and wait until it is completely written.
@@ -370,14 +442,28 @@ impl Worker {
         self.control_plane()?.try_send(&self.id, envelope)
     }
 
-    /// Request graceful termination, then force process-group cleanup.
+    /// Wait until the worker stops and return its retained exit.
+    ///
+    /// Any number of handles may wait; one that starts after the worker
+    /// already stopped returns at once. This keeps working after the Manager
+    /// is dropped.
+    pub async fn wait(&self) -> Result<WorkerExit, RunpyError> {
+        wait_for_exit(self.lifecycle.clone(), &self.id).await
+    }
+
+    /// Request graceful termination, force process-group cleanup, and return
+    /// the worker's exit.
     ///
     /// New sends to this worker are refused at once. The worker is removed
     /// when its process exits, and at the latest when the Manager's shutdown
-    /// grace ends, even if `terminate` could not be written. Cleanup always
-    /// runs; the result reports whether `terminate` was written.
-    pub async fn terminate(&self) -> Result<(), RunpyError> {
-        self.control_plane()?.terminate_worker(&self.id).await
+    /// grace ends, even if `terminate` could not be written. A worker that
+    /// already stopped returns its retained exit.
+    pub async fn terminate(&self) -> Result<WorkerExit, RunpyError> {
+        let control_plane = self.control_plane()?;
+        // Whether `terminate` was written does not change the outcome: the
+        // group is stopped by the grace deadline either way.
+        let _ = control_plane.terminate_worker(&self.id).await;
+        self.wait().await
     }
 
     fn control_plane(&self) -> Result<Arc<ControlPlane>, RunpyError> {

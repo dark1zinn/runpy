@@ -45,23 +45,6 @@ async fn main() {
             let operation = inbound.envelope.meta().get("x_op").and_then(Value::as_str);
 
             match operation {
-                Some("ready") => {
-                    worker_logger.info_with("Worker", "ready");
-                    let execute = Envelope::execute(object(json!({"name": "RunPy"})));
-                    if let Err(error) = inbound.reply(execute) {
-                        worker_logger.error_with("Worker", &format!("execute not sent: {error}"));
-                    }
-
-                    let mut meta = Meta::new();
-                    meta.insert("some_custom_meta".into(), json!(42));
-                    let custom =
-                        Envelope::new(meta, object(json!({"event": "custom manager message"})))
-                            .expect("custom metadata must not use x_ keys");
-                    if let Err(error) = inbound.reply(custom) {
-                        worker_logger
-                            .error_with("Worker", &format!("custom message not sent: {error}"));
-                    }
-                }
                 Some("log") => {
                     let level = inbound
                         .envelope
@@ -95,7 +78,7 @@ async fn main() {
 
     let worker = match builder.spawn().await {
         Ok(worker) => {
-            logger.success(&format!("Worker spawned: {}", worker.id()));
+            logger.success(&format!("Worker spawned and ready: {}", worker.id()));
             worker
         }
         Err(error) => {
@@ -103,6 +86,20 @@ async fn main() {
             return;
         }
     };
+
+    // `spawn` returns once the worker reported `ready`, so work can be sent
+    // immediately.
+    let execute = Envelope::execute(object(json!({"name": "RunPy"})));
+    if let Err(error) = worker.send_message(execute).await {
+        logger.error_with("Worker", &format!("execute not sent: {error}"));
+    }
+    let mut meta = Meta::new();
+    meta.insert("some_custom_meta".into(), json!(42));
+    let custom = Envelope::new(meta, object(json!({"event": "custom manager message"})))
+        .expect("custom metadata must not use x_ keys");
+    if let Err(error) = worker.send_message(custom).await {
+        logger.error_with("Worker", &format!("custom message not sent: {error}"));
+    }
 
     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
 
@@ -117,8 +114,9 @@ async fn main() {
     }
 
     logger.info("Shutting down...");
-    if let Err(error) = worker.terminate().await {
-        logger.warning(&format!("terminate was not delivered: {error}"));
+    match worker.terminate().await {
+        Ok(exit) => logger.info(&format!("Worker stopped: {:?}", exit.reason)),
+        Err(error) => logger.warning(&format!("terminate failed: {error}")),
     }
     manager.terminate_all().await;
 }

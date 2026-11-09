@@ -184,9 +184,22 @@ process creation kill and reap the process group and remove the socket.
 ### 4. Connect and announce readiness
 
 `uv` executes the script. Its `RunScript(MyWorker)` receives the socket path and
-worker ID as the first two positional arguments, creates the subclass, connects
-the Unix socket, and sends a `ready` envelope. Remaining `--key=value`
-arguments become `Worker.extra`.
+worker ID as the first two positional arguments, creates the subclass, and
+connects the Unix socket. `Worker.run()` then sends a `ready` envelope with
+`{"protocol_version": 1, "capabilities": [...]}` before receiving anything, so
+work never reaches a worker that is still constructing. Remaining
+`--key=value` arguments become `Worker.extra`.
+
+The Manager requires `ready` to be the first envelope and to carry protocol
+version 1; an older or newer SDK, a missing version, a repeated `ready`, or any
+other envelope first is a protocol violation. Rust and Python must therefore
+be upgraded together. `ready` is lifecycle state, not a message: it is not
+passed to `on_message` handlers. `WorkerBuilder::spawn` returns only after
+`ready` arrives, so work can be sent immediately; `Worker::capabilities()`
+lists what the worker advertised. If the process exits first, `spawn` fails
+with `WorkerExited` at once; if `ready` does not arrive within the startup
+timeout, the process group is stopped and `spawn` fails with
+`Timeout(Startup)`. Cancelling `spawn` while it waits stops the process too.
 
 Each worker gets exactly one socket connection. When that connection closes,
 fails, or violates the protocol, the session ends and the Manager removes the
@@ -250,17 +263,24 @@ can reply with `Worker.send` or emit a structured `Worker.log` envelope.
 new sends to that worker, then tries to deliver `terminate` within the grace.
 The worker is removed as soon as its process exits, and at the latest when the
 grace ends, even if `terminate` is stuck behind a saturated queue or could not
-be written. The returned result only reports whether `terminate` was written.
-`Manager::terminate_all` does the same for every worker under one shared
-deadline, delivering the requests concurrently so one stuck worker cannot delay
-the others. `Manager::broadcast` likewise sends to all workers concurrently.
+be written. It returns the worker's `WorkerExit`. `Manager::terminate_all`
+does the same for every worker under one shared deadline, delivering the
+requests concurrently so one stuck worker cannot delay the others, and returns
+each exit keyed by worker ID. `Manager::broadcast` likewise sends to all
+workers concurrently.
 
 Watchdog cleanup and session end use the same removal path. Removal happens
 once: concurrent watchdog, session, termination, and shutdown attempts are
-idempotent, and the first records the reason (`process exited`,
-`disconnected`, `protocol violation`, `terminated`, or `manager shutdown`) in
-the removal log. A worker whose termination was requested is recorded as
-terminated even if it exits or disconnects first.
+idempotent, and the first records the reason (`Exited`, `Terminated`,
+`Disconnected`, `ProtocolViolation`, `StartupTimeout`, or `ManagerShutdown`).
+A worker whose termination was requested is recorded as terminated even if it
+exits or disconnects first.
+
+The outcome is retained as a `WorkerExit` with the worker ID, the reason, and
+the `uv` process's exit code or terminating signal. `Worker::wait()` returns
+it to any number of waiters, including ones that start after the worker
+stopped and after the Manager was dropped (Manager drop records
+`ManagerShutdown`).
 
 Removal aborts the protocol task, kills and reaps the process group on a
 blocking thread outside the async runtime workers, removes the socket, then
@@ -344,7 +364,7 @@ are protocol errors.
 
 | Operation | Direction | Behavior |
 | --- | --- | --- |
-| `ready` | Python → Rust | Announces that the worker connected. |
+| `ready` | Python → Rust | First envelope: `protocol_version` and `capabilities`. Consumed by Runpy, not dispatched. |
 | `execute` | Rust → Python | Calls `Worker.execute(data)`. |
 | `retry` | Rust → Python | Repeats the last execute payload. |
 | `terminate` | Rust → Python | Stops the Python receive loop and closes its socket. |
@@ -449,7 +469,8 @@ non-finite number or oversized body raises `ValueError` and leaves the
 connection usable; an `execute` result that cannot be encoded becomes an
 `error` envelope. A failed socket write may leave a partial frame on the wire,
 so it closes the connection and later sends raise `ConnectionError`. The
-constructor closes its socket if connecting or sending `ready` fails. `close()`
+constructor closes its socket if connecting fails, and `run()` closes it if
+sending `ready` fails. `close()`
 is idempotent, and `Worker` is a context manager.
 
 ### Structured log fallback

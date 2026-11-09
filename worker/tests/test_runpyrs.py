@@ -56,8 +56,7 @@ def open_worker(worker_type: type[Worker] = EchoWorker):
     worker = worker_type(socket_path, "worker-123")
     connection, _ = listener.accept()
     connection.settimeout(1)
-    ready = read_envelope(connection)
-    return temp, listener, connection, worker, ready, socket_path
+    return temp, listener, connection, worker, None, socket_path
 
 
 def close_worker(resources) -> None:
@@ -70,8 +69,12 @@ def close_worker(resources) -> None:
         temp.cleanup()
 
 
-def run_in_thread(worker: Worker):
-    """Run the receive loop in a thread, capturing any raised exception."""
+def run_in_thread(worker: Worker, connection: socket.socket):
+    """Run the receive loop in a thread, capturing any raised exception.
+
+    Returns the thread, the list of raised exceptions, and the ``ready``
+    envelope ``run`` sends first.
+    """
     errors: list[BaseException] = []
 
     def target():
@@ -82,7 +85,8 @@ def run_in_thread(worker: Worker):
 
     thread = threading.Thread(target=target)
     thread.start()
-    return thread, errors
+    ready = read_envelope(connection)
+    return thread, errors, ready
 
 
 def test_envelope_types_describe_the_wire_shape():
@@ -124,18 +128,27 @@ def test_create_envelope_requires_objects(field):
         create_envelope(**kwargs)
 
 
-def test_worker_ready_envelope_uses_exact_argv_identity_and_socket():
+def test_constructor_does_not_send_and_run_announces_versioned_ready():
     resources = open_worker()
     try:
-        _, _, _, _, ready, socket_path = resources
+        _, _, connection, worker, _, socket_path = resources
+        connection.settimeout(0.1)
+        with pytest.raises(socket.timeout):
+            connection.recv(1)
+        connection.settimeout(1)
+
+        thread, errors, ready = run_in_thread(worker, connection)
         assert ready == {
             "meta": {
                 "x_op": "ready",
                 "x_wid": "worker-123",
                 "x_spath": socket_path,
             },
-            "data": {},
+            "data": {"protocol_version": 1, "capabilities": []},
         }
+        send_envelope(connection, {"meta": {"x_op": "terminate"}, "data": {}})
+        thread.join(timeout=1)
+        assert errors == []
     finally:
         close_worker(resources)
 
@@ -248,8 +261,7 @@ def test_execute_returns_direct_done_data():
     resources = open_worker()
     try:
         _, _, connection, worker, _, socket_path = resources
-        thread = threading.Thread(target=worker.run)
-        thread.start()
+        thread, _, _ = run_in_thread(worker, connection)
 
         send_envelope(
             connection,
@@ -288,8 +300,7 @@ def test_custom_inbound_envelope_reaches_developer_hook_once():
     resources = open_worker(CustomWorker)
     try:
         _, _, connection, worker, _, _ = resources
-        thread = threading.Thread(target=worker.run)
-        thread.start()
+        thread, _, _ = run_in_thread(worker, connection)
         custom = {
             "meta": {
                 "x_wid": "worker-123",
@@ -315,8 +326,7 @@ def test_retry_before_execute_returns_error():
     resources = open_worker()
     try:
         _, _, connection, worker, _, _ = resources
-        thread = threading.Thread(target=worker.run)
-        thread.start()
+        thread, _, _ = run_in_thread(worker, connection)
         send_envelope(connection, {"meta": {"x_op": "retry"}, "data": {}})
         error = read_envelope(connection)
         assert error["meta"]["x_op"] == "error"
@@ -341,8 +351,7 @@ def test_invalid_execute_result_returns_error():
     resources = open_worker(InvalidResultWorker)
     try:
         _, _, connection, worker, _, _ = resources
-        thread = threading.Thread(target=worker.run)
-        thread.start()
+        thread, _, _ = run_in_thread(worker, connection)
         send_envelope(
             connection,
             {"meta": {"x_op": "execute"}, "data": {}},
@@ -375,7 +384,7 @@ def test_protocol_violation_closes_without_response_and_raises(invalid):
     resources = open_worker()
     try:
         _, _, connection, worker, _, _ = resources
-        thread, errors = run_in_thread(worker)
+        thread, errors, _ = run_in_thread(worker, connection)
         send_envelope(connection, invalid)
         thread.join(timeout=1)
         assert not thread.is_alive()
@@ -468,7 +477,7 @@ def test_invalid_inbound_length_closes_without_reading_a_body(monkeypatch, size)
     resources = open_worker()
     try:
         _, _, connection, worker, _, _ = resources
-        thread, errors = run_in_thread(worker)
+        thread, errors, _ = run_in_thread(worker, connection)
         connection.sendall(struct.pack("<Q", size))
         thread.join(timeout=1)
         assert not thread.is_alive()
@@ -494,8 +503,7 @@ def test_frame_at_the_limit_is_accepted(monkeypatch):
     resources = open_worker(Recording)
     try:
         _, _, connection, worker, _, _ = resources
-        thread = threading.Thread(target=worker.run)
-        thread.start()
+        thread, _, _ = run_in_thread(worker, connection)
         connection.sendall(_frame(body.encode()))
         send_envelope(connection, {"meta": {"x_op": "terminate"}, "data": {}})
         thread.join(timeout=1)
@@ -510,7 +518,7 @@ def test_stalled_frame_times_out_after_its_first_byte(monkeypatch, sent):
     resources = open_worker()
     try:
         _, _, connection, worker, _, _ = resources
-        thread, errors = run_in_thread(worker)
+        thread, errors, _ = run_in_thread(worker, connection)
         connection.sendall(_frame(b'{"meta":{},"data":{}}')[:sent])
         thread.join(timeout=2)
         assert not thread.is_alive()
@@ -524,8 +532,7 @@ def test_idle_connection_has_no_frame_deadline(monkeypatch):
     resources = open_worker()
     try:
         _, _, connection, worker, _, _ = resources
-        thread = threading.Thread(target=worker.run)
-        thread.start()
+        thread, _, _ = run_in_thread(worker, connection)
         time.sleep(0.3)
         assert thread.is_alive()
         send_envelope(connection, {"meta": {"x_op": "execute"}, "data": {"n": 1}})
@@ -577,31 +584,37 @@ def test_concurrent_sends_never_interleave_frames():
         close_worker(resources)
 
 
-def test_ready_send_failure_closes_the_socket(monkeypatch):
-    with tempfile.TemporaryDirectory() as directory:
-        path = f"{directory}/worker.sock"
-        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        listener.bind(path)
-        listener.listen(1)
-        closed = []
-        original_close = socket.socket.close
+def test_connect_failure_closes_the_socket(monkeypatch):
+    closed = []
+    original_close = socket.socket.close
+
+    def recording_close(self):
+        closed.append(self)
+        original_close(self)
+
+    monkeypatch.setattr(socket.socket, "close", recording_close)
+    with pytest.raises(FileNotFoundError):
+        EchoWorker("/nonexistent/runpy/worker.sock", "worker-123")
+    monkeypatch.undo()
+    assert closed and all(sock.fileno() == -1 for sock in closed)
+
+
+def test_ready_send_failure_raises_from_run_and_closes(monkeypatch):
+    resources = open_worker()
+    try:
+        _, _, connection, worker, _, _ = resources
 
         def failing_sendall(self, data):
             raise BrokenPipeError("peer gone")
 
-        def recording_close(self):
-            closed.append(self)
-            original_close(self)
-
         monkeypatch.setattr(socket.socket, "sendall", failing_sendall)
-        monkeypatch.setattr(socket.socket, "close", recording_close)
-        try:
-            with pytest.raises(BrokenPipeError):
-                EchoWorker(path, "worker-123")
-            assert closed and all(sock.fileno() == -1 for sock in closed)
-        finally:
-            monkeypatch.undo()
-            listener.close()
+        with pytest.raises(BrokenPipeError):
+            worker.run()
+        monkeypatch.undo()
+        assert worker.stream.fileno() == -1
+        assert connection.recv(1) == b""
+    finally:
+        close_worker(resources)
 
 
 def test_failed_send_closes_the_transport_and_rejects_later_writes(monkeypatch):
@@ -637,8 +650,7 @@ def test_non_finite_result_becomes_an_error_and_the_worker_stays_usable():
     resources = open_worker(NaNWorker)
     try:
         _, _, connection, worker, _, _ = resources
-        thread = threading.Thread(target=worker.run)
-        thread.start()
+        thread, _, _ = run_in_thread(worker, connection)
         send_envelope(connection, {"meta": {"x_op": "execute"}, "data": {"bad": True}})
         error = read_envelope(connection)
         assert error["meta"]["x_op"] == "error"
@@ -657,7 +669,7 @@ def test_inbound_non_finite_number_is_a_protocol_violation():
     resources = open_worker()
     try:
         _, _, connection, worker, _, _ = resources
-        thread, errors = run_in_thread(worker)
+        thread, errors, _ = run_in_thread(worker, connection)
         connection.sendall(_frame(b'{"meta":{},"data":{"v":NaN}}'))
         thread.join(timeout=1)
         assert not thread.is_alive()
@@ -682,7 +694,7 @@ def test_execution_exceptions_report_type_and_keep_the_worker_alive():
     resources = open_worker(Failing)
     try:
         _, _, connection, worker, _, _ = resources
-        thread, errors = run_in_thread(worker)
+        thread, errors, _ = run_in_thread(worker, connection)
         send_envelope(
             connection, {"meta": {"x_op": "execute"}, "data": {"fail": "empty"}}
         )
@@ -720,7 +732,7 @@ def test_system_exit_from_execute_is_not_converted():
     resources = open_worker(Exiting)
     try:
         _, _, connection, worker, _, _ = resources
-        thread, errors = run_in_thread(worker)
+        thread, errors, _ = run_in_thread(worker, connection)
         send_envelope(connection, {"meta": {"x_op": "execute"}, "data": {}})
         thread.join(timeout=1)
         assert len(errors) == 1 and isinstance(errors[0], SystemExit)

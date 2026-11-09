@@ -19,6 +19,10 @@ pub enum InvalidScriptReason {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum TimeoutStage {
+    /// The worker did not report `ready` within the startup timeout.
+    ///
+    /// Its process group was stopped.
+    Startup,
     /// Waiting for outbound queue capacity (byte budget or route slot).
     ///
     /// Nothing was queued or written.
@@ -37,6 +41,7 @@ pub enum TimeoutStage {
 impl fmt::Display for TimeoutStage {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
+            Self::Startup => "waiting for the worker to become ready",
             Self::Admission => "waiting for queue capacity",
             Self::Queued => "waiting in the outbound queue",
             Self::Write => "writing to the socket",

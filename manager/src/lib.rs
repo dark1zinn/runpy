@@ -70,29 +70,26 @@
 //!     let manager = Manager::builder("worker").build().await?;
 //!     let (finished_tx, mut finished_rx) = tokio::sync::mpsc::unbounded_channel();
 //!     manager.on_message(move |inbound| {
-//!         match inbound.envelope.meta().get("x_op").and_then(Value::as_str) {
-//!             Some("ready") => {
-//!                 let execute = Envelope::execute(object(json!({"task": "process"})));
-//!                 if let Err(error) = inbound.reply(execute) {
-//!                     eprintln!("execute not admitted: {error}");
-//!                 }
-//!             }
-//!             Some("done" | "error") => {
-//!                 println!("{:?}", inbound.envelope.data());
-//!                 let _ = finished_tx.send(());
-//!             }
-//!             _ => {}
+//!         if let Some("done" | "error") =
+//!             inbound.envelope.meta().get("x_op").and_then(Value::as_str)
+//!         {
+//!             println!("{:?}", inbound.envelope.data());
+//!             let _ = finished_tx.send(());
 //!         }
 //!     });
 //!
+//!     // `spawn` returns once the worker reported `ready`.
 //!     let worker = manager.worker("my_worker").spawn().await?;
 //!     println!("spawned {}", worker.id());
+//!     worker
+//!         .send_message(Envelope::execute(object(json!({"task": "process"}))))
+//!         .await?;
 //!     tokio::time::timeout(Duration::from_secs(30), finished_rx.recv())
 //!         .await
 //!         .expect("worker response timed out")
 //!         .expect("worker response channel closed");
-//!     worker.terminate().await?;
-//!     manager.terminate_all().await;
+//!     let exit = worker.terminate().await?;
+//!     println!("stopped: {:?}", exit.reason);
 //!     Ok(())
 //! }
 //! ```
@@ -103,6 +100,7 @@
 mod config;
 mod error;
 mod integrity;
+mod lifecycle;
 mod manager;
 mod protocol;
 mod scribbler;
@@ -124,6 +122,7 @@ pub use config::{
     DEFAULT_QUEUED_BYTES, DEFAULT_SEND_TIMEOUT, DEFAULT_SHUTDOWN_GRACE, DEFAULT_STARTUP_TIMEOUT,
 };
 pub use error::{InvalidScriptReason, RunpyError, TimeoutStage};
+pub use lifecycle::{ExitReason, WorkerExit};
 pub use manager::{StdinMode, Worker, WorkerBuilder, WorkerIdentity};
 pub use protocol::{
     Data, Envelope, EnvelopeError, InboundEnvelope, MessageHandler, Meta, SendReceipt,
@@ -497,15 +496,16 @@ impl Manager {
         self.control_plane.broadcast(envelope).await
     }
 
-    /// Request graceful termination for all workers, then force cleanup.
+    /// Request graceful termination for all workers, force cleanup, and
+    /// return each worker's exit keyed by worker ID.
     ///
     /// New sends are refused at once. `terminate` requests are delivered
     /// concurrently, and every process group is killed and reaped as soon as
     /// it exits or at the latest when the shutdown grace ends, even when a
     /// worker's queue is saturated. Sockets are removed and output readers
     /// drain briefly.
-    pub async fn terminate_all(&self) {
-        self.control_plane.terminate_all().await;
+    pub async fn terminate_all(&self) -> HashMap<String, WorkerExit> {
+        self.control_plane.terminate_all().await
     }
 }
 

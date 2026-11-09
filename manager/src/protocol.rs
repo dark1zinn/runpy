@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
-use std::process::Child;
+use std::process::{Child, ExitStatus};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Weak};
@@ -19,6 +19,10 @@ use tokio::time::{Duration, Instant, interval, timeout, timeout_at};
 
 use crate::config::{ProtocolLimits, QueueLimits};
 use crate::error::{RunpyError, TimeoutStage};
+use crate::lifecycle::{
+    ExitReason, LifecycleReceiver, LifecycleSender, LifecycleState, WorkerExit, lifecycle_channel,
+    parse_ready,
+};
 use crate::manager::WorkerIdentity;
 use crate::scribbler::Scribbler;
 use crate::watchdog::WatchdogService;
@@ -599,6 +603,8 @@ pub(crate) struct WorkerHandle {
     pub sock_path: PathBuf,
     pub sender: MessageSender,
     pub process_group_id: u32,
+    /// Publishes readiness and the retained final exit to worker handles.
+    pub lifecycle: LifecycleSender,
 }
 
 /// Process-lifetime tasks removed as one unit during cleanup.
@@ -697,40 +703,14 @@ struct WorkerSession {
     logger: Arc<Scribbler>,
     limits: ProtocolLimits,
     ended: mpsc::UnboundedSender<(String, ExitReason)>,
-}
-
-/// Why a registered worker was removed.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ExitReason {
-    /// The `uv` process exited on its own.
-    Exited,
-    /// The caller requested termination.
-    Terminated,
-    /// The connection closed or failed.
-    Disconnected,
-    /// The worker sent an invalid frame or envelope.
-    ProtocolViolation,
-    /// The Manager is shutting down.
-    ManagerShutdown,
-}
-
-impl ExitReason {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Exited => "process exited",
-            Self::Terminated => "terminated",
-            Self::Disconnected => "disconnected",
-            Self::ProtocolViolation => "protocol violation",
-            Self::ManagerShutdown => "manager shutdown",
-        }
-    }
+    lifecycle: LifecycleSender,
 }
 
 /// Kill the complete process group when possible, then reap the stored child.
 ///
 /// Reaping is required on every registration/removal failure path to avoid
-/// leaking a zombie `uv` process.
-fn force_stop_child(child: &mut Child, process_group_id: u32) {
+/// leaking a zombie `uv` process. Returns the reaped exit status.
+fn force_stop_child(child: &mut Child, process_group_id: u32) -> Option<ExitStatus> {
     #[cfg(unix)]
     {
         let result = unsafe { libc::kill(-(process_group_id as libc::pid_t), libc::SIGKILL) };
@@ -747,15 +727,15 @@ fn force_stop_child(child: &mut Child, process_group_id: u32) {
         let _ = child.kill();
     }
 
-    let _ = child.wait();
+    child.wait().ok()
 }
 
-pub(crate) fn force_stop_worker(handle: &mut WorkerHandle) {
-    force_stop_child(&mut handle.child, handle.process_group_id);
+pub(crate) fn force_stop_worker(handle: &mut WorkerHandle) -> Option<ExitStatus> {
+    force_stop_child(&mut handle.child, handle.process_group_id)
 }
 
 fn cleanup_unregistered_worker(child: &mut Child, process_group_id: u32, sock_path: &PathBuf) {
-    force_stop_child(child, process_group_id);
+    let _ = force_stop_child(child, process_group_id);
     let _ = std::fs::remove_file(sock_path);
 }
 
@@ -1015,7 +995,7 @@ impl ControlPlane {
         socket_path: String,
         listener: UnixListener,
         worker_handler: Option<MessageHandler>,
-    ) -> Result<(), RunpyError> {
+    ) -> Result<LifecycleReceiver, RunpyError> {
         let worker_id = identity.name.clone();
         let process_group_id = child.id();
         let missing = |stream: &str| {
@@ -1105,6 +1085,7 @@ impl ControlPlane {
         };
 
         self.start_monitoring(5);
+        let (lifecycle, observer) = lifecycle_channel();
         workers.insert(
             worker_id.clone(),
             WorkerHandle {
@@ -1113,6 +1094,7 @@ impl ControlPlane {
                 sock_path,
                 sender,
                 process_group_id,
+                lifecycle: lifecycle.clone(),
             },
         );
 
@@ -1127,6 +1109,7 @@ impl ControlPlane {
             logger: self.logger.clone(),
             limits: self.limits,
             ended: self.ended_tx.clone(),
+            lifecycle,
         }));
         let stdout = tokio::spawn(capture_worker_output(
             stdout,
@@ -1148,7 +1131,7 @@ impl ControlPlane {
                 stderr,
             },
         );
-        Ok(())
+        Ok(observer)
     }
 
     pub(crate) async fn send(&self, worker_id: &str, envelope: Envelope) -> Result<(), RunpyError> {
@@ -1208,16 +1191,22 @@ impl ControlPlane {
     }
 
     /// Terminate every registered worker under one shared grace deadline.
-    pub(crate) async fn terminate_all(&self) {
+    pub(crate) async fn terminate_all(&self) -> HashMap<String, WorkerExit> {
         let deadline = Instant::now() + self.queue.shutdown_grace;
         let routes: Vec<_> = self
             .workers
             .read()
             .iter()
-            .map(|(worker_id, handle)| (worker_id.clone(), handle.sender.clone()))
+            .map(|(worker_id, handle)| {
+                (
+                    worker_id.clone(),
+                    handle.sender.clone(),
+                    handle.lifecycle.subscribe(),
+                )
+            })
             .collect();
         let mut requests = JoinSet::new();
-        for (_, sender) in &routes {
+        for (_, sender, _) in &routes {
             let sender = sender.clone();
             requests.spawn(async move {
                 let _ = sender.request_termination(deadline).await;
@@ -1225,18 +1214,36 @@ impl ControlPlane {
         }
         while requests.join_next().await.is_some() {}
 
-        for (worker_id, _) in &routes {
+        for (worker_id, _, _) in &routes {
             self.wait_for_exit(worker_id, deadline).await;
         }
-        for (worker_id, _) in &routes {
-            self.remove_worker(worker_id, ExitReason::Terminated).await;
+        let mut exits = HashMap::with_capacity(routes.len());
+        for (worker_id, _, lifecycle) in routes {
+            self.remove_worker(&worker_id, ExitReason::Terminated).await;
+            if let LifecycleState::Exited(exit) = &*lifecycle.borrow() {
+                exits.insert(worker_id, exit.clone());
+            }
         }
+        exits
+    }
+
+    /// Stop a worker whose spawn was abandoned before it became ready.
+    ///
+    /// Called from a synchronous drop guard, so removal is handed to the
+    /// monitor rather than awaited here.
+    pub(crate) fn abandon(&self, worker_id: &str) {
+        if let Some(handle) = self.workers.read().get(worker_id) {
+            handle.sender.closing.store(true, Ordering::Release);
+        }
+        let _ = self
+            .ended_tx
+            .send((worker_id.to_string(), ExitReason::Terminated));
     }
 
     /// Wait until the worker's process exits, it is removed, or `deadline`.
     ///
     /// Polls `try_wait` without holding the registry lock across a sleep.
-    async fn wait_for_exit(&self, worker_id: &str, deadline: Instant) {
+    pub(crate) async fn wait_for_exit(&self, worker_id: &str, deadline: Instant) {
         loop {
             let exited = match self.workers.write().get_mut(worker_id) {
                 None => true,
@@ -1257,7 +1264,7 @@ impl ControlPlane {
     /// callers return `false`. A worker whose termination was requested is
     /// recorded as terminated even if it exited or disconnected first. The
     /// blocking kill-and-reap runs off the async runtime threads.
-    async fn remove_worker(&self, worker_id: &str, reason: ExitReason) -> bool {
+    pub(crate) async fn remove_worker(&self, worker_id: &str, reason: ExitReason) -> bool {
         let tasks = self.sessions.lock().remove(worker_id);
         if let Some(tasks) = &tasks {
             tasks.session.abort();
@@ -1266,25 +1273,35 @@ impl ControlPlane {
         let handle = self.workers.write().remove(worker_id);
         let removed = handle.is_some();
         if let Some(mut handle) = handle {
-            let reason = if reason != ExitReason::ManagerShutdown
-                && handle.sender.closing.load(Ordering::Acquire)
+            let reason = if !matches!(
+                reason,
+                ExitReason::ManagerShutdown | ExitReason::StartupTimeout
+            ) && handle.sender.closing.load(Ordering::Acquire)
             {
                 ExitReason::Terminated
             } else {
                 reason
             };
             let name = handle.identity.name.clone();
+            let lifecycle = handle.lifecycle.clone();
             let stopped = tokio::task::spawn_blocking(move || {
-                force_stop_worker(&mut handle);
+                let status = force_stop_worker(&mut handle);
                 let _ = std::fs::remove_file(&handle.sock_path);
+                status
             })
             .await;
-            if let Err(error) = stopped {
+            let status = stopped.unwrap_or_else(|error| {
                 self.logger.error_with(
                     "ControlPlane",
                     &format!("Failed to stop worker '{name}': {error}"),
                 );
-            }
+                None
+            });
+            lifecycle.send_replace(LifecycleState::Exited(WorkerExit::new(
+                name.clone(),
+                status,
+                reason,
+            )));
             self.logger.info_with(
                 "ControlPlane",
                 &format!("Removed worker '{name}' ({})", reason.as_str()),
@@ -1320,8 +1337,15 @@ impl ControlPlane {
             tasks.stderr.abort();
         }
         for (_, mut handle) in workers.drain() {
-            force_stop_worker(&mut handle);
+            let status = force_stop_worker(&mut handle);
             let _ = std::fs::remove_file(&handle.sock_path);
+            handle
+                .lifecycle
+                .send_replace(LifecycleState::Exited(WorkerExit::new(
+                    handle.identity.name.clone(),
+                    status,
+                    ExitReason::ManagerShutdown,
+                )));
         }
     }
 
@@ -1349,6 +1373,7 @@ impl ControlPlane {
             logger,
             limits,
             ended: _,
+            lifecycle,
         } = session;
         let stream = match listener.accept().await {
             Ok((stream, _)) => stream,
@@ -1394,6 +1419,7 @@ impl ControlPlane {
         ));
         let mut writer = AbortOnDrop(writer);
 
+        let mut ready = false;
         loop {
             tokio::select! {
                 received = inbound_rx.recv() => {
@@ -1403,6 +1429,35 @@ impl ControlPlane {
                     if let Err(error) = envelope.validate_worker_to_manager() {
                         logger.error_with("Protocol", &error.to_string());
                         return ExitReason::ProtocolViolation;
+                    }
+                    // The first envelope must be `ready` and nothing may
+                    // repeat it. Readiness is lifecycle state, consumed here
+                    // and published to handles, not dispatched to handlers.
+                    let is_ready = envelope.operation() == Some("ready");
+                    if is_ready == ready {
+                        let problem = if ready {
+                            "sent `ready` more than once".to_string()
+                        } else {
+                            format!(
+                                "sent {} before `ready`",
+                                envelope.operation().unwrap_or("a custom envelope")
+                            )
+                        };
+                        logger.error_with("Protocol", &format!("{worker_id} {problem}"));
+                        return ExitReason::ProtocolViolation;
+                    }
+                    if is_ready {
+                        match parse_ready(envelope.data()) {
+                            Ok(capabilities) => {
+                                ready = true;
+                                lifecycle.send_replace(LifecycleState::Ready { capabilities });
+                                continue;
+                            }
+                            Err(error) => {
+                                logger.error_with("Protocol", &format!("{worker_id}: {error}"));
+                                return ExitReason::ProtocolViolation;
+                            }
+                        }
                     }
                     envelope.stamp_trusted(&worker_id, &socket_path);
 
@@ -1704,6 +1759,7 @@ impl Mailer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lifecycle::wait_for_exit;
     use serde_json::json;
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
@@ -1727,12 +1783,13 @@ mod tests {
         ControlPlane::new(test_logger(), limits, QueueLimits::default())
     }
 
-    async fn register_worker(
+    /// Register a `sleep` child and connect to its socket without `ready`.
+    async fn register_unready(
         control_plane: &Arc<ControlPlane>,
         directory: &std::path::Path,
         worker_id: &str,
         handler: Option<MessageHandler>,
-    ) -> UnixStream {
+    ) -> (UnixStream, LifecycleReceiver) {
         let sock_path = directory.join(format!("{worker_id}.sock"));
         let listener = UnixListener::bind(&sock_path).unwrap();
         let socket_path = sock_path.to_string_lossy().into_owned();
@@ -1748,7 +1805,7 @@ mod tests {
             sock_file: format!("{worker_id}.sock"),
         };
 
-        control_plane
+        let lifecycle = control_plane
             .register_worker(
                 child,
                 identity,
@@ -1759,7 +1816,35 @@ mod tests {
             )
             .await
             .unwrap();
-        UnixStream::connect(sock_path).await.unwrap()
+        (UnixStream::connect(sock_path).await.unwrap(), lifecycle)
+    }
+
+    fn ready_envelope(protocol_version: u64) -> Envelope {
+        serde_json::from_value(json!({
+            "meta": {"x_op": "ready"},
+            "data": {"protocol_version": protocol_version, "capabilities": ["extra"]}
+        }))
+        .unwrap()
+    }
+
+    /// Register a worker that has announced `ready`.
+    async fn register_worker(
+        control_plane: &Arc<ControlPlane>,
+        directory: &std::path::Path,
+        worker_id: &str,
+        handler: Option<MessageHandler>,
+    ) -> UnixStream {
+        let (mut stream, mut lifecycle) =
+            register_unready(control_plane, directory, worker_id, handler).await;
+        write_envelope(&mut stream, &ready_envelope(1)).await;
+        timeout(
+            Duration::from_secs(2),
+            lifecycle.wait_for(|state| matches!(state, LifecycleState::Ready { .. })),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        stream
     }
 
     async fn write_envelope(stream: &mut UnixStream, envelope: &Envelope) {
@@ -2093,7 +2178,7 @@ mod tests {
         for (stream, source) in [(&mut first, "first"), (&mut second, "second")] {
             let inbound: Envelope = serde_json::from_value(json!({
                 "meta": {
-                    "x_op": "ready",
+                    "x_op": "log",
                     "x_wid": "spoofed",
                     "x_spath": "/tmp/spoofed.sock"
                 },
@@ -2184,6 +2269,100 @@ mod tests {
         assert!(control_plane.workers.read().contains_key("other"));
         control_plane.send("worker", numbered(4)).await.unwrap();
         control_plane.shutdown_now();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ready_is_consumed_as_lifecycle_state_not_dispatched() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let control_plane = test_control_plane(ProtocolLimits::default());
+        let (observed_tx, observed_rx) = std_mpsc::channel();
+        let handler: MessageHandler = Arc::new(move |inbound| {
+            observed_tx
+                .send(inbound.envelope.meta().get("x_op").cloned())
+                .unwrap();
+        });
+        let (mut stream, mut lifecycle) =
+            register_unready(&control_plane, directory.path(), "worker", Some(handler)).await;
+        assert!(matches!(*lifecycle.borrow(), LifecycleState::Starting));
+
+        write_envelope(&mut stream, &ready_envelope(1)).await;
+        let state = timeout(
+            Duration::from_secs(2),
+            lifecycle.wait_for(|state| !matches!(state, LifecycleState::Starting)),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .clone();
+        match state {
+            LifecycleState::Ready { capabilities } => assert_eq!(&*capabilities, ["extra"]),
+            other => panic!("unexpected state {other:?}"),
+        }
+
+        write_envelope(
+            &mut stream,
+            &Envelope::new(Meta::new(), Data::new()).unwrap(),
+        )
+        .await;
+        assert_eq!(
+            observed_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            None,
+            "only the custom envelope reaches handlers"
+        );
+        assert!(observed_rx.try_recv().is_err());
+        control_plane.shutdown_now();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn readiness_violations_stop_the_worker_with_a_retained_reason() {
+        let custom = Envelope::new(Meta::new(), Data::new()).unwrap();
+        let cases: [(&str, Vec<Envelope>); 3] = [
+            ("custom-first", vec![custom]),
+            ("wrong-version", vec![ready_envelope(2)]),
+            ("ready-twice", vec![ready_envelope(1), ready_envelope(1)]),
+        ];
+        for (name, frames) in cases {
+            let directory = tempfile::TempDir::new().unwrap();
+            let control_plane = test_control_plane(ProtocolLimits::default());
+            let (mut stream, lifecycle) =
+                register_unready(&control_plane, directory.path(), name, None).await;
+            for frame in &frames {
+                write_envelope(&mut stream, frame).await;
+            }
+            let exit = timeout(Duration::from_secs(3), wait_for_exit(lifecycle, name))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(exit.reason, ExitReason::ProtocolViolation, "case {name}");
+            assert_eq!(exit.signal, Some(libc::SIGKILL));
+            control_plane.shutdown_now();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn exits_are_retained_for_late_and_simultaneous_waiters() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let control_plane = test_control_plane(ProtocolLimits::default());
+        let (_stream, lifecycle) =
+            register_unready(&control_plane, directory.path(), "worker", None).await;
+        let waiters: Vec<_> = (0..3)
+            .map(|_| tokio::spawn(wait_for_exit(lifecycle.clone(), "worker")))
+            .collect();
+
+        control_plane
+            .remove_worker("worker", ExitReason::Terminated)
+            .await;
+        for waiter in waiters {
+            let exit = waiter.await.unwrap().unwrap();
+            assert_eq!(exit.reason, ExitReason::Terminated);
+            assert_eq!(exit.worker_id, "worker");
+        }
+
+        // Every sender is gone now; a late waiter still sees the exit.
+        control_plane.shutdown_now();
+        drop(control_plane);
+        let late = wait_for_exit(lifecycle, "worker").await.unwrap();
+        assert_eq!(late.reason, ExitReason::Terminated);
     }
 
     #[tokio::test(flavor = "multi_thread")]

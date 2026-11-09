@@ -51,6 +51,27 @@ is now the null device by default instead of the Manager's stdin.
 - A worker's socket accepts exactly one connection. A closed or invalid
   connection removes the worker and stops its process group; reconnecting is
   no longer supported.
+- `spawn` returns only after the worker's versioned `ready`. `ready` is no
+  longer passed to `on_message` handlers: send the first work right after
+  `spawn` returns instead of replying to `ready`.
+
+  ```rust
+  // Before
+  manager.on_message(|inbound| {
+      if inbound.envelope.meta().get("x_op") == Some(&"ready".into()) {
+          let _ = inbound.reply(Envelope::execute(data));
+      }
+  });
+  // After
+  let worker = manager.worker("my_worker").spawn().await?;
+  worker.send_message(Envelope::execute(data)).await?;
+  ```
+- `Worker::terminate` returns `Result<WorkerExit, RunpyError>` (whether the
+  `terminate` frame was written is no longer reported) and
+  `Manager::terminate_all` returns each `WorkerExit`. `Worker::wait` observes
+  the retained exit.
+- `spawn` fails with `Timeout(Startup)` when `ready` does not arrive within
+  `startup_timeout`.
 
 ## Python SDK
 
@@ -61,3 +82,6 @@ is now the null device by default instead of the Manager's stdin.
   stderr and exits with status 1.
 - Frames above `RUNPY_MAX_FRAME_BYTES` raise `FrameTooLargeError`; NaN and
   infinite numbers raise `ValueError` in both directions.
+- `ready` is sent by `Worker.run()` instead of the constructor and carries
+  `{"protocol_version": 1, "capabilities": [...]}`. The Rust Manager rejects
+  any other version: upgrade `runpy` and `runpyrs` together.

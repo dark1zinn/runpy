@@ -1,8 +1,13 @@
 # /// script
 # requires-python = ">=3.10"
 # dependencies = [
-#   "runpyrs @ git+https://github.com/dark1zinn/runpy#subdirectory=worker",
+#   "runpyrs",
 # ]
+#
+# # Development example: use the SDK from this checkout. Applications install
+# # runpyrs from Git or a package index instead (see docs/installation.md).
+# [tool.uv.sources]
+# runpyrs = { path = "../../../worker", editable = true }
 # ///
 
 from runpyrs import Worker, RunScript

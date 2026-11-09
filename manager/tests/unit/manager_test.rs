@@ -1,5 +1,6 @@
 use runpy::{
-    InvalidScriptReason, Manager, RunpyError, StdinMode, TimeoutStage, WorkerOutputStream,
+    ExitReason, InvalidScriptReason, Manager, RunpyError, StdinMode, TimeoutStage,
+    WorkerOutputStream,
 };
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -26,12 +27,56 @@ fn fake_uv(tmp: &TempDir) -> PathBuf {
     )
 }
 
-/// A fake uv that records `name=value` facts about its launch and then idles.
-fn recording_uv(tmp: &TempDir, body: &str) -> PathBuf {
+/// Minimal stand-in for a Python SDK worker: connects to the socket Runpy
+/// passes after `--script <file>`, announces `ready`, and runs until it
+/// receives `terminate` or the connection closes.
+const FAKE_WORKER: &str = r#"
+import json, socket, struct, sys
+args = sys.argv[1:]
+index = args.index("--script")
+sock_path = args[index + 2]
+stream = socket.socket(socket.AF_UNIX)
+stream.connect(sock_path)
+body = json.dumps({"meta": {"x_op": "ready"},
+                   "data": {"protocol_version": 1, "capabilities": []}}).encode()
+stream.sendall(struct.pack("<Q", len(body)) + body)
+def read(size):
+    data = b""
+    while len(data) < size:
+        chunk = stream.recv(size - len(data))
+        if not chunk:
+            sys.exit(0)
+        data += chunk
+    return data
+while True:
+    (size,) = struct.unpack("<Q", read(8))
+    if json.loads(read(size))["meta"].get("x_op") == "terminate":
+        sys.exit(0)
+"#;
+
+/// A fake uv whose launch runs `body` and then hands over to the fake worker.
+///
+/// `$FAKE_WORKER` names the worker script, so `body` can also start it itself
+/// (for example in the background) and end with its own `exit`.
+fn uv_script(tmp: &TempDir, body: &str) -> PathBuf {
+    let worker = tmp.path().join("fake_worker.py");
+    fs::write(&worker, FAKE_WORKER).unwrap();
     write_executable(
         tmp,
         "uv",
-        &format!("#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then exit 0; fi\n{body}\n"),
+        &format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then exit 0; fi\nFAKE_WORKER='{}'\n{body}\n",
+            worker.display()
+        ),
+    )
+}
+
+/// A fake uv that runs `body` (recording facts about its launch) and then
+/// becomes a ready worker.
+fn recording_uv(tmp: &TempDir, body: &str) -> PathBuf {
+    uv_script(
+        tmp,
+        &format!("{body}\nexec python3 \"$FAKE_WORKER\" \"$@\""),
     )
 }
 
@@ -99,7 +144,7 @@ async fn wait_for_process_exit(pid: u32) {
 #[tokio::test]
 async fn each_manager_owns_a_private_socket_directory_removed_on_drop() {
     let tmp = TempDir::new().unwrap();
-    let uv = recording_uv(&tmp, "exec sleep 300");
+    let uv = recording_uv(&tmp, ":");
     let scripts = scripts_dir(&tmp, &["same"]);
     let first = manager_with_uv(&scripts, &uv).await;
     let second = manager_with_uv(&scripts, &uv).await;
@@ -360,7 +405,7 @@ async fn hung_uv_is_killed_at_the_startup_timeout_and_on_cancellation() {
 #[tokio::test]
 async fn scripts_are_resolved_per_spawn_without_walking_the_directory() {
     let tmp = TempDir::new().unwrap();
-    let uv = recording_uv(&tmp, "exec sleep 300");
+    let uv = recording_uv(&tmp, ":");
     let scripts = scripts_dir(&tmp, &["present"]);
     // A symlink cycle would never finish a recursive walk.
     std::os::unix::fs::symlink(&scripts, scripts.join("loop")).unwrap();
@@ -382,10 +427,109 @@ async fn scripts_are_resolved_per_spawn_without_walking_the_directory() {
     ));
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn spawn_waits_for_ready_and_fails_cleanly_otherwise() {
+    let tmp = TempDir::new().unwrap();
+    let pid_file = tmp.path().join("pid");
+    let uv = uv_script(
+        &tmp,
+        &format!(
+            r#"echo $$ > '{}'
+case "$RUNPY_TEST_MODE" in
+  silent) exec sleep 300 ;;
+  exit) exit 3 ;;
+  version) sed -i 's/"protocol_version": 1/"protocol_version": 99/' "$FAKE_WORKER" ;;
+esac
+exec python3 "$FAKE_WORKER" "$@""#,
+            pid_file.display()
+        ),
+    );
+    let scripts = scripts_dir(&tmp, &["managed"]);
+    let manager = Manager::builder(&scripts)
+        .uv_path(&uv)
+        .startup_timeout(Duration::from_millis(500))
+        .build()
+        .await
+        .unwrap();
+    let spawn = |mode: &str| {
+        let _ = fs::remove_file(&pid_file);
+        manager
+            .worker("managed")
+            .env("RUNPY_TEST_MODE", mode)
+            .spawn()
+    };
+    let pid = || -> u32 {
+        fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    };
+
+    let worker = spawn("ready").await.unwrap();
+    assert!(worker.capabilities().is_empty());
+    worker.terminate().await.unwrap();
+
+    assert!(matches!(
+        spawn("silent").await,
+        Err(RunpyError::Timeout(TimeoutStage::Startup))
+    ));
+    assert!(
+        process_is_stopped(pid()),
+        "an unready worker must be stopped"
+    );
+
+    assert!(matches!(
+        spawn("exit").await,
+        Err(RunpyError::WorkerExited { .. })
+    ));
+    assert!(matches!(
+        spawn("version").await,
+        Err(RunpyError::WorkerExited { .. })
+    ));
+    assert!(process_is_stopped(pid()));
+    assert!(manager.watchdog().report().await.is_empty());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancelling_spawn_before_ready_stops_the_process() {
+    let tmp = TempDir::new().unwrap();
+    let pid_file = tmp.path().join("pid");
+    let uv = uv_script(
+        &tmp,
+        &format!("echo $$ > '{}'\nexec sleep 300", pid_file.display()),
+    );
+    let scripts = scripts_dir(&tmp, &["managed"]);
+    let manager = manager_with_uv(&scripts, &uv).await;
+
+    let cancelled = tokio::time::timeout(
+        Duration::from_millis(300),
+        manager.worker("managed").spawn(),
+    )
+    .await;
+    assert!(cancelled.is_err());
+    wait_for_file(&pid_file).await;
+    let pid: u32 = fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !process_is_stopped(pid) || !manager.watchdog().report().await.is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "abandoned worker was not stopped"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 #[tokio::test]
 async fn worker_handles_stop_working_after_manager_drop() {
     let tmp = TempDir::new().unwrap();
-    let uv = recording_uv(&tmp, "exec sleep 300");
+    let uv = recording_uv(&tmp, ":");
     let scripts = scripts_dir(&tmp, &["test"]);
     let (builder, worker) = {
         let manager = manager_with_uv(&scripts, &uv).await;
@@ -467,7 +611,7 @@ async fn stdin_defaults_to_null_and_cwd_can_be_overridden() {
         r#"cat > /dev/null
 printf 'cwd=%s\npythonpath=%s\n' "$(pwd -P)" "$PYTHONPATH" > "$RUNPY_TEST_FACTS.tmp"
 mv "$RUNPY_TEST_FACTS.tmp" "$RUNPY_TEST_FACTS"
-exec sleep 300"#,
+cat /dev/null"#,
     );
     let scripts = scripts_dir(&tmp, &["managed"]);
     let manager = manager_with_uv(&scripts, &uv).await;
@@ -514,7 +658,7 @@ async fn worker_output_is_attributed_and_python_is_forced_unbuffered() {
         r#"printf '%s' "$PYTHONUNBUFFERED" > "$RUNPY_TEST_UNBUFFERED"
 printf 'startup stdout\n'
 printf 'startup stderr\n' >&2
-sleep 300"#,
+true"#,
     );
     let scripts = scripts_dir(&tmp, &["managed"]);
     let manager = manager_with_uv(&scripts, &uv).await;
@@ -567,7 +711,7 @@ async fn high_volume_worker_output_does_not_block_process_progress() {
         r#"dd if=/dev/zero bs=131072 count=1 2>/dev/null | tr '\0' x
 dd if=/dev/zero bs=131072 count=1 2>/dev/null | tr '\0' y >&2
 printf 'done' > "$RUNPY_TEST_OUTPUT_MARKER"
-sleep 300"#,
+true"#,
     );
     let scripts = scripts_dir(&tmp, &["managed"]);
     let manager = manager_with_uv(&scripts, &uv).await;
@@ -593,8 +737,7 @@ async fn uv_runner_receives_worker_arguments_and_termination_kills_process_group
         r#"printf '%s\n' "$@" > "$RUNPY_TEST_ARGS"
 sleep 300 &
 descendant=$!
-printf '%s' "$descendant" > "$RUNPY_TEST_DESCENDANT"
-wait "$descendant""#,
+printf '%s' "$descendant" > "$RUNPY_TEST_DESCENDANT""#,
     );
     let scripts = scripts_dir(&tmp, &["managed"]);
     let manager = manager_with_uv(&scripts, &uv).await;
@@ -645,12 +788,12 @@ wait "$descendant""#,
     assert!(process_exists(uv_pid));
     assert!(process_exists(descendant_pid));
 
-    // The fake runner never connects, so the terminate frame cannot be
-    // written; cleanup still stops the whole process group.
-    assert!(matches!(
-        worker.terminate().await,
-        Err(RunpyError::Timeout(TimeoutStage::Queued))
-    ));
+    // The worker exits on `terminate`; cleanup still stops the background
+    // descendant in the same process group.
+    let exit = worker.terminate().await.unwrap();
+    assert_eq!(exit.reason, ExitReason::Terminated);
+    assert_eq!(exit.worker_id, worker.id());
+    assert_eq!(worker.wait().await.unwrap(), exit);
     wait_for_process_exit(uv_pid).await;
     wait_for_process_exit(descendant_pid).await;
 }
@@ -710,10 +853,11 @@ async fn watchdog_cleanup_kills_descendants_after_uv_exits() {
     let tmp = TempDir::new().unwrap();
     let descendant_file = tmp.path().join("descendant-pid");
     let release_file = tmp.path().join("release-uv");
-    let uv = recording_uv(
+    let uv = uv_script(
         &tmp,
         r#"sleep 300 &
 printf '%s' "$!" > "$RUNPY_TEST_DESCENDANT"
+python3 "$FAKE_WORKER" "$@" &
 while [ ! -e "$RUNPY_TEST_RELEASE" ]; do sleep 0.01; done
 exit 0"#,
     );
@@ -770,7 +914,7 @@ exit 0"#,
 #[tokio::test]
 async fn one_watchdog_reports_workers_from_the_shared_control_plane() {
     let tmp = TempDir::new().unwrap();
-    let uv = recording_uv(&tmp, "exec sleep 300");
+    let uv = recording_uv(&tmp, ":");
     let scripts = scripts_dir(&tmp, &["first", "second"]);
     let manager = manager_with_uv(&scripts, &uv).await;
     let first = manager.worker("first").spawn().await.unwrap();

@@ -57,7 +57,10 @@ if __name__ == "__main__":
 
 The Manager supplies the socket path and trusted worker ID as positional
 arguments. Additional `--key=value` arguments become `Worker.extra`.
-`RunScript` constructs the class, sends `ready`, and runs the receive loop.
+`RunScript` constructs the class and calls `run()`, which first sends a
+versioned `ready` (`protocol_version` 1) and then runs the receive loop. The
+Rust Manager rejects a worker speaking another protocol version, so upgrade
+both packages together.
 
 ## Execution model
 
