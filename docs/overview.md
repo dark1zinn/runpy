@@ -156,7 +156,12 @@ it.
 Incoming worker envelopes are validated, then their `x_wid` and `x_spath` are
 overwritten with trusted Manager values. The current global handler runs first;
 the worker-specific handler captured at spawn runs second. These synchronous
-callbacks execute in the protocol task and should return promptly.
+callbacks execute in the protocol task and should return promptly. Both receive
+the same shared envelope (`InboundEnvelope::envelope` is an `Arc<Envelope>`),
+so dispatching to two handlers does not copy the JSON. A panic in either
+handler is caught and logged; the other handler and later envelopes are still
+dispatched. Runpy cannot interrupt a handler that blocks, so a blocking handler
+stalls that worker's inbound dispatch.
 
 Every outbound send is bounded. The envelope is validated, trust-stamped, and
 encoded first, so direction and frame-size errors return to the caller

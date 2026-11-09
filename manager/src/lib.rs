@@ -42,7 +42,8 @@
 //! `x_` namespace and stamps trusted worker/socket values at transport edges.
 //! Incoming messages reach the current Manager handler before the worker's
 //! per-worker handler. Both callbacks run synchronously in the protocol task
-//! and should return promptly.
+//! and should return promptly. A handler panic is caught and logged without
+//! ending the session or skipping the other handler.
 //!
 //! ## Worker process output
 //!
@@ -262,7 +263,8 @@ impl Manager {
     ///
     /// The current global handler runs before a worker-specific handler for
     /// every valid worker message. It executes synchronously in the protocol
-    /// task and should return promptly.
+    /// task and should return promptly. A panic is caught and logged; the
+    /// worker handler and later messages still run.
     ///
     /// ```no_run
     /// use runpy::Manager;

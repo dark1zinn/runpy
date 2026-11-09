@@ -310,6 +310,7 @@ fn validate_direction(
 /// Shared synchronous callback type for validated worker envelopes.
 ///
 /// Handlers should return promptly because they run in the protocol task.
+/// Runpy catches a handler panic so dispatch continues.
 pub type MessageHandler = Arc<dyn Fn(InboundEnvelope) + Send + Sync>;
 
 /// Operating-system stream that produced a [`WorkerOutput`] record.
@@ -352,7 +353,9 @@ pub type WorkerOutputHandler = Arc<dyn Fn(WorkerOutput) + Send + Sync>;
 #[derive(Clone)]
 pub struct InboundEnvelope {
     /// Received envelope, including trusted routing metadata.
-    pub envelope: Envelope,
+    ///
+    /// Shared between the global and per-worker handler without copying.
+    pub envelope: Arc<Envelope>,
     worker_id: String,
     mailer: Arc<Mailer>,
 }
@@ -1388,7 +1391,7 @@ impl ControlPlane {
                     envelope.stamp_trusted(&worker_id, &socket_path);
 
                     let inbound = InboundEnvelope {
-                        envelope,
+                        envelope: Arc::new(envelope),
                         worker_id: worker_id.clone(),
                         mailer: mailer.clone(),
                     };
@@ -1398,14 +1401,34 @@ impl ControlPlane {
                     let global_handler = control_plane.global_handler.read().clone();
                     drop(control_plane);
                     if let Some(handler) = global_handler {
-                        handler(inbound.clone());
+                        Self::dispatch_inbound(&logger, &worker_id, "global", &handler, inbound.clone());
                     }
                     if let Some(handler) = &worker_handler {
-                        handler(inbound);
+                        Self::dispatch_inbound(&logger, &worker_id, "worker", handler, inbound);
                     }
                 }
                 _ = &mut writer.0 => return ExitReason::Disconnected,
             }
+        }
+    }
+
+    /// Invoke one inbound handler, containing a panic so it cannot end the
+    /// session or skip the next handler and later envelopes.
+    fn dispatch_inbound(
+        logger: &Scribbler,
+        worker_id: &str,
+        kind: &str,
+        handler: &MessageHandler,
+        inbound: InboundEnvelope,
+    ) {
+        if catch_unwind(AssertUnwindSafe(|| handler(inbound))).is_err() {
+            logger.error_with(
+                "Protocol",
+                &format!(
+                    "Inbound message handler panicked; continuing dispatch \
+                     (handler: {kind}, worker: {worker_id})"
+                ),
+            );
         }
     }
 
@@ -2042,7 +2065,9 @@ mod tests {
         let (observed_tx, observed_rx) = std_mpsc::channel();
 
         control_plane.set_global_handler(Arc::new(move |inbound| {
-            observed_tx.send(inbound.envelope.clone()).unwrap();
+            observed_tx
+                .send(Envelope::clone(&inbound.envelope))
+                .unwrap();
             let source = inbound.envelope.data()["source"].clone();
             let _ = inbound
                 .reply(Envelope::execute(object(json!({ "source": source }))))
@@ -2090,6 +2115,58 @@ mod tests {
         );
         assert_eq!(observed[1].meta()["x_wid"], "worker-b");
 
+        control_plane.shutdown_now();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn handler_panics_do_not_end_the_session_or_skip_handlers() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let control_plane = test_control_plane(ProtocolLimits::default());
+        let global_calls = Arc::new(AtomicUsize::new(0));
+        let calls = global_calls.clone();
+        control_plane.set_global_handler(Arc::new(move |_| {
+            if calls.fetch_add(1, AtomicOrdering::SeqCst) == 0 {
+                panic!("intentional global handler panic");
+            }
+        }));
+        let (observed_tx, observed_rx) = std_mpsc::channel();
+        let worker_handler: MessageHandler = Arc::new(move |inbound| {
+            let sequence = inbound.envelope.data()["sequence"].as_u64().unwrap();
+            observed_tx.send(sequence).unwrap();
+            if sequence == 2 {
+                panic!("intentional worker handler panic");
+            }
+        });
+        let mut stream = register_worker(
+            &control_plane,
+            directory.path(),
+            "worker",
+            Some(worker_handler),
+        )
+        .await;
+        let _other = register_worker(&control_plane, directory.path(), "other", None).await;
+
+        for sequence in 1..=3 {
+            let envelope: Envelope = serde_json::from_value(json!({
+                "meta": {"x_op": "log"},
+                "data": {"sequence": sequence}
+            }))
+            .unwrap();
+            write_envelope(&mut stream, &envelope).await;
+        }
+
+        // The global panic did not skip the worker handler, and the worker
+        // panic did not stop dispatch of the next envelope.
+        for expected in 1..=3 {
+            assert_eq!(
+                observed_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+                expected
+            );
+        }
+        assert_eq!(global_calls.load(AtomicOrdering::SeqCst), 3);
+        assert!(control_plane.workers.read().contains_key("worker"));
+        assert!(control_plane.workers.read().contains_key("other"));
+        control_plane.send("worker", numbered(4)).await.unwrap();
         control_plane.shutdown_now();
     }
 
