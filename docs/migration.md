@@ -96,3 +96,9 @@ is now the null device by default instead of the Manager's stdin.
 - `retry` is no longer an operation and `Worker` no longer stores the last
   payload. `execute` envelopes carry `x_req`, and `done`/`error` echo it.
   `ready` advertises the `requests` capability.
+- The protocol adds `cancel` (Manager to worker) and `cancelled` (worker to
+  Manager), both carrying `x_req`. `RunpyOperation` includes them. The sync
+  `Worker` treats `cancel` as a protocol violation; the Manager never sends it
+  to workers that do not advertise the `cancel` capability.
+- `RunpyError` gains `Cancelled { request_id }`; exhaustive matches must
+  handle it.

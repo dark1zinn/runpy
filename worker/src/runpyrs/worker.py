@@ -1,6 +1,5 @@
 """Managed worker connection, protocol validation, and dispatch lifecycle."""
 
-import json
 import socket
 import threading
 from types import TracebackType
@@ -9,9 +8,13 @@ from typing import Dict, Optional, Type
 from ._protocol import (
     PROTOCOL_VERSION,
     FrameLimits,
-    decode_body,
+    decode_envelope,
     encode_frame,
+    error_data,
+    invalid_result,
+    operation_envelope,
     recv_frame,
+    stamp,
 )
 from .utils import (
     Data,
@@ -23,9 +26,7 @@ from .utils import (
 )
 
 
-_RUNPY_OPERATIONS = frozenset({"ready", "execute", "terminate", "done", "error", "log"})
 _MANAGER_OPERATIONS = frozenset({"execute", "terminate"})
-_RESERVED_KEYS = frozenset({"x_wid", "x_spath", "x_op", "x_req"})
 #: Capabilities this SDK advertises in ``ready``.
 _CAPABILITIES = ("requests",)
 
@@ -147,10 +148,7 @@ class Worker:
         happens before any byte is written, so an oversized or non-finite
         envelope raises ``ValueError`` and leaves the connection usable.
         """
-        meta = dict(envelope["meta"])
-        meta["x_wid"] = self.name
-        meta["x_spath"] = self.__sock_path
-        stamped: Envelope = {"meta": meta, "data": dict(envelope["data"])}
+        stamped = stamp(envelope, self.name, self.__sock_path)
         self._send_bytes(encode_frame(stamped, self._limits.max_frame_bytes))
 
     def _send_operation(
@@ -161,9 +159,7 @@ class Worker:
         meta: Optional[Meta] = None,
     ) -> None:
         """Build and send one Python-to-Manager operation envelope."""
-        envelope = create_envelope(data, meta)
-        envelope["meta"]["x_op"] = operation
-        self._send_envelope(envelope)
+        self._send_envelope(operation_envelope(operation, data, meta=meta))
 
     def send(self, data: Data, *, meta: Optional[Meta] = None) -> None:
         """Send an application-defined envelope without ``x_op``.
@@ -245,70 +241,17 @@ class Worker:
         The frame uses an 8-byte little-endian payload size followed by UTF-8
         JSON, bounded by the Manager-supplied size and partial-frame deadline.
         Invalid size, encoding, JSON, shape, metadata, or operation direction
-        raises ``ValueError``; a stalled frame raises ``TimeoutError``.
+        raises ``ValueError``; a stalled frame raises ``TimeoutError``. This
+        worker does not support ``cancel``, so it is a protocol violation.
         """
         payload = recv_frame(self.stream, self._limits)
         if payload is None:
             return None
-
-        try:
-            decoded = decode_body(payload)
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise ValueError(f"Invalid JSON envelope: {error}") from error
-
-        return self._validate_inbound(decoded)
-
-    @staticmethod
-    def _validate_inbound(value: object) -> Envelope:
-        """Validate the exact envelope shape and Manager operation boundary.
-
-        Custom envelopes omit ``x_op``. Only ``execute`` (which must carry a
-        ``x_req`` request ID) and ``terminate`` are valid internal operations
-        from Manager to worker.
-        """
-        if not isinstance(value, dict) or set(value) != {"meta", "data"}:
-            raise ValueError("Envelope must contain exactly 'meta' and 'data'")
-
-        meta = value["meta"]
-        data = value["data"]
-        if not isinstance(meta, dict) or not isinstance(data, dict):
-            raise ValueError("Envelope 'meta' and 'data' must be objects")
-
-        for key, item in meta.items():
-            if not key.startswith("x_"):
-                continue
-            if key not in _RESERVED_KEYS:
-                raise ValueError(f"Unknown Runpy metadata key '{key}'")
-            if not isinstance(item, str):
-                raise ValueError(f"Runpy metadata '{key}' must be a string")
-
-        operation = meta.get("x_op")
-        if operation is not None:
-            if operation not in _RUNPY_OPERATIONS:
-                raise ValueError(f"Unknown Runpy operation '{operation}'")
-            if operation not in _MANAGER_OPERATIONS:
-                raise ValueError(
-                    f"Runpy operation '{operation}' is invalid for manager-to-worker envelopes"
-                )
-            if operation == "execute" and not meta.get("x_req"):
-                raise ValueError("execute must carry a 'x_req' request ID")
-        if "x_req" in meta and operation != "execute":
-            raise ValueError("Only execute envelopes may carry 'x_req'")
-
-        return {"meta": dict(meta), "data": dict(data)}
+        return decode_envelope(payload, _MANAGER_OPERATIONS)
 
     def _send_result(self, operation: str, data: Data, request_id: str) -> None:
         """Send ``done`` or ``error`` correlated with ``request_id``."""
-        envelope = create_envelope(data)
-        envelope["meta"]["x_op"] = operation
-        envelope["meta"]["x_req"] = request_id
-        self._send_envelope(envelope)
-
-    @staticmethod
-    def _error_data(error: BaseException) -> Data:
-        """Structured error body; an empty message reports the type name."""
-        kind = type(error).__name__
-        return {"kind": kind, "message": str(error) or kind}
+        self._send_envelope(operation_envelope(operation, data, request_id=request_id))
 
     def _complete_execution(self, request_id: str, payload: Data) -> None:
         """Run one request and reply with ``done`` or ``error`` for it.
@@ -322,23 +265,17 @@ class Worker:
         try:
             result = self.execute(payload)
         except Exception as error:
-            self._send_result("error", self._error_data(error), request_id)
+            self._send_result("error", error_data(error), request_id)
             return
-        if result is not None and not isinstance(result, dict):
-            self._send_result(
-                "error",
-                {
-                    "kind": "TypeError",
-                    "message": "Worker.execute must return a dictionary or None",
-                },
-                request_id,
-            )
+        invalid = invalid_result(result, "Worker.execute")
+        if invalid is not None:
+            self._send_result("error", invalid, request_id)
             return
         try:
             self._send_result("done", result or {}, request_id)
         except (TypeError, ValueError) as error:
             # Encoding failed before any byte was written.
-            self._send_result("error", self._error_data(error), request_id)
+            self._send_result("error", error_data(error), request_id)
 
     def _dispatch(self, envelope: Envelope) -> None:
         """Dispatch one validated envelope to lifecycle or developer hooks."""
@@ -355,7 +292,7 @@ class Worker:
             self.handle_envelope(envelope)
         except Exception as error:
             # No request to answer: an unsolicited error without ``x_req``.
-            self._send_operation("error", self._error_data(error))
+            self._send_operation("error", error_data(error))
 
     def run(self) -> None:
         """Announce readiness, then receive and dispatch envelopes until

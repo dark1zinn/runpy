@@ -41,9 +41,18 @@ const X_WORKER_ID: &str = "x_wid";
 const X_SOCKET_PATH: &str = "x_spath";
 const X_OPERATION: &str = "x_op";
 const X_REQUEST: &str = "x_req";
-const OPERATIONS: &[&str] = &["ready", "execute", "terminate", "done", "error", "log"];
-const MANAGER_OPERATIONS: &[&str] = &["execute", "terminate"];
-const WORKER_OPERATIONS: &[&str] = &["ready", "done", "error", "log"];
+const OPERATIONS: &[&str] = &[
+    "ready",
+    "execute",
+    "cancel",
+    "terminate",
+    "done",
+    "error",
+    "cancelled",
+    "log",
+];
+const MANAGER_OPERATIONS: &[&str] = &["execute", "cancel", "terminate"];
+const WORKER_OPERATIONS: &[&str] = &["ready", "done", "error", "cancelled", "log"];
 
 const OUTPUT_QUEUE_CAPACITY: usize = 256;
 const OUTPUT_READ_BUFFER_SIZE: usize = 8 * 1024;
@@ -193,6 +202,15 @@ impl Envelope {
         envelope
     }
 
+    /// Internal `cancel` for one request; built only by [`crate::Canceller`].
+    pub(crate) fn cancel(id: &RequestId) -> Self {
+        let mut envelope = Self::with_operation("cancel", Data::new());
+        envelope
+            .meta
+            .insert(X_REQUEST.to_string(), Value::String(id.to_string()));
+        envelope
+    }
+
     /// Build a Manager-to-worker graceful `terminate` request.
     ///
     /// ```
@@ -284,7 +302,7 @@ fn validate_wire_meta(meta: &Meta) -> Result<(), EnvelopeError> {
     if meta.contains_key(X_REQUEST)
         && !matches!(
             meta.get(X_OPERATION).and_then(Value::as_str),
-            Some("execute" | "done" | "error")
+            Some("execute" | "done" | "error" | "cancel" | "cancelled")
         )
     {
         return Err(EnvelopeError::InvalidReservedMetadata(
@@ -474,6 +492,11 @@ pub(crate) struct MessageSender {
 }
 
 impl MessageSender {
+    /// Deadline the Manager allows for one send, also used for cancellation.
+    pub(crate) fn send_timeout(&self) -> Duration {
+        self.send_timeout
+    }
+
     fn encode(&self, mut envelope: Envelope) -> Result<(Vec<u8>, u32), RunpyError> {
         envelope.validate_manager_to_worker()?;
         envelope.stamp_trusted(&self.worker_id, &self.socket_path);
@@ -550,10 +573,10 @@ impl MessageSender {
 
     /// Reject internal request operations on the application send paths.
     fn application(envelope: &Envelope) -> Result<(), RunpyError> {
-        if envelope.operation() == Some("execute") {
+        if matches!(envelope.operation(), Some("execute" | "cancel")) {
             return Err(RunpyError::InvalidConfig(
-                "execute envelopes cannot be sent directly; use Worker::submit or \
-                 Worker::execute"
+                "execute and cancel envelopes cannot be sent directly; use Worker::submit, \
+                 Worker::execute, or Request::canceller"
                     .to_string(),
             ));
         }
@@ -1189,6 +1212,7 @@ impl ControlPlane {
             sender.clone(),
             request_queue,
             active_request.clone(),
+            observer.clone(),
         ));
         workers.insert(
             worker_id.clone(),
@@ -1664,6 +1688,12 @@ impl ControlPlane {
                     // observer runs. An `error` without `x_req` reports a
                     // custom-handler failure and only reaches observers.
                     let operation = envelope.operation();
+                    if operation == Some("cancelled")
+                        && let Err(problem) = Self::complete_cancellation(&envelope, &active_request)
+                    {
+                        logger.error_with("Protocol", &format!("{worker_id} {problem}"));
+                        return ExitReason::ProtocolViolation;
+                    }
                     if matches!(operation, Some("done" | "error")) {
                         match envelope.request_id() {
                             Some(id) => {
@@ -1713,6 +1743,36 @@ impl ControlPlane {
                 }
                 _ = &mut writer.0 => return ExitReason::Disconnected,
             }
+        }
+    }
+
+    /// Apply a worker's `cancelled` answer.
+    ///
+    /// `cancelled` completes the matching active request and confirms its
+    /// canceller. `already_finished` only acknowledges the `cancel`: the
+    /// request's own `done`/`error` came first, so it must not match (and
+    /// complete) the active request, which may be a newer one.
+    fn complete_cancellation(envelope: &Envelope, active: &ActiveSlot) -> Result<(), String> {
+        let Some(id) = envelope.request_id() else {
+            return Err("sent `cancelled` without a request ID".to_string());
+        };
+        let mut slot = active.lock();
+        let matches_active = slot.as_ref().is_some_and(|active| active.id.as_str() == id);
+        match envelope.data().get("status").and_then(Value::as_str) {
+            Some("cancelled") if matches_active => {
+                let active = slot.take().expect("matched an active request");
+                if let Some(confirm) = active.cancel {
+                    let _ = confirm.send(());
+                }
+                let _ = active.complete.send(Completion::Cancelled);
+                Ok(())
+            }
+            Some("cancelled") => Err(format!("cancelled request '{id}' that was not running")),
+            Some("already_finished") if matches_active => Err(format!(
+                "reported request '{id}' as finished without its result"
+            )),
+            Some("already_finished") => Ok(()),
+            _ => Err("sent `cancelled` without a valid status".to_string()),
         }
     }
 
@@ -3024,6 +3084,193 @@ mod tests {
     }
 
     const LONG: Duration = Duration::from_secs(10);
+
+    /// Register a worker whose `ready` advertises `cancel`.
+    async fn register_cancellable(
+        control_plane: &Arc<ControlPlane>,
+        directory: &std::path::Path,
+    ) -> UnixStream {
+        let (mut stream, mut lifecycle) =
+            register_unready(control_plane, directory, "worker", None).await;
+        let ready: Envelope = serde_json::from_value(json!({
+            "meta": {"x_op": "ready"},
+            "data": {"protocol_version": 1, "capabilities": ["requests", "cancel"]}
+        }))
+        .unwrap();
+        write_envelope(&mut stream, &ready).await;
+        lifecycle
+            .wait_for(|state| matches!(state, LifecycleState::Ready { .. }))
+            .await
+            .unwrap();
+        stream
+    }
+
+    async fn expect_cancel(stream: &mut UnixStream, id: &str) {
+        let envelope = timeout(Duration::from_secs(2), read_envelope(stream))
+            .await
+            .expect("expected a cancel frame");
+        assert_eq!(envelope.meta()["x_op"], "cancel");
+        assert_eq!(envelope.meta()["x_req"], id);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn queued_request_is_cancelled_locally_and_never_sent() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let control_plane = test_control_plane(ProtocolLimits::default());
+        let mut stream = register_cancellable(&control_plane, directory.path()).await;
+        let busy = control_plane
+            .submit("worker", payload(1), LONG)
+            .await
+            .unwrap();
+        let queued = control_plane
+            .submit("worker", payload(2), LONG)
+            .await
+            .unwrap();
+        let (busy_id, _) = read_request(&mut stream).await;
+
+        assert_eq!(
+            queued.canceller().cancel().await.unwrap(),
+            crate::request::Cancellation::Cancelled
+        );
+        assert!(matches!(
+            queued.result().await,
+            Err(RunpyError::Cancelled { .. })
+        ));
+        answer(&mut stream, "done", Some(&busy_id), payload(1)).await;
+        busy.result().await.unwrap();
+        assert_idle(&mut stream).await;
+        control_plane.shutdown_now();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn running_request_is_cancelled_only_after_the_worker_confirms() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let control_plane = test_control_plane(ProtocolLimits::default());
+        let mut stream = register_cancellable(&control_plane, directory.path()).await;
+        let request = control_plane
+            .submit("worker", payload(1), LONG)
+            .await
+            .unwrap();
+        let canceller = request.canceller();
+        let (id, _) = read_request(&mut stream).await;
+
+        let cancelling = tokio::spawn(async move { canceller.cancel().await });
+        expect_cancel(&mut stream, &id).await;
+        assert!(
+            !cancelling.is_finished(),
+            "cancel reported before the worker stopped"
+        );
+        answer(
+            &mut stream,
+            "cancelled",
+            Some(&id),
+            object(json!({"status": "cancelled"})),
+        )
+        .await;
+        assert_eq!(
+            cancelling.await.unwrap().unwrap(),
+            crate::request::Cancellation::Cancelled
+        );
+        assert!(matches!(
+            request.result().await,
+            Err(RunpyError::Cancelled { .. })
+        ));
+
+        // The worker is free for the next request.
+        let next = control_plane
+            .submit("worker", payload(2), LONG)
+            .await
+            .unwrap();
+        let (next_id, _) = read_request(&mut stream).await;
+        answer(&mut stream, "done", Some(&next_id), payload(2)).await;
+        next.result().await.unwrap();
+        control_plane.shutdown_now();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn late_cancel_reports_already_finished_and_keeps_the_result() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let control_plane = test_control_plane(ProtocolLimits::default());
+        let mut stream = register_cancellable(&control_plane, directory.path()).await;
+        let request = control_plane
+            .submit("worker", payload(1), LONG)
+            .await
+            .unwrap();
+        let canceller = request.canceller();
+        let (id, _) = read_request(&mut stream).await;
+
+        let cancelling = tokio::spawn(async move { canceller.cancel().await });
+        expect_cancel(&mut stream, &id).await;
+        // The request finished before the worker saw `cancel`.
+        answer(&mut stream, "done", Some(&id), payload(5)).await;
+        answer(
+            &mut stream,
+            "cancelled",
+            Some(&id),
+            object(json!({"status": "already_finished"})),
+        )
+        .await;
+        assert_eq!(
+            cancelling.await.unwrap().unwrap(),
+            crate::request::Cancellation::AlreadyFinished
+        );
+        assert_eq!(request.result().await.unwrap()["value"], 5);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(control_plane.workers.read().contains_key("worker"));
+        control_plane.shutdown_now();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancel_needs_capability_and_a_confirmation_in_time() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let queue = QueueLimits {
+            send_timeout: Duration::from_millis(200),
+            ..QueueLimits::default()
+        };
+        let control_plane = ControlPlane::new(test_logger(), ProtocolLimits::default(), queue);
+        let mut plain = register_worker(&control_plane, directory.path(), "plain", None).await;
+        let request = control_plane
+            .submit("plain", payload(1), LONG)
+            .await
+            .unwrap();
+        read_request(&mut plain).await;
+        assert!(matches!(
+            request.canceller().cancel().await,
+            Err(RunpyError::Unsupported(_))
+        ));
+
+        let mut stream = register_cancellable(&control_plane, directory.path()).await;
+        let stubborn = control_plane
+            .submit("worker", payload(1), LONG)
+            .await
+            .unwrap();
+        let (id, _) = read_request(&mut stream).await;
+        // The worker never confirms: the request keeps its worker busy.
+        assert!(matches!(
+            stubborn.canceller().cancel().await,
+            Err(RunpyError::Timeout(TimeoutStage::Response))
+        ));
+        expect_cancel(&mut stream, &id).await;
+        answer(&mut stream, "done", Some(&id), payload(1)).await;
+        stubborn.result().await.unwrap();
+        control_plane.shutdown_now();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancelled_for_a_request_that_is_not_running_is_a_violation() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let control_plane = test_control_plane(ProtocolLimits::default());
+        let mut stream = register_cancellable(&control_plane, directory.path()).await;
+        answer(
+            &mut stream,
+            "cancelled",
+            Some("9"),
+            object(json!({"status": "cancelled"})),
+        )
+        .await;
+        wait_for_removal(&control_plane, "worker").await;
+        control_plane.shutdown_now();
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn requests_run_one_at_a_time_and_return_their_own_results() {

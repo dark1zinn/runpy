@@ -121,7 +121,7 @@ pub use protocol::{
     Data, Envelope, EnvelopeError, InboundEnvelope, MessageHandler, Meta, SendReceipt,
     WorkerOutput, WorkerOutputHandler, WorkerOutputStream,
 };
-pub use request::{RemoteError, Request, RequestId};
+pub use request::{Cancellation, Canceller, RemoteError, Request, RequestId};
 pub use scribbler::{LogLevel, Scribbler};
 pub use watchdog::{ProcessState, WatchdogService as Watchdog, WorkerReport};
 

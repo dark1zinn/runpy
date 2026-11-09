@@ -128,6 +128,12 @@ pub enum RunpyError {
         /// Worker that was running it.
         worker_id: String,
     },
+    /// The request was cancelled: it never ran, or the worker confirmed it
+    /// stopped.
+    Cancelled {
+        /// The cancelled request.
+        request_id: RequestId,
+    },
 }
 
 impl fmt::Display for RunpyError {
@@ -179,6 +185,7 @@ impl fmt::Display for RunpyError {
                 "worker '{worker_id}' stopped while running request {request_id}; \
                  its outcome is unknown"
             ),
+            Self::Cancelled { request_id } => write!(f, "request {request_id} was cancelled"),
         }
     }
 }

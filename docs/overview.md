@@ -289,6 +289,32 @@ cannot be sent through `send_message` or `reply`.
 A message without `x_op` is passed once to `Worker.handle_envelope`. The method
 can reply with `Worker.send` or emit a structured `Worker.log` envelope.
 
+#### Cancellation
+
+`Request::canceller()` returns a `Canceller` that can stop the request while
+another task awaits `Request::result`. A queued request is cancelled locally:
+it never runs and its result is `Cancelled`. A running request can be
+cancelled only on a worker that advertised `cancel` (the Python
+`AsyncWorker`); otherwise `cancel` returns `Unsupported`. Runpy sends `cancel`
+and waits, within `send_timeout`, for the worker to confirm with `cancelled`:
+`Cancellation::Cancelled` is reported only after the worker stopped the
+request, and its result is `RunpyError::Cancelled`. If the request finished
+first, the result is kept and `cancel` returns `AlreadyFinished`. If the
+worker does not confirm in time (cancellation is cooperative), `cancel`
+returns `Timeout(Response)` and the worker stays occupied until the request
+ends. A deadline alone never sends `cancel`, and a cancelled request is never
+retried.
+
+```rust
+let request = worker.submit(data, Duration::from_secs(60)).await?;
+let canceller = request.canceller();
+tokio::spawn(async move { canceller.cancel().await });
+match request.result().await {
+    Err(RunpyError::Cancelled { .. }) => println!("stopped"),
+    other => println!("{other:?}"),
+}
+```
+
 ### 7. Terminate and clean up
 
 `Worker::terminate` starts a two-second shutdown grace. It immediately refuses
@@ -494,7 +520,7 @@ reject such keys. At each outbound transport edge, Runpy stamps `x_wid` and
 | `x_wid` | Manager-generated identity for the running worker. |
 | `x_spath` | Manager-bound socket path for that worker. |
 | `x_op` | Optional lifecycle operation; absence denotes a custom envelope. |
-| `x_req` | Manager-generated request ID; only on `execute`, `done`, and `error`. |
+| `x_req` | Manager-generated request ID; only on `execute`, `cancel`, `done`, `error`, and `cancelled`. |
 
 Reserved fields must be strings. Unknown `x_` fields and unknown operations
 are protocol errors.
@@ -505,9 +531,11 @@ are protocol errors.
 | --- | --- | --- |
 | `ready` | Python → Rust | First envelope: `protocol_version` and `capabilities`. Consumed by Runpy, not dispatched. |
 | `execute` | Rust → Python | Calls `Worker.execute(data)` for request `x_req`. |
+| `cancel` | Rust → Python | Cancels request `x_req`; sent only to workers advertising `cancel`. |
 | `terminate` | Rust → Python | Stops the Python receive loop and closes its socket. |
 | `done` | Python → Rust | Carries the direct dictionary execution result. |
 | `error` | Python → Rust | Carries `data.kind` (exception type) and `data.message` for an execution or dispatch failure. |
+| `cancelled` | Python → Rust | Answers `cancel` for `x_req`: `{"status": "cancelled"}` ends the request; `{"status": "already_finished"}` only acknowledges it. |
 | `log` | Python → Rust | Carries developer-selected structured log data. |
 
 A known operation sent in the wrong direction is a protocol violation: the

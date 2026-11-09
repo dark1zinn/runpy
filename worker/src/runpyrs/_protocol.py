@@ -7,6 +7,7 @@ enforce the same maximum body size and partial-frame deadline.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import select
@@ -14,11 +15,22 @@ import socket
 import struct
 import time
 from dataclasses import dataclass
-from typing import Mapping, Optional
+from typing import FrozenSet, Mapping, Optional
+
+from .utils import Data, Envelope, Meta, create_envelope
 
 DEFAULT_MAX_FRAME_BYTES = 8 * 1024 * 1024
 DEFAULT_FRAME_TIMEOUT_MS = 30_000
 PROTOCOL_VERSION = 1
+
+#: Every operation the protocol defines.
+RUNPY_OPERATIONS = frozenset(
+    {"ready", "execute", "cancel", "terminate", "done", "error", "cancelled", "log"}
+)
+#: Metadata keys Runpy reserves; values must be strings.
+RESERVED_KEYS = frozenset({"x_wid", "x_spath", "x_op", "x_req"})
+#: Manager operations that address one request.
+_REQUEST_OPERATIONS = frozenset({"execute", "cancel"})
 ENV_MAX_FRAME_BYTES = "RUNPY_MAX_FRAME_BYTES"
 ENV_FRAME_TIMEOUT_MS = "RUNPY_FRAME_TIMEOUT_MS"
 
@@ -145,3 +157,121 @@ def recv_frame(stream: socket.socket, limits: FrameLimits) -> Optional[bytes]:
             f"Frame body of {size} bytes exceeds the {limits.max_frame_bytes}-byte limit"
         )
     return _recv_until(stream, size, deadline)
+
+
+async def recv_frame_async(
+    reader: asyncio.StreamReader, limits: FrameLimits
+) -> Optional[bytes]:
+    """Asynchronous :func:`recv_frame` for an asyncio stream, same contract."""
+    first = await reader.read(1)
+    if not first:
+        return None
+
+    async def rest() -> bytes:
+        try:
+            header = first + await reader.readexactly(_HEADER.size - 1)
+            size = _HEADER.unpack(header)[0]
+            if size == 0:
+                raise ValueError("Frame declares an empty body")
+            if size > limits.max_frame_bytes:
+                raise FrameTooLargeError(
+                    f"Frame body of {size} bytes exceeds the {limits.max_frame_bytes}-byte limit"
+                )
+            return await reader.readexactly(size)
+        except asyncio.IncompleteReadError as error:
+            raise ConnectionError("Connection closed during a frame") from error
+
+    try:
+        return await asyncio.wait_for(rest(), limits.frame_timeout)
+    except asyncio.TimeoutError as error:
+        raise TimeoutError("Frame did not complete before the frame timeout") from error
+
+
+def decode_envelope(payload: bytes, manager_operations: FrozenSet[str]) -> Envelope:
+    """Decode and validate one Manager-to-worker frame body.
+
+    Raises:
+        ValueError: For invalid UTF-8 or JSON, a wrong envelope shape,
+            invalid reserved metadata, or an operation outside
+            ``manager_operations``.
+    """
+    try:
+        decoded = decode_body(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"Invalid JSON envelope: {error}") from error
+    return validate_inbound(decoded, manager_operations)
+
+
+def validate_inbound(value: object, manager_operations: FrozenSet[str]) -> Envelope:
+    """Validate the exact envelope shape and Manager operation boundary.
+
+    Custom envelopes omit ``x_op``. ``execute`` and ``cancel`` must carry a
+    ``x_req`` request ID, and no other Manager operation may carry one.
+    """
+    if not isinstance(value, dict) or set(value) != {"meta", "data"}:
+        raise ValueError("Envelope must contain exactly 'meta' and 'data'")
+
+    meta = value["meta"]
+    data = value["data"]
+    if not isinstance(meta, dict) or not isinstance(data, dict):
+        raise ValueError("Envelope 'meta' and 'data' must be objects")
+
+    for key, item in meta.items():
+        if not key.startswith("x_"):
+            continue
+        if key not in RESERVED_KEYS:
+            raise ValueError(f"Unknown Runpy metadata key '{key}'")
+        if not isinstance(item, str):
+            raise ValueError(f"Runpy metadata '{key}' must be a string")
+
+    operation = meta.get("x_op")
+    if operation is not None:
+        if operation not in RUNPY_OPERATIONS:
+            raise ValueError(f"Unknown Runpy operation '{operation}'")
+        if operation not in manager_operations:
+            raise ValueError(
+                f"Runpy operation '{operation}' is invalid for manager-to-worker envelopes"
+            )
+    requires_id = operation in _REQUEST_OPERATIONS
+    if requires_id and not meta.get("x_req"):
+        raise ValueError(f"{operation} must carry a 'x_req' request ID")
+    if "x_req" in meta and not requires_id:
+        raise ValueError("Only execute and cancel envelopes may carry 'x_req'")
+
+    return {"meta": dict(meta), "data": dict(data)}
+
+
+def error_data(error: BaseException) -> Data:
+    """Structured error body; an empty message reports the type name."""
+    kind = type(error).__name__
+    return {"kind": kind, "message": str(error) or kind}
+
+
+def operation_envelope(
+    operation: str,
+    data: Data,
+    *,
+    meta: Optional[Meta] = None,
+    request_id: Optional[str] = None,
+) -> Envelope:
+    """Build a worker-to-Manager operation envelope."""
+    envelope = create_envelope(data, meta)
+    envelope["meta"]["x_op"] = operation
+    if request_id is not None:
+        envelope["meta"]["x_req"] = request_id
+    return envelope
+
+
+def stamp(envelope: Envelope, name: str, sock_path: str) -> Envelope:
+    """Copy ``envelope`` with this connection's trusted identity fields."""
+    meta = dict(envelope["meta"])
+    meta["x_wid"] = name
+    meta["x_spath"] = sock_path
+    return {"meta": meta, "data": dict(envelope["data"])}
+
+
+def invalid_result(result: object, hook: str) -> Optional[Data]:
+    """Error data when an ``execute`` result is not a dictionary or None."""
+    if result is None or isinstance(result, dict):
+        return None
+    return {"kind": "TypeError", "message": f"{hook} must return a dictionary or None"}
