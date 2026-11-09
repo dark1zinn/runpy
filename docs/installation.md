@@ -21,9 +21,10 @@ For architecture, lifecycle, protocol, and operations details, see the
 - Python 3.10 or newer for the `runpyrs` SDK. `uv` can install the Python
   version declared by each worker.
 
-The repository development environment requires `uv >= 0.11.2`. At runtime,
-Runpy executes the configured binary with `uv --version` and requires a
-successful exit status; it does not parse or compare the reported version.
+Developing this repository requires uv 0.10 or newer (see
+[Contributor setup](#contributor-setup)). At runtime, Runpy executes the
+configured binary with `uv --version` and requires a successful exit status;
+it does not parse or compare the reported version.
 
 ## Install the Rust crate
 
@@ -155,3 +156,26 @@ Runpy forces `PYTHONUNBUFFERED=1`, captures both process streams, and owns the
 worker process group until explicit termination or Manager drop. Continue with
 the [project overview](overview.md) for message routing, output guarantees, and
 shutdown behavior.
+
+## Contributor setup
+
+Two equivalent paths prepare a checkout for development.
+
+**Nix and direnv.** `flake.nix` provides Rust 1.93.0 (rustfmt, Clippy,
+rust-src), rust-analyzer, cargo-deny, cargo-edit, cargo-watch, Python 3.14,
+uv, git, gh, and actionlint. With direnv, `.envrc` enters that shell, runs
+`uv sync --frozen --all-packages --group dev --python 3.14`, and activates
+`.venv`; it re-runs when `pyproject.toml`, `worker/pyproject.toml`, or
+`uv.lock` change. `nix flake check` verifies the shell's tool versions on the
+host system. Shells evaluate for x86_64/aarch64 Linux and macOS; CI executes
+them on x86_64 Linux and Apple Silicon macOS only.
+
+**uv only.** Install Rust 1.93.0 or newer and uv 0.10 or newer, then:
+
+```bash
+uv sync --all-packages --group dev
+```
+
+Python development tools (pytest, Ruff, mypy, Hypothesis, build, pip-audit)
+live in the root `dev` dependency group of the uv workspace and are pinned by
+`uv.lock`; uv itself is a bootstrap tool, not a project dependency.

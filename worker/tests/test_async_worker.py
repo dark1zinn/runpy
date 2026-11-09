@@ -232,16 +232,22 @@ def test_second_execute_while_running_is_a_protocol_violation():
 
 
 class Blocked(AsyncWorker):
+    started: asyncio.Event
+
     async def handle_envelope(self, envelope):
+        Blocked.started.set()
         await asyncio.sleep(3600)
 
 
 def test_full_custom_queue_reports_queue_full_and_control_stays_responsive():
     async def scenario():
+        Blocked.started = asyncio.Event()
         manager, _, task, _ = await connect(Blocked)
-        # One envelope occupies the handler, then the queue fills.
-        for index in range(CUSTOM_QUEUE_CAPACITY + 2):
-            await manager.send({"index": index})
+        # One envelope occupies the handler, then exactly one overflows.
+        await manager.send({"index": 0})
+        await asyncio.wait_for(Blocked.started.wait(), TIMEOUT)
+        for index in range(CUSTOM_QUEUE_CAPACITY + 1):
+            await manager.send({"index": index + 1})
         error = await manager.recv()
         assert error["meta"]["x_op"] == "error"
         assert "x_req" not in error["meta"]

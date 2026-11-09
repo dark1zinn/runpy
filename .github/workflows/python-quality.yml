@@ -74,9 +74,7 @@ jobs:
           examples/playground/worker/my_script.py
 
       - name: Run tests
-        run: >-
-          uv run --frozen --python 3.10 --package runpyrs --extra dev
-          pytest worker/tests
+        run: uv run --frozen --all-packages --python 3.10 pytest worker/tests
 
       - name: Test the pre-commit hook
-        run: uv run --frozen --python 3.10 pytest tests/hooks
+        run: uv run --frozen --all-packages --python 3.10 pytest tests/hooks

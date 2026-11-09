@@ -8,9 +8,12 @@ members = ["worker"]
 
 [dependency-groups]
 dev = [
+    "build>=1.6.1",
+    "hypothesis>=6.168.5",
+    "mypy>=2.4.1",
+    "pip-audit>=2.10.1",
     "pytest>=9.0.2",
     "ruff>=0.15.8",
-    "uv>=0.11.2",
 ]
 
 [tool.ruff]

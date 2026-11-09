@@ -10,9 +10,6 @@ authors = [
 ]
 dependencies = []
 
-[project.optional-dependencies]
-dev = ["pytest>=7.0"]
-
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
@@ -21,13 +18,6 @@ build-backend = "hatchling.build"
 packages = ["src/runpyrs"]
 # This ensures it also ends up in the built distributions.
 include = ["../LICENSE"]
-
-[dependency-groups]
-dev = [
-    "hypothesis>=6.168.5",
-    "pytest>=9.0.2",
-    "uv>=0.11.2",
-]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -34,7 +34,15 @@ def clone(tmp_path: Path) -> Path:
     git(target, "config", "user.name", "hook test")
     shutil.copy2(HOOK, target / ".githooks" / "pre-commit")
     git(target, "add", ".githooks/pre-commit")
-    git(target, "commit", "--quiet", "--no-verify", "-m", "install hook under test")
+    git(
+        target,
+        "commit",
+        "--quiet",
+        "--no-verify",
+        "--allow-empty",
+        "-m",
+        "install hook under test",
+    )
     return target
 
 

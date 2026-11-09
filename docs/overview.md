@@ -794,10 +794,11 @@ Applications install pinned Git revisions instead (see the
 Run Python validation from the repository root:
 
 ```bash
-uv run --frozen --python 3.10 ruff format --check worker/src/runpyrs worker/tests tests examples/playground/worker/my_script.py
-uv run --frozen --python 3.10 ruff check worker/src/runpyrs worker/tests tests examples/playground/worker/my_script.py
-uv run --frozen --python 3.10 --package runpyrs --extra dev pytest worker/tests
-uv run --frozen --python 3.10 pytest tests/hooks
+uv run --frozen ruff format --check worker/src/runpyrs worker/tests tests examples/playground/worker/my_script.py
+uv run --frozen ruff check worker/src/runpyrs worker/tests tests examples/playground/worker/my_script.py
+uv run --frozen --all-packages pytest worker/tests tests/hooks
+# Against the minimum Python without replacing .venv:
+uv run --frozen --all-packages --isolated --python 3.10 pytest worker/tests
 ```
 
 `tests/protocol_vectors.json` holds wire vectors that both languages must
