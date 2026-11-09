@@ -19,7 +19,7 @@ fn write_executable(tmp: &TempDir, name: &str, body: &str) -> PathBuf {
     path
 }
 
-fn fake_uv(tmp: &TempDir) -> PathBuf {
+pub(crate) fn fake_uv(tmp: &TempDir) -> PathBuf {
     write_executable(
         tmp,
         "uv",
@@ -29,10 +29,14 @@ fn fake_uv(tmp: &TempDir) -> PathBuf {
 
 /// Minimal stand-in for a Python SDK worker: connects to the socket Runpy
 /// passes after `--script <file>`, announces `ready` with the `requests`
-/// capability, echoes each `execute` payload back as `done`, and runs until
-/// it receives `terminate` or the connection closes.
+/// capability, and answers each `execute` with `done` carrying the input as
+/// `echo` plus its `pid`, until it receives `terminate` or the connection
+/// closes. Optional `execute` data drives tests: `record` appends
+/// `start|end <pid> <time>` lines to a file, `barrier` + `parties` waits until
+/// that many workers reached the barrier directory, and `sleep` delays the
+/// answer.
 const FAKE_WORKER: &str = r#"
-import json, socket, struct, sys
+import json, os, socket, struct, sys, time
 args = sys.argv[1:]
 index = args.index("--script")
 sock_path = args[index + 2]
@@ -50,6 +54,9 @@ def read(size):
             sys.exit(0)
         data += chunk
     return data
+def record(path, event):
+    with open(path, "a") as log:
+        log.write(f"{event} {os.getpid()} {time.time()}\n")
 while True:
     (size,) = struct.unpack("<Q", read(8))
     envelope = json.loads(read(size))
@@ -57,7 +64,19 @@ while True:
     if operation == "terminate":
         sys.exit(0)
     if operation == "execute":
-        send({"x_op": "done", "x_req": envelope["meta"]["x_req"]}, {"echo": envelope["data"]})
+        data = envelope["data"]
+        if "record" in data:
+            record(data["record"], "start")
+        if "barrier" in data:
+            open(os.path.join(data["barrier"], str(os.getpid())), "w").close()
+            deadline = time.time() + 5
+            while len(os.listdir(data["barrier"])) < data["parties"] and time.time() < deadline:
+                time.sleep(0.01)
+        time.sleep(data.get("sleep", 0))
+        if "record" in data:
+            record(data["record"], "end")
+        result = {"echo": data, "pid": os.getpid()}
+        send({"x_op": "done", "x_req": envelope["meta"]["x_req"]}, result)
 "#;
 
 /// A fake uv whose launch runs `body` and then hands over to the fake worker.
@@ -86,7 +105,7 @@ fn recording_uv(tmp: &TempDir, body: &str) -> PathBuf {
     )
 }
 
-fn scripts_dir(tmp: &TempDir, names: &[&str]) -> PathBuf {
+pub(crate) fn scripts_dir(tmp: &TempDir, names: &[&str]) -> PathBuf {
     let scripts = tmp.path().join("scripts");
     fs::create_dir_all(&scripts).unwrap();
     for name in names {
@@ -506,7 +525,7 @@ exec python3 "$FAKE_WORKER" "$@""#,
 
 /// A fake uv that records each launch in `launches` and fails at once when
 /// `RUNPY_TEST_MODE=exit`; otherwise it becomes a ready worker.
-fn counting_uv(tmp: &TempDir, launches: &Path) -> PathBuf {
+pub(crate) fn counting_uv(tmp: &TempDir, launches: &Path) -> PathBuf {
     uv_script(
         tmp,
         &format!(
@@ -516,7 +535,7 @@ fn counting_uv(tmp: &TempDir, launches: &Path) -> PathBuf {
     )
 }
 
-fn launch_count(launches: &Path) -> usize {
+pub(crate) fn launch_count(launches: &Path) -> usize {
     fs::read_to_string(launches)
         .map(|text| text.lines().count())
         .unwrap_or(0)

@@ -105,6 +105,84 @@ pub(crate) struct PendingRequest {
     _permit: Arc<OwnedSemaphorePermit>,
 }
 
+impl PendingRequest {
+    /// End-to-end deadline of this request.
+    pub(crate) fn deadline(&self) -> Instant {
+        self.deadline
+    }
+
+    /// Whether the caller already gave up while the request was queued.
+    pub(crate) fn is_abandoned(&self) -> bool {
+        self.state.load(Ordering::Acquire) == ABANDONED
+    }
+
+    /// Fail a request that never reached a worker. No-op if the caller
+    /// already abandoned it, since its handle reports the timeout itself.
+    pub(crate) fn fail_unsent(self, error: RunpyError) {
+        if self
+            .state
+            .compare_exchange(QUEUED, ABANDONED, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            let _ = self.reply.send(Err(error));
+        }
+    }
+
+    /// Split a pooled request into the copy handed to one worker's
+    /// dispatcher and a [`Relay`] that forwards its outcome to the caller.
+    ///
+    /// The pool awaits the returned receiver, so it learns when the worker
+    /// finished even after the caller stopped waiting.
+    pub(crate) fn relay(self) -> (Self, oneshot::Receiver<Result<Data, RunpyError>>, Relay) {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let relay = Relay {
+            id: self.id.clone(),
+            state: self.state.clone(),
+            reply: self.reply,
+        };
+        let inner = Self {
+            id: self.id,
+            data: self.data,
+            deadline: self.deadline,
+            state: self.state,
+            reply: reply_tx,
+            _permit: self._permit,
+        };
+        (inner, reply_rx, relay)
+    }
+}
+
+/// Caller-facing end of a pooled request, see [`PendingRequest::relay`].
+pub(crate) struct Relay {
+    id: RequestId,
+    state: Arc<AtomicU8>,
+    reply: oneshot::Sender<Result<Data, RunpyError>>,
+}
+
+impl Relay {
+    /// Forward the worker's outcome. A dropped dispatcher reply means the
+    /// worker stopped: the outcome is unknown only if the request was sent.
+    pub(crate) fn finish(
+        self,
+        outcome: Result<Result<Data, RunpyError>, oneshot::error::RecvError>,
+        worker_id: &str,
+    ) {
+        let outcome = outcome.unwrap_or_else(|_| {
+            Err(if self.state.load(Ordering::Acquire) == DISPATCHED {
+                RunpyError::OutcomeUnknown {
+                    request_id: self.id,
+                    worker_id: worker_id.to_string(),
+                }
+            } else {
+                RunpyError::WorkerExited {
+                    worker_id: worker_id.to_string(),
+                }
+            })
+        });
+        let _ = self.reply.send(outcome);
+    }
+}
+
 /// Handle to one submitted request.
 ///
 /// Dropping it discards the result but does not cancel execution; the worker

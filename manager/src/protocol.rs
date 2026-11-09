@@ -980,6 +980,11 @@ impl ControlPlane {
         self.limits
     }
 
+    /// Manager-wide bound on worker processes.
+    pub(crate) fn max_workers(&self) -> usize {
+        self.queue.max_workers
+    }
+
     pub(crate) fn logger(&self) -> &Scribbler {
         &self.logger
     }
@@ -1240,10 +1245,7 @@ impl ControlPlane {
             }
             handle.requests.clone()
         };
-        let permit = timeout_at(deadline, self.request_budget.clone().acquire_owned())
-            .await
-            .map_err(|_| RunpyError::Timeout(TimeoutStage::Admission))?
-            .map_err(|_| RunpyError::ManagerClosed)?;
+        let permit = self.admit_request(deadline).await?;
         let id = self.next_request_id()?;
         let (request, pending) = Request::new(id, worker_id.to_string(), data, deadline, permit);
         queue.send(pending).map_err(|_| RunpyError::WorkerExited {
@@ -1252,8 +1254,43 @@ impl ControlPlane {
         Ok(request)
     }
 
+    /// Reserve one Manager-wide pending-request slot within `deadline`.
+    pub(crate) async fn admit_request(
+        &self,
+        deadline: Instant,
+    ) -> Result<OwnedSemaphorePermit, RunpyError> {
+        timeout_at(deadline, self.request_budget.clone().acquire_owned())
+            .await
+            .map_err(|_| RunpyError::Timeout(TimeoutStage::Admission))?
+            .map_err(|_| RunpyError::ManagerClosed)
+    }
+
+    /// Reserve a pending-request slot without waiting.
+    pub(crate) fn try_admit_request(&self) -> Result<OwnedSemaphorePermit, RunpyError> {
+        self.request_budget
+            .clone()
+            .try_acquire_owned()
+            .map_err(|error| match error {
+                TryAcquireError::NoPermits => RunpyError::QueueFull,
+                TryAcquireError::Closed => RunpyError::ManagerClosed,
+            })
+    }
+
+    /// Hand an already-admitted request to a worker's dispatcher. If the
+    /// worker is gone the request is dropped, which its waiter observes.
+    pub(crate) fn enqueue(&self, worker_id: &str, pending: PendingRequest) {
+        let queue = self
+            .workers
+            .read()
+            .get(worker_id)
+            .map(|handle| handle.requests.clone());
+        if let Some(queue) = queue {
+            let _ = queue.send(pending);
+        }
+    }
+
     /// Allocate a request ID, failing rather than wrapping when exhausted.
-    fn next_request_id(&self) -> Result<RequestId, RunpyError> {
+    pub(crate) fn next_request_id(&self) -> Result<RequestId, RunpyError> {
         self.next_request
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |id| id.checked_add(1))
             .map(RequestId::new)

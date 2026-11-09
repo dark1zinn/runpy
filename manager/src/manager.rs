@@ -197,6 +197,11 @@ impl WorkerBuilder {
         self
     }
 
+    /// Whether this builder was created by the Manager owning `control_plane`.
+    pub(crate) fn belongs_to(&self, control_plane: &Arc<ControlPlane>) -> bool {
+        std::ptr::eq(self.control_plane.as_ptr(), Arc::as_ptr(control_plane))
+    }
+
     /// Launch the configured script and register it with the Manager.
     ///
     /// The script name must be a single path component naming a root-level
@@ -212,8 +217,10 @@ impl WorkerBuilder {
     /// [`RunpyError::ManagerClosed`] after Manager drop or during shutdown,
     /// [`RunpyError::InvalidScript`] for a bad or missing script,
     /// [`RunpyError::ScriptsDirectory`] or [`RunpyError::UvUnavailable`] when
-    /// a path cannot be resolved, and [`RunpyError::Io`] when the socket,
-    /// process, or pipes cannot be set up.
+    /// a path cannot be resolved, [`RunpyError::Timeout`] with
+    /// [`TimeoutStage::Admission`] when no worker slot frees up within the
+    /// startup timeout, and [`RunpyError::Io`] when the socket, process, or
+    /// pipes cannot be set up.
     pub async fn spawn(self) -> Result<Worker, RunpyError> {
         let script_name = Path::new(&self.script);
         if self.script.is_empty() || script_name.file_name() != Some(script_name.as_os_str()) {
@@ -515,7 +522,7 @@ impl Worker {
         self.wait().await
     }
 
-    fn control_plane(&self) -> Result<Arc<ControlPlane>, RunpyError> {
+    pub(crate) fn control_plane(&self) -> Result<Arc<ControlPlane>, RunpyError> {
         self.control_plane
             .upgrade()
             .ok_or(RunpyError::ManagerClosed)

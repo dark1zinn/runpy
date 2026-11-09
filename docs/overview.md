@@ -326,6 +326,54 @@ so it can block briefly and does not give workers a grace period. Final
 buffered output is therefore best effort; call `terminate_all` first for a
 graceful shutdown.
 
+## Worker pools
+
+`Manager::pool(template, PoolConfig)` creates a pool that runs independent
+requests for one `WorkerBuilder` template (script, environment, arguments,
+handler) across separate worker processes. Every call creates a distinct pool,
+even for the same script and configuration. Pools use the ordinary correlated
+request protocol; there is no second wire format.
+
+```rust
+use runpy::{Data, Manager, PoolConfig};
+use serde_json::json;
+use std::time::Duration;
+
+let pool = manager
+    .pool(manager.worker("parse"), PoolConfig::default().max_workers(2))
+    .await?;
+let first = pool.submit(Data::from_iter([("text".into(), json!("a"))]), Duration::from_secs(30)).await?;
+let second = pool.submit(Data::from_iter([("text".into(), json!("b"))]), Duration::from_secs(30)).await?;
+// Both run at once, on two processes; each result matches its own request.
+let (first, second) = tokio::join!(first.result(), second.result());
+```
+
+Pools are cold and do not reuse workers:
+
+- Creating a pool starts no process. Requests wait in a FIFO queue and each
+  starts its own worker when a pool slot is free. A pool runs at most
+  `max_workers` workers (default: the Manager's `max_workers`), and every
+  pool and direct `spawn` share the Manager-wide worker cap.
+- A worker runs exactly one request and is terminated after the request's
+  terminal result. Its pool slot frees only once its process group has been
+  stopped and reaped, so no state carries between requests and requests must
+  not rely on affinity.
+- `submit` waits within the request deadline for pool queue capacity
+  (`queue_capacity`, default 64) and the Manager-wide `max_pending_requests`;
+  `try_submit` fails with `QueueFull` instead of waiting. The pending budget
+  covers queued requests in every pool. Futures an application creates
+  outside Runpy while waiting for admission are not bounded by it.
+- The deadline covers queueing, worker startup, and execution. A request that
+  expires before reaching a worker fails with `Timeout(Queued)` and never
+  runs; a failed worker start returns that start's error. A request that times
+  out while running keeps its worker and pool slot busy until the worker
+  answers. Requests are never replayed.
+- `WorkerPool::close` rejects new requests, fails queued ones with
+  `PoolClosed`, terminates running workers within the shutdown grace (their
+  requests fail with `OutcomeUnknown`), and returns their exits. The Manager
+  owns every pool: dropping all handles keeps serving submitted requests,
+  and dropping the Manager stops pool tasks and kills their workers.
+
 ## Protocol reference
 
 ### Frame format

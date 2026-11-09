@@ -88,6 +88,7 @@ mod error;
 mod integrity;
 mod lifecycle;
 mod manager;
+mod pool;
 mod protocol;
 mod request;
 mod scribbler;
@@ -96,11 +97,15 @@ mod watchdog;
 use std::collections::HashMap;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::Duration;
+
+use parking_lot::Mutex;
 
 use crate::config::{ProtocolLimits, QueueLimits};
 use crate::integrity::IntegrityChecker;
+use crate::pool::PoolCore;
 use crate::protocol::ControlPlane;
 
 // ── Public re-exports ──────────────────────────────────────────────────
@@ -112,6 +117,7 @@ pub use config::{
 pub use error::{InvalidScriptReason, RunpyError, TimeoutStage};
 pub use lifecycle::{ExitReason, WorkerExit};
 pub use manager::{StdinMode, Worker, WorkerBuilder, WorkerIdentity};
+pub use pool::{DEFAULT_POOL_QUEUE_CAPACITY, PoolConfig, WorkerPool};
 pub use protocol::{
     Data, Envelope, EnvelopeError, InboundEnvelope, MessageHandler, Meta, SendReceipt,
     WorkerOutput, WorkerOutputHandler, WorkerOutputStream,
@@ -314,6 +320,8 @@ impl ManagerBuilder {
             logger,
             control_plane,
             socket_dir,
+            pools: Mutex::new(Vec::new()),
+            next_pool: AtomicU64::new(1),
         })
     }
 }
@@ -392,6 +400,10 @@ pub struct Manager {
     control_plane: Arc<ControlPlane>,
     /// Removed when the Manager drops, after every worker has been stopped.
     socket_dir: tempfile::TempDir,
+    /// Pools stopped when the Manager drops. A pool's own tasks keep it
+    /// alive while it runs, so dropped handles never orphan it.
+    pools: Mutex<Vec<Weak<PoolCore>>>,
+    next_pool: AtomicU64,
 }
 
 impl Manager {
@@ -518,6 +530,51 @@ impl Manager {
     pub async fn terminate_all(&self) -> HashMap<String, WorkerExit> {
         self.control_plane.terminate_all().await
     }
+
+    /// Register a pool of cold workers that runs independent requests for
+    /// `template`'s script across separate processes.
+    ///
+    /// Every call creates a distinct pool, even for the same script and
+    /// configuration; pools are never merged by filename. Creation starts no
+    /// process. The Manager owns the pool: dropping every [`WorkerPool`]
+    /// handle leaves submitted requests running, and dropping the Manager
+    /// stops the pool and its workers. See [`WorkerPool`] for scheduling.
+    ///
+    /// ```no_run
+    /// use runpy::{Manager, PoolConfig};
+    ///
+    /// # async fn demo() -> Result<(), runpy::RunpyError> {
+    /// let manager = Manager::builder("workers").build().await?;
+    /// let pool = manager
+    ///     .pool(manager.worker("parse").arg("mode", "fast"), PoolConfig::default().max_workers(2))
+    ///     .await?;
+    /// # let _ = pool;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// [`RunpyError::InvalidConfig`] when `template` belongs to another
+    /// Manager or `config` is out of range (`max_workers` must be between 1
+    /// and the Manager's `max_workers`; `queue_capacity` must be positive).
+    pub async fn pool(
+        &self,
+        template: WorkerBuilder,
+        config: PoolConfig,
+    ) -> Result<WorkerPool, RunpyError> {
+        if !template.belongs_to(&self.control_plane) {
+            return Err(RunpyError::InvalidConfig(
+                "the pool template must come from this Manager's `worker`".to_string(),
+            ));
+        }
+        let id = format!("pool-{}", self.next_pool.fetch_add(1, Ordering::Relaxed));
+        let (pool, core) = WorkerPool::start(id, template, &self.control_plane, config)?;
+        let mut pools = self.pools.lock();
+        pools.retain(|pool| pool.strong_count() > 0);
+        pools.push(core);
+        Ok(pool)
+    }
 }
 
 impl Drop for Manager {
@@ -525,6 +582,11 @@ impl Drop for Manager {
         self.logger
             .info_with("Manager", "Shutting down all workers...");
         self.control_plane.shutdown_now();
+        for pool in self.pools.lock().drain(..) {
+            if let Some(pool) = pool.upgrade() {
+                pool.shutdown_now();
+            }
+        }
         self.logger.success("All workers terminated.");
     }
 }

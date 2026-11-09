@@ -131,6 +131,24 @@ return promptly. Capture is bounded and best effort. Runpy never treats stderr
 or output text as an automatic termination signal; applications own that
 policy.
 
+## Run requests in parallel
+
+A pool runs independent requests for one script on separate, fresh worker
+processes, bounded per pool and by the Manager-wide `max_workers` (default 3):
+
+```rust
+use runpy::PoolConfig;
+
+let pool = manager.pool(manager.worker("parse"), PoolConfig::default()).await?;
+let first = pool.submit(Data::from_iter([("text".into(), json!("a"))]), Duration::from_secs(30)).await?;
+let second = pool.submit(Data::from_iter([("text".into(), json!("b"))]), Duration::from_secs(30)).await?;
+let (first, second) = tokio::join!(first.result(), second.result());
+```
+
+Each worker serves one request and is then retired. See
+[Worker pools](docs/overview.md#worker-pools) for queueing, deadlines, and
+shutdown.
+
 ## Documentation
 
 - [Project overview](docs/overview.md) — architecture, lifecycle, protocol,

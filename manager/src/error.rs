@@ -94,12 +94,14 @@ pub enum RunpyError {
         /// Configured maximum body size.
         limit: usize,
     },
-    /// A nonblocking operation found no outbound capacity.
+    /// A nonblocking operation found no queue capacity.
     QueueFull,
     /// A deadline expired at the given stage.
     Timeout(TimeoutStage),
     /// The owning Manager has been dropped or is shutting down.
     ManagerClosed,
+    /// The worker pool was closed before the request reached a worker.
+    PoolClosed,
     /// The worker is not registered or its connection has closed.
     WorkerExited {
         /// Trusted worker identity.
@@ -159,6 +161,7 @@ impl fmt::Display for RunpyError {
             Self::QueueFull => f.write_str("outbound queue is full"),
             Self::Timeout(stage) => write!(f, "timed out while {stage}"),
             Self::ManagerClosed => f.write_str("worker manager is no longer available"),
+            Self::PoolClosed => f.write_str("worker pool is closed"),
             Self::WorkerExited { worker_id } => {
                 write!(f, "worker '{worker_id}' is not running")
             }
