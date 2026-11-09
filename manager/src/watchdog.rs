@@ -4,7 +4,7 @@ use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 use sysinfo::{Pid, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System};
 
 use crate::lifecycle::LifecycleState;
@@ -62,9 +62,11 @@ struct GroupSample {
 /// Sampling state; one instance, used only on a blocking thread.
 struct Sampler {
     system: System,
-    /// PIDs per group seen in the previous sample, to know when a CPU delta
-    /// covers every member.
-    previous: HashMap<u32, HashSet<Pid>>,
+    /// Accumulated CPU milliseconds per member PID, per group, from the
+    /// previous sample; a CPU figure needs every current member in it.
+    previous: HashMap<u32, HashMap<Pid, u64>>,
+    /// When the previous sample was taken.
+    previous_at: Option<Instant>,
 }
 
 impl Sampler {
@@ -78,6 +80,7 @@ impl Sampler {
         Self {
             system: System::new(),
             previous: HashMap::new(),
+            previous_at: None,
         }
     }
 
@@ -91,8 +94,9 @@ impl Sampler {
             true,
             ProcessRefreshKind::nothing().with_cpu().with_memory(),
         );
+        let now = Instant::now();
         let sampled_at = SystemTime::now();
-        let mut members: HashMap<u32, HashSet<Pid>> = HashMap::new();
+        let mut members: HashMap<u32, HashMap<Pid, u64>> = HashMap::new();
         let mut samples: HashMap<u32, GroupSample> = HashMap::new();
         for (pid, process) in self.system.processes() {
             if process.thread_kind().is_some()
@@ -111,31 +115,45 @@ impl Sampler {
             if !groups.contains(&group) {
                 continue;
             }
-            members.entry(group).or_default().insert(*pid);
+            members
+                .entry(group)
+                .or_default()
+                .insert(*pid, process.accumulated_cpu_time());
             let sample = samples.entry(group).or_insert(GroupSample {
                 memory_bytes: 0,
-                cpu_percent: Some(0.0),
+                cpu_percent: None,
                 process_count: 0,
                 stopped: true,
                 sampled_at,
             });
             sample.memory_bytes += process.memory();
-            if let Some(cpu) = sample.cpu_percent.as_mut() {
-                *cpu += process.cpu_usage();
-            }
             sample.process_count += 1;
             sample.stopped &= is_stopped(*pid, process);
         }
+        // CPU comes from each member's accumulated CPU time across two
+        // samples, not sysinfo's `cpu_usage`, which stays 0 for a process
+        // whose first sample had not yet used a full clock tick. A group gets
+        // a figure only when every current member was also sampled last time.
+        let elapsed = self
+            .previous_at
+            .map(|at| now.duration_since(at).as_secs_f32())
+            .filter(|seconds| *seconds > 0.0);
         for (group, sample) in &mut samples {
-            let complete = self
-                .previous
-                .get(group)
-                .is_some_and(|previous| members[group].is_subset(previous));
-            if !complete {
-                sample.cpu_percent = None;
+            let (Some(elapsed), Some(previous)) = (elapsed, self.previous.get(group)) else {
+                continue;
+            };
+            let current = &members[group];
+            if current.keys().all(|pid| previous.contains_key(pid)) {
+                let used_ms: u64 = current
+                    .iter()
+                    .map(|(pid, total)| total.saturating_sub(previous[pid]))
+                    .sum();
+                // CPU-milliseconds per second of wall time, as a percentage.
+                sample.cpu_percent = Some(used_ms as f32 / (elapsed * 10.0));
             }
         }
         self.previous = members;
+        self.previous_at = Some(now);
         samples
     }
 }
