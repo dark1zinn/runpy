@@ -69,6 +69,12 @@ struct Sampler {
 
 impl Sampler {
     fn new() -> Self {
+        // On Linux sysinfo otherwise keeps `/proc/<pid>/stat` open for every
+        // process it has seen, up to half the descriptor limit: hundreds of
+        // descriptors per host for a scan that runs once per second. The
+        // setting is process-wide and only trades descriptors for reopening
+        // those files on each refresh.
+        sysinfo::set_open_files_limit(0);
         Self {
             system: System::new(),
             previous: HashMap::new(),

@@ -720,6 +720,9 @@ groups are never included. Zombies and threads are skipped. Metrics that
 cannot be read (sampling races, permissions) are reported as `None`, never as
 zero. Sampling refreshes the process table once per second, which costs a few
 milliseconds with typical process counts; it runs only while workers exist.
+Runpy disables sysinfo's per-process file caching
+(`sysinfo::set_open_files_limit(0)`, process-wide) so sampling holds no
+descriptor per host process between refreshes.
 
 The watchdog reports process state; application-level retry, alerting, and
 termination policy remains the caller's responsibility.
