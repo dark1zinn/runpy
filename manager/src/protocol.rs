@@ -10,8 +10,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Weak};
 use std::thread;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::net::UnixListener;
 use tokio::process::{ChildStderr, ChildStdout};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -47,6 +47,17 @@ const OUTPUT_QUEUE_CAPACITY: usize = 256;
 const OUTPUT_READ_BUFFER_SIZE: usize = 8 * 1024;
 const OUTPUT_RECORD_LIMIT: usize = 16 * 1024;
 const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
+/// Complete envelopes buffered between a session and its socket I/O tasks.
+const SESSION_QUEUE_CAPACITY: usize = 64;
+
+/// Abort an owned helper task when its owning scope ends or is cancelled.
+struct AbortOnDrop(JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 
 /// Validation failure for reserved metadata or operation direction.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -779,7 +790,7 @@ impl ControlPlane {
                 return Err(error);
             }
         };
-        let (tx, outbound_rx) = mpsc::channel::<Envelope>(64);
+        let (tx, outbound_rx) = mpsc::channel::<Envelope>(SESSION_QUEUE_CAPACITY);
         let sender = MessageSender { tx };
 
         // Registration and synchronous shutdown acquire sessions before
@@ -971,7 +982,7 @@ impl ControlPlane {
             logger,
         } = session;
         loop {
-            let (mut stream, _) = match listener.accept().await {
+            let (stream, _) = match listener.accept().await {
                 Ok(connection) => connection,
                 Err(error) => {
                     logger.error_with(
@@ -982,9 +993,26 @@ impl ControlPlane {
                 }
             };
 
+            // A dedicated task owns every receive operation until it completes,
+            // so selecting on outbound work can never drop a partially read
+            // frame. Only complete envelopes cross this bounded channel.
+            let (mut read_half, mut write_half) = stream.into_split();
+            let (inbound_tx, mut inbound_rx) = mpsc::channel::<Envelope>(SESSION_QUEUE_CAPACITY);
+            let reader_logger = logger.clone();
+            let reader = tokio::spawn(async move {
+                while let Some(envelope) = Self::recv_envelope(&reader_logger, &mut read_half).await
+                {
+                    if inbound_tx.send(envelope).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            // Aborting the session (cleanup) drops this guard and the reader.
+            let _reader = AbortOnDrop(reader);
+
             loop {
                 tokio::select! {
-                    received = Self::recv_envelope(&logger, &mut stream) => {
+                    received = inbound_rx.recv() => {
                         let Some(mut envelope) = received else {
                             break;
                         };
@@ -1016,7 +1044,7 @@ impl ControlPlane {
                             Self::write_stamped_envelope(
                                 &worker_id,
                                 &socket_path,
-                                &mut stream,
+                                &mut write_half,
                                 envelope,
                             )
                             .await
@@ -1037,7 +1065,10 @@ impl ControlPlane {
     ///
     /// A malformed body or I/O failure ends only the current socket connection;
     /// the outer session loop can accept a reconnect from the same process.
-    async fn recv_envelope(logger: &Scribbler, stream: &mut UnixStream) -> Option<Envelope> {
+    async fn recv_envelope<R>(logger: &Scribbler, stream: &mut R) -> Option<Envelope>
+    where
+        R: AsyncRead + Unpin,
+    {
         let mut size_buf = [0_u8; 8];
         if let Err(error) = stream.read_exact(&mut size_buf).await {
             match error.kind() {
@@ -1084,12 +1115,15 @@ impl ControlPlane {
 
     /// Validate direction, overwrite trusted routing fields, and write one
     /// little-endian length-prefixed JSON envelope.
-    async fn write_stamped_envelope(
+    async fn write_stamped_envelope<W>(
         worker_id: &str,
         socket_path: &str,
-        stream: &mut UnixStream,
+        stream: &mut W,
         mut envelope: Envelope,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    where
+        W: AsyncWrite + Unpin,
+    {
         envelope.validate_manager_to_worker()?;
         envelope.stamp_trusted(worker_id, socket_path);
 
@@ -1160,6 +1194,7 @@ mod tests {
     use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::mpsc as std_mpsc;
+    use tokio::net::UnixStream;
     use tokio::time::timeout;
 
     fn object(value: Value) -> Data {
@@ -1437,6 +1472,67 @@ mod tests {
             .unwrap();
         assert!(result.is_err());
         assert!(called_rx.try_recv().is_err());
+
+        control_plane.shutdown_now();
+    }
+
+    /// Outbound traffic must never discard bytes of a partially received
+    /// inbound frame, whichever boundary the fragment stops at.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn outbound_activity_preserves_partially_received_frames() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let control_plane = ControlPlane::new(test_logger());
+        let (observed_tx, observed_rx) = std_mpsc::channel();
+        let handler: MessageHandler = Arc::new(move |inbound| {
+            observed_tx.send(inbound.envelope.data().clone()).unwrap();
+        });
+        let mut stream =
+            register_worker(&control_plane, directory.path(), "worker", Some(handler)).await;
+
+        let mut frames = Vec::new();
+        for sequence in 0..2 {
+            let envelope: Envelope = serde_json::from_value(json!({
+                "meta": {"x_op": "log"},
+                "data": {"sequence": sequence, "padding": "p".repeat(512)}
+            }))
+            .unwrap();
+            let payload = serde_json::to_vec(&envelope).unwrap();
+            let mut frame = (payload.len() as u64).to_le_bytes().to_vec();
+            frame.extend_from_slice(&payload);
+            frames.push(frame);
+        }
+
+        // Split inside the header, then inside the body, forcing the
+        // outbound branch to win while the reader holds partial progress.
+        let first = &frames[0];
+        let cuts = [0, 4, 8 + 100, first.len()];
+        for (index, window) in cuts.windows(2).enumerate() {
+            stream
+                .write_all(&first[window[0]..window[1]])
+                .await
+                .unwrap();
+            stream.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            control_plane
+                .send(
+                    "worker",
+                    Envelope::new(Meta::new(), object(json!({ "outbound": index }))).unwrap(),
+                )
+                .await
+                .unwrap();
+            let outbound = timeout(Duration::from_secs(1), read_frame(&mut stream))
+                .await
+                .unwrap();
+            assert_eq!(outbound.data()["outbound"], index);
+        }
+        stream.write_all(&frames[1]).await.unwrap();
+        stream.flush().await.unwrap();
+
+        for sequence in 0..2 {
+            let data = observed_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert_eq!(data["sequence"], sequence);
+            assert_eq!(data["padding"].as_str().unwrap().len(), 512);
+        }
 
         control_plane.shutdown_now();
     }

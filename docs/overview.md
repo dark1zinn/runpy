@@ -194,6 +194,12 @@ Each socket frame consists of:
 1. an unsigned 64-bit little-endian payload length;
 2. exactly that many UTF-8 JSON bytes.
 
+On the Manager, a dedicated reader task owns each connection's read half and
+completes every frame before handing the decoded envelope to the session. The
+session therefore waits for complete envelopes and outbound work without ever
+cancelling a partially read frame: a frame split across arbitrary socket reads
+is reassembled exactly, even while the Manager is sending to the same worker.
+
 The JSON value must contain exactly two fields, both objects:
 
 ```json
