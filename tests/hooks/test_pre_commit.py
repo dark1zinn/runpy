@@ -116,6 +116,7 @@ def test_staged_bad_rust_formatting_fails_even_when_the_worktree_is_fixed(clone)
     stage(clone, path, original + "fn  extra( ) {}\n", original + "fn extra() {}\n")
     result = run_hook(clone)
     assert result.returncode != 0
+    assert "Checking Rust formatting" in result.stdout
     assert "Checking Rust lints" not in result.stdout
 
 

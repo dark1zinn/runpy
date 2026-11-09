@@ -956,8 +956,9 @@ median across runs and flags medians more than 20% slower; it never fails.
 
 Limits: measurements are only comparable on the same machine class,
 toolchain, Python, and uv version; the first spawn depends on uv's cache
-state; worker RSS is not included; `ENVIRONMENT=development` forces verbose
-logging and distorts results. The scheduled **Benchmarks** workflow runs the
+state; worker RSS is not included. `ENVIRONMENT=development` forces verbose
+logging and distorts results: the runner clears it and defaults `LOG=off`,
+but Criterion runs need `ENVIRONMENT=` set by hand. The scheduled **Benchmarks** workflow runs the
 runner three times and the Criterion suite, compares against the latest
 successful run on `main`, and keeps reports as workflow artifacts for 90 days.
 They are never attached to releases.

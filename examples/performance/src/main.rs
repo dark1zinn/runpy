@@ -79,8 +79,12 @@ fn run_command(args: &[String]) -> Result<(), String> {
             other => return Err(format!("unknown argument {other}")),
         }
     }
+    // Development mode forces verbose logging regardless of LOG, which would
+    // put per-frame logging into every measurement.
+    // SAFETY: runs before the runtime or any other thread starts.
+    unsafe { std::env::remove_var("ENVIRONMENT") };
     if std::env::var_os("LOG").is_none() {
-        // SAFETY: runs before the runtime or any other thread starts.
+        // SAFETY: as above.
         unsafe { std::env::set_var("LOG", "off") };
     }
     let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
