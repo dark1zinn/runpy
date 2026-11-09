@@ -672,6 +672,13 @@ reads these variables at Manager construction:
 Severity order is `Error`, `Warning`, `Info`, `Debug`, `Verbose`; `Off`
 disables logging. Component-tagged and untagged methods share the same filter.
 
+Diagnostics are best effort. Each line is written under the stderr lock, and a
+closed or broken stderr is ignored instead of panicking. Runpy never logs valid
+application envelopes. When a worker sends a body that is not valid JSON, the
+diagnostic includes the parse error, the body length, and at most the first
+1024 bytes, decoded lossily with control characters escaped. That excerpt can
+still contain application data, so treat Runpy logs as potentially sensitive.
+
 ### Watchdog reports
 
 The shared watchdog checks child exit state every five seconds and removes dead

@@ -1901,11 +1901,7 @@ impl ControlPlane {
         };
 
         serde_json::from_slice(&payload).map_err(|error| {
-            let raw = String::from_utf8_lossy(&payload);
-            logger.error_with(
-                "Protocol",
-                &format!("JSON envelope error: {error}\n  Raw: {raw}"),
-            );
+            logger.error_with("Protocol", &invalid_body_diagnostic(&error, &payload));
             ExitReason::ProtocolViolation
         })
     }
@@ -1913,6 +1909,22 @@ impl ControlPlane {
 
 /// Size of the little-endian length header that precedes every frame body.
 const FRAME_HEADER_BYTES: usize = 8;
+/// Most bytes of an invalid body included in its diagnostic.
+const INVALID_BODY_EXCERPT: usize = 1024;
+
+/// Diagnostic for an undecodable body: the error, the body length, and at
+/// most [`INVALID_BODY_EXCERPT`] sanitized bytes. The body may be large,
+/// binary, contain terminal control sequences, or carry sensitive data, so it
+/// is never logged whole.
+fn invalid_body_diagnostic(error: &serde_json::Error, payload: &[u8]) -> String {
+    let excerpt = &payload[..payload.len().min(INVALID_BODY_EXCERPT)];
+    format!(
+        "JSON envelope error: {error} ({} bytes); first {} bytes: {}",
+        payload.len(),
+        excerpt.len(),
+        sanitize_output(excerpt)
+    )
+}
 
 /// Why a frame could not be read or encoded.
 #[derive(Debug)]
@@ -2209,6 +2221,21 @@ mod tests {
                 && record.stream == WorkerOutputStream::Stdout
                 && !record.truncated
         }));
+    }
+
+    #[test]
+    fn invalid_body_diagnostics_are_bounded_and_escaped() {
+        let mut payload = b"{\"meta\": \x1b[31m\xff".to_vec();
+        payload.extend(std::iter::repeat_n(b'x', 10_000));
+        let error = serde_json::from_slice::<Envelope>(&payload).unwrap_err();
+        let diagnostic = invalid_body_diagnostic(&error, &payload);
+
+        assert!(diagnostic.contains(&format!("({} bytes)", payload.len())));
+        assert!(!diagnostic.contains('\x1b'), "{diagnostic}");
+        assert!(diagnostic.contains("\\u{1b}[31m\u{fffd}"), "{diagnostic}");
+        let excerpt_x = diagnostic.matches('x').count();
+        assert!(excerpt_x <= INVALID_BODY_EXCERPT, "excerpt was not bounded");
+        assert!(diagnostic.len() < 2 * INVALID_BODY_EXCERPT + 200);
     }
 
     #[tokio::test]

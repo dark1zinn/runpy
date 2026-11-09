@@ -26,6 +26,21 @@
 
 use chrono::Local;
 use std::env;
+use std::fmt;
+use std::io::Write;
+
+/// Write one diagnostic line to stderr.
+///
+/// Logging is best effort: a closed or broken stderr must not panic (as
+/// `eprintln!` would) or recursively log, so write errors are ignored. The
+/// line is written under the stderr lock so concurrent lines do not
+/// interleave.
+fn write_line(line: fmt::Arguments<'_>) {
+    let mut stderr = std::io::stderr().lock();
+    let _ = stderr
+        .write_fmt(line)
+        .and_then(|()| stderr.write_all(b"\n"));
+}
 
 // ── ANSI Color Codes ───────────────────────────────────────────────────
 
@@ -180,13 +195,16 @@ impl Scribbler {
                 .map(|c| format!("{CYAN}{}{RESET} ", c))
                 .unwrap_or_default();
 
-            eprintln!(
+            write_line(format_args!(
                 "{DIM}{}{RESET} {BOLD}{}{}{RESET} {component_str}{}",
                 timestamp, color, prefix, message
-            );
+            ));
         } else {
             let component_str = component.map(|c| format!("[{}] ", c)).unwrap_or_default();
-            eprintln!("{} {} {}{}", timestamp, prefix, component_str, message);
+            write_line(format_args!(
+                "{} {} {}{}",
+                timestamp, prefix, component_str, message
+            ));
         }
     }
 
@@ -315,12 +333,12 @@ impl Scribbler {
         if self.should_log(LogLevel::Info) {
             let timestamp = Local::now().format("%H:%M:%S%.3f");
             if self.use_colors {
-                eprintln!(
+                write_line(format_args!(
                     "{DIM}{}{RESET} {BOLD}{GREEN}  ✓  {RESET} {}",
                     timestamp, message
-                );
+                ));
             } else {
-                eprintln!("{} [OK] {}", timestamp, message);
+                write_line(format_args!("{} [OK] {}", timestamp, message));
             }
         }
     }
@@ -336,12 +354,12 @@ impl Scribbler {
         if self.should_log(LogLevel::Info) {
             let timestamp = Local::now().format("%H:%M:%S%.3f");
             if self.use_colors {
-                eprintln!(
+                write_line(format_args!(
                     "{DIM}{}{RESET} {BOLD}{CYAN}[{:>2}]{RESET} {}",
                     timestamp, step, message
-                );
+                ));
             } else {
-                eprintln!("{} [{:>2}] {}", timestamp, step, message);
+                write_line(format_args!("{} [{:>2}] {}", timestamp, step, message));
             }
         }
     }
@@ -356,9 +374,11 @@ impl Scribbler {
     pub fn separator(&self) {
         if self.should_log(LogLevel::Info) {
             if self.use_colors {
-                eprintln!("{DIM}────────────────────────────────────────{RESET}");
+                write_line(format_args!(
+                    "{DIM}────────────────────────────────────────{RESET}"
+                ));
             } else {
-                eprintln!("----------------------------------------");
+                write_line(format_args!("----------------------------------------"));
             }
         }
     }
@@ -381,6 +401,43 @@ impl Scribbler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Child half of [`logging_survives_a_closed_stderr`]: logs every kind of
+    /// line into a stderr whose reader is gone.
+    #[test]
+    #[ignore = "run only as a subprocess of logging_survives_a_closed_stderr"]
+    fn closed_stderr_child() {
+        if std::env::var_os("RUNPY_CLOSED_STDERR_CHILD").is_none() {
+            return;
+        }
+        let log = Scribbler::with_level(LogLevel::Verbose);
+        for _ in 0..1000 {
+            log.error("error");
+            log.info_with("Component", "info");
+            log.success("success");
+            log.step(1, "step");
+            log.separator();
+        }
+    }
+
+    #[test]
+    fn logging_survives_a_closed_stderr() {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "scribbler::tests::closed_stderr_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("RUNPY_CLOSED_STDERR_CHILD", "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        // Close the read end so every write to the child's stderr fails.
+        drop(child.stderr.take());
+        assert!(child.wait().unwrap().success(), "logging panicked");
+    }
 
     #[test]
     fn log_level_ordering() {
