@@ -117,7 +117,7 @@ pub use config::{
 pub use error::{InvalidScriptReason, RunpyError, TimeoutStage};
 pub use lifecycle::{ExitReason, WorkerExit};
 pub use manager::{StdinMode, Worker, WorkerBuilder, WorkerIdentity};
-pub use pool::{DEFAULT_POOL_QUEUE_CAPACITY, PoolConfig, WorkerPool};
+pub use pool::{DEFAULT_POOL_IDLE_TIMEOUT, DEFAULT_POOL_QUEUE_CAPACITY, PoolConfig, WorkerPool};
 pub use protocol::{
     Data, Envelope, EnvelopeError, InboundEnvelope, MessageHandler, Meta, SendReceipt,
     WorkerOutput, WorkerOutputHandler, WorkerOutputStream,

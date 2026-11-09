@@ -286,6 +286,68 @@ async fn pools_share_the_manager_worker_cap() {
     assert_eq!(fixture.launches(), 4);
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn reuse_keeps_a_finished_worker_for_the_next_request() {
+    let fixture = Fixture::new().await;
+    let pool = fixture
+        .pool(PoolConfig::default().max_workers(1).reuse_workers(true))
+        .await;
+    let first = pool.execute(data(json!({})), LONG).await.unwrap();
+    let second = pool.execute(data(json!({ "n": 2 })), LONG).await.unwrap();
+    assert_eq!(first["pid"], second["pid"]);
+    assert_eq!(fixture.launches(), 1);
+    assert_eq!(fixture.manager.watchdog().report().await.len(), 1);
+
+    assert_eq!(pool.close().await.len(), 1);
+    assert!(fixture.manager.watchdog().report().await.is_empty());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn idle_workers_retire_after_the_timeout_but_not_while_busy() {
+    let fixture = Fixture::new().await;
+    let pool = fixture
+        .pool(
+            PoolConfig::default()
+                .reuse_workers(true)
+                .idle_timeout(Duration::from_millis(300)),
+        )
+        .await;
+    let first = pool.execute(data(json!({})), LONG).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // This request outlives the first idle timer; that stale timer must not
+    // stop the busy worker.
+    let second = pool
+        .execute(data(json!({ "sleep": 0.4 })), LONG)
+        .await
+        .unwrap();
+    assert_eq!(first["pid"], second["pid"]);
+    assert_eq!(fixture.manager.watchdog().report().await.len(), 1);
+
+    // Idle again, it is retired once a full timeout passes.
+    fixture.wait_until_idle().await;
+    assert_eq!(fixture.launches(), 1);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn failed_workers_are_never_reused() {
+    let fixture = Fixture::new().await;
+    let pool = fixture
+        .pool(PoolConfig::default().max_workers(1).reuse_workers(true))
+        .await;
+    let first = pool.execute(data(json!({})), LONG).await.unwrap();
+    assert!(matches!(
+        pool.execute(data(json!({ "exit": true })), LONG).await,
+        Err(RunpyError::OutcomeUnknown { .. })
+    ));
+    let third = pool.execute(data(json!({})), LONG).await.unwrap();
+    assert_ne!(first["pid"], third["pid"]);
+    assert_eq!(fixture.launches(), 2);
+    pool.close().await;
+}
+
 #[tokio::test]
 async fn invalid_pool_configuration_is_rejected() {
     let tmp = TempDir::new().unwrap();
@@ -306,6 +368,7 @@ async fn invalid_pool_configuration_is_rejected() {
         PoolConfig::default().max_workers(0),
         PoolConfig::default().max_workers(4),
         PoolConfig::default().queue_capacity(0),
+        PoolConfig::default().idle_timeout(Duration::ZERO),
     ] {
         assert!(matches!(
             manager.pool(manager.worker("parse"), config).await,

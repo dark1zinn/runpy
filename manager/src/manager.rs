@@ -522,6 +522,11 @@ impl Worker {
         self.wait().await
     }
 
+    /// Whether the worker is ready and has not exited.
+    pub(crate) fn is_ready(&self) -> bool {
+        matches!(&*self.lifecycle.borrow(), LifecycleState::Ready { .. })
+    }
+
     pub(crate) fn control_plane(&self) -> Result<Arc<ControlPlane>, RunpyError> {
         self.control_plane
             .upgrade()

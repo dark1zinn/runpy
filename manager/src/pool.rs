@@ -1,18 +1,17 @@
-//! Cold same-script request pools.
+//! Same-script request pools.
 //!
 //! A pool runs independent requests for one [`WorkerBuilder`] template across
 //! separate worker processes. It owns no wire protocol of its own: each
-//! request becomes an ordinary correlated request on a freshly spawned worker,
-//! and the worker is retired as soon as that request reaches a terminal
-//! result.
+//! request becomes an ordinary correlated request on a worker. Workers are
+//! retired after one request unless the pool explicitly enables reuse.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
 use parking_lot::Mutex;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError, mpsc, watch};
-use tokio::task::{JoinHandle, JoinSet};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError, mpsc, watch};
+use tokio::task::{AbortHandle, JoinHandle, JoinSet};
 use tokio::time::{Duration, Instant, sleep_until, timeout_at};
 
 use crate::error::{RunpyError, TimeoutStage};
@@ -23,6 +22,8 @@ use crate::request::{PendingRequest, Request};
 
 /// Default bound on requests waiting in one pool's queue.
 pub const DEFAULT_POOL_QUEUE_CAPACITY: usize = 64;
+/// Default time a reusable pool worker may stay idle before it is retired.
+pub const DEFAULT_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Configuration for a [`WorkerPool`].
 ///
@@ -36,6 +37,8 @@ pub const DEFAULT_POOL_QUEUE_CAPACITY: usize = 64;
 pub struct PoolConfig {
     max_workers: Option<usize>,
     queue_capacity: usize,
+    reuse_workers: bool,
+    idle_timeout: Duration,
 }
 
 impl Default for PoolConfig {
@@ -43,6 +46,8 @@ impl Default for PoolConfig {
         Self {
             max_workers: None,
             queue_capacity: DEFAULT_POOL_QUEUE_CAPACITY,
+            reuse_workers: false,
+            idle_timeout: DEFAULT_POOL_IDLE_TIMEOUT,
         }
     }
 }
@@ -59,6 +64,27 @@ impl PoolConfig {
     /// [`DEFAULT_POOL_QUEUE_CAPACITY`] (64). Must be positive.
     pub fn queue_capacity(mut self, requests: usize) -> Self {
         self.queue_capacity = requests;
+        self
+    }
+
+    /// Keep a worker after its request instead of retiring it; default off.
+    ///
+    /// A reused worker keeps all process state from earlier requests:
+    /// imports, caches, globals, open files, and leaked memory. Nothing is
+    /// reset. Enable it only when every request is independent of that state
+    /// and correct on any worker; requests have no affinity. A worker is
+    /// reused only after `done` or a reported execution error, never after a
+    /// transport or protocol failure, and never while it still runs a request
+    /// whose caller timed out.
+    pub fn reuse_workers(mut self, reuse: bool) -> Self {
+        self.reuse_workers = reuse;
+        self
+    }
+
+    /// How long a reusable worker may stay idle before it is retired;
+    /// default [`DEFAULT_POOL_IDLE_TIMEOUT`] (30 s). Must be positive.
+    pub fn idle_timeout(mut self, timeout: Duration) -> Self {
+        self.idle_timeout = timeout;
         self
     }
 }
@@ -84,6 +110,30 @@ pub(crate) struct PoolCore {
     dispatcher: Mutex<Option<JoinHandle<()>>>,
     /// One task per started request; owns its worker until it is retired.
     runs: Arc<Mutex<JoinSet<Option<WorkerExit>>>>,
+    /// `Some(idle_timeout)` when finished workers are kept for reuse.
+    reuse: Option<Duration>,
+    /// Parked workers available for the next request.
+    idle: Mutex<Vec<IdleWorker>>,
+    /// Wakes the dispatcher when a worker is parked.
+    parked: Notify,
+    next_token: AtomicU64,
+}
+
+/// How a queued job obtained a worker.
+enum Assigned {
+    /// A pool slot for a worker that still has to be started.
+    Fresh(OwnedSemaphorePermit),
+    /// A parked worker, together with the pool slot it kept while idle.
+    Idle(Worker, OwnedSemaphorePermit),
+}
+
+/// A worker kept between requests when reuse is enabled.
+struct IdleWorker {
+    /// Distinguishes this parking from later ones of the same worker.
+    token: u64,
+    worker: Worker,
+    slot: OwnedSemaphorePermit,
+    timer: AbortHandle,
 }
 
 impl PoolCore {
@@ -94,19 +144,71 @@ impl PoolCore {
         if let Some(task) = self.dispatcher.lock().take() {
             task.abort();
         }
+        self.idle.lock().clear();
         self.runs.lock().abort_all();
+    }
+
+    /// Keep a worker idle with its pool slot and arm its idle timeout.
+    ///
+    /// Hands the worker back when the pool is closed: `close` drains the
+    /// idle list under the same lock after setting `closed`, so a worker
+    /// can never be parked after it.
+    fn park(
+        self: &Arc<Self>,
+        worker: Worker,
+        slot: OwnedSemaphorePermit,
+    ) -> Result<(), (Worker, OwnedSemaphorePermit)> {
+        let Some(idle_timeout) = self.reuse else {
+            return Err((worker, slot));
+        };
+        let token = self.next_token.fetch_add(1, Ordering::Relaxed);
+        // The timer looks its entry up under this lock, so it cannot run
+        // before the entry exists.
+        let mut idle = self.idle.lock();
+        if self.closed.load(Ordering::Acquire) {
+            return Err((worker, slot));
+        }
+        let timer = self
+            .runs
+            .lock()
+            .spawn(expire_idle(self.clone(), token, idle_timeout));
+        idle.push(IdleWorker {
+            token,
+            worker,
+            slot,
+            timer,
+        });
+        drop(idle);
+        self.parked.notify_one();
+        Ok(())
+    }
+
+    /// Take a parked worker that is still ready, cancelling its idle timer.
+    /// Parked workers that exited meanwhile are discarded; the Manager has
+    /// already reaped or is reaping them.
+    fn take_idle(&self) -> Option<IdleWorker> {
+        let mut idle = self.idle.lock();
+        while let Some(entry) = idle.pop() {
+            entry.timer.abort();
+            if entry.worker.is_ready() {
+                return Some(entry);
+            }
+        }
+        None
     }
 }
 
-/// Handle to a pool of cold workers for one script template.
+/// Handle to a pool of workers for one script template.
 ///
-/// Created by [`crate::Manager::pool`]. Requests are started in FIFO order,
-/// each on its own new worker process, up to the pool's `max_workers` and the
-/// Manager-wide process limit. A worker is retired after its request's
-/// terminal result, so no state carries between requests and requests need
-/// no affinity. Cloning is cheap; the Manager owns the pool, so dropping
-/// every handle neither stops it nor leaks it: the pool keeps serving
-/// submitted requests until [`WorkerPool::close`] or Manager drop.
+/// Created by [`crate::Manager::pool`]. Requests are started in FIFO order up
+/// to the pool's `max_workers` and the Manager-wide process limit. By
+/// default each request gets its own new worker process, retired after the
+/// request's terminal result, so no state carries between requests; with
+/// [`PoolConfig::reuse_workers`] a finished worker serves later requests.
+/// Requests have no affinity either way. Cloning is cheap; the Manager owns
+/// the pool, so dropping every handle neither stops it nor leaks it: the
+/// pool keeps serving submitted requests until [`WorkerPool::close`] or
+/// Manager drop.
 ///
 /// ```no_run
 /// use runpy::{Data, Manager, PoolConfig};
@@ -161,6 +263,11 @@ impl WorkerPool {
                 "pool queue_capacity must be greater than zero".to_string(),
             ));
         }
+        if config.idle_timeout.is_zero() {
+            return Err(RunpyError::InvalidConfig(
+                "pool idle_timeout must be greater than zero".to_string(),
+            ));
+        }
 
         let (jobs_tx, jobs_rx) = mpsc::unbounded_channel();
         let (closing, closing_rx) = watch::channel(false);
@@ -175,6 +282,10 @@ impl WorkerPool {
             active: Mutex::new(HashMap::new()),
             dispatcher: Mutex::new(None),
             runs: Arc::new(Mutex::new(JoinSet::new())),
+            reuse: config.reuse_workers.then_some(config.idle_timeout),
+            idle: Mutex::new(Vec::new()),
+            parked: Notify::new(),
+            next_token: AtomicU64::new(0),
         });
         let task = tokio::spawn(dispatch(
             core.clone(),
@@ -245,9 +356,9 @@ impl WorkerPool {
     }
 
     /// Stop accepting requests, fail queued ones with
-    /// [`RunpyError::PoolClosed`], gracefully terminate the workers still
-    /// running requests, and return the exit of every worker this pool
-    /// still owned. Requests interrupted this way fail with
+    /// [`RunpyError::PoolClosed`], gracefully terminate running and idle
+    /// workers, and return the exit of every worker this pool still owned.
+    /// Requests interrupted this way fail with
     /// [`RunpyError::OutcomeUnknown`]. Closing twice returns no exits.
     pub async fn close(&self) -> Vec<WorkerExit> {
         let core = &self.core;
@@ -258,14 +369,26 @@ impl WorkerPool {
         if let Some(dispatcher) = dispatcher {
             let _ = dispatcher.await;
         }
+        // `closed` is set, so no worker can be parked after this drain.
+        let parked: Vec<IdleWorker> = core.idle.lock().drain(..).collect();
         let active: Vec<Worker> = core.active.lock().values().cloned().collect();
         let mut stopping = JoinSet::new();
         for worker in active {
-            stopping.spawn(async move { worker.terminate().await });
+            stopping.spawn(async move {
+                let _ = worker.terminate().await;
+                None
+            });
         }
-        stopping.join_all().await;
+        for entry in parked {
+            entry.timer.abort();
+            stopping.spawn(async move {
+                let exit = retire(entry.worker).await;
+                drop(entry.slot);
+                exit
+            });
+        }
+        let mut exits: Vec<WorkerExit> = stopping.join_all().await.into_iter().flatten().collect();
         let mut runs = std::mem::take(&mut *core.runs.lock());
-        let mut exits = Vec::new();
         while let Some(exit) = runs.join_next().await {
             if let Ok(Some(exit)) = exit {
                 exits.push(exit);
@@ -312,9 +435,10 @@ impl WorkerPool {
     }
 }
 
-/// Start queued jobs in FIFO order as pool slots free up.
+/// Start queued jobs in FIFO order as workers become available, preferring
+/// a parked idle worker over starting a new process.
 ///
-/// A job keeps its queue slot until it gets a pool slot, so the queue bound
+/// A job keeps its queue slot until it gets a worker, so the queue bound
 /// covers every request not yet handed to a worker. A job whose deadline
 /// passes while waiting is failed with `Timeout(Queued)` without starting a
 /// process.
@@ -324,21 +448,30 @@ async fn dispatch(
     mut closing: watch::Receiver<bool>,
     slots: Arc<Semaphore>,
 ) {
-    loop {
+    'jobs: loop {
         let job = tokio::select! {
             job = jobs.recv() => job,
             _ = closing.wait_for(|closing| *closing) => None,
         };
         let Some(job) = job else { break };
-        let slot = tokio::select! {
-            slot = slots.clone().acquire_owned() => slot.expect("pool slots are never closed"),
-            () = sleep_until(job.pending.deadline()) => {
-                job.pending.fail_unsent(RunpyError::Timeout(TimeoutStage::Queued));
-                continue;
+        let assigned = loop {
+            if let Some(entry) = core.take_idle() {
+                break Assigned::Idle(entry.worker, entry.slot);
             }
-            _ = closing.wait_for(|closing| *closing) => {
-                job.pending.fail_unsent(RunpyError::PoolClosed);
-                break;
+            tokio::select! {
+                slot = slots.clone().acquire_owned() => {
+                    break Assigned::Fresh(slot.expect("pool slots are never closed"));
+                }
+                // A finished worker was parked; prefer it over a new process.
+                () = core.parked.notified() => {}
+                () = sleep_until(job.pending.deadline()) => {
+                    job.pending.fail_unsent(RunpyError::Timeout(TimeoutStage::Queued));
+                    continue 'jobs;
+                }
+                _ = closing.wait_for(|closing| *closing) => {
+                    job.pending.fail_unsent(RunpyError::PoolClosed);
+                    break 'jobs;
+                }
             }
         };
         let Job { pending, .. } = job;
@@ -347,7 +480,7 @@ async fn dispatch(
         }
         let mut runs = core.runs.lock();
         while runs.try_join_next().is_some() {}
-        runs.spawn(run(core.clone(), pending, slot));
+        runs.spawn(run(core.clone(), pending, assigned));
     }
     // Late submissions now fail at send; everything still queued is failed.
     jobs.close();
@@ -356,25 +489,35 @@ async fn dispatch(
     }
 }
 
-/// Start a worker for one request, wait for its terminal result even past
-/// the caller's deadline, then retire the worker. The pool slot is released
-/// only after the worker's process group was stopped and reaped.
+/// Run one request on its assigned worker, starting a fresh one if needed,
+/// and wait for its terminal result even past the caller's deadline.
+///
+/// Afterwards the worker is parked for reuse when the pool allows it and the
+/// request ended normally (`done` or a reported execution error); otherwise
+/// it is retired, and the pool slot is released only after its process
+/// group was stopped and reaped.
 async fn run(
     core: Arc<PoolCore>,
     pending: PendingRequest,
-    _slot: OwnedSemaphorePermit,
+    assigned: Assigned,
 ) -> Option<WorkerExit> {
-    let deadline = pending.deadline();
-    let worker = match timeout_at(deadline, core.template.clone().spawn()).await {
-        Ok(Ok(worker)) => worker,
-        // `spawn` already stopped anything it started; the request never ran.
-        Ok(Err(error)) => {
-            pending.fail_unsent(error);
-            return None;
-        }
-        Err(_) => {
-            pending.fail_unsent(RunpyError::Timeout(TimeoutStage::Queued));
-            return None;
+    let (worker, slot) = match assigned {
+        Assigned::Idle(worker, slot) => (worker, slot),
+        Assigned::Fresh(slot) => {
+            let deadline = pending.deadline();
+            match timeout_at(deadline, core.template.clone().spawn()).await {
+                Ok(Ok(worker)) => (worker, slot),
+                // `spawn` already stopped anything it started; the request
+                // never ran.
+                Ok(Err(error)) => {
+                    pending.fail_unsent(error);
+                    return None;
+                }
+                Err(_) => {
+                    pending.fail_unsent(RunpyError::Timeout(TimeoutStage::Queued));
+                    return None;
+                }
+            }
         }
     };
     if pending.is_abandoned() || core.closed.load(Ordering::Acquire) {
@@ -389,13 +532,44 @@ async fn run(
         Ok(control_plane) => control_plane.enqueue(&worker_id, inner),
         Err(_) => drop(inner),
     }
-    relay.finish(outcome.await, &worker_id);
+    let outcome = outcome.await;
+    let ended_normally = matches!(outcome, Ok(Ok(_) | Err(RunpyError::Execution { .. })));
+    relay.finish(outcome, &worker_id);
     core.active.lock().remove(&worker_id);
-    retire(worker).await
+
+    let (worker, slot) = if ended_normally && worker.is_ready() {
+        match core.park(worker, slot) {
+            Ok(()) => return None,
+            Err(returned) => returned,
+        }
+    } else {
+        (worker, slot)
+    };
+    let exit = retire(worker).await;
+    drop(slot);
+    exit
 }
 
-/// Terminate a worker that finished its request and return its exit, or
-/// `None` if the Manager is gone and nothing retained it.
+/// Retire a parked worker whose idle timeout passed, unless new work took it
+/// first: a stale timer can never stop a busy worker.
+async fn expire_idle(
+    core: Arc<PoolCore>,
+    token: u64,
+    idle_timeout: Duration,
+) -> Option<WorkerExit> {
+    tokio::time::sleep(idle_timeout).await;
+    let entry = {
+        let mut idle = core.idle.lock();
+        let position = idle.iter().position(|entry| entry.token == token)?;
+        idle.swap_remove(position)
+    };
+    let exit = retire(entry.worker).await;
+    drop(entry.slot);
+    exit
+}
+
+/// Terminate a worker and return its exit, or `None` if the Manager is gone
+/// and nothing retained it.
 async fn retire(worker: Worker) -> Option<WorkerExit> {
     match worker.terminate().await {
         Ok(exit) => Some(exit),

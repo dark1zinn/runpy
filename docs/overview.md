@@ -348,16 +348,16 @@ let second = pool.submit(Data::from_iter([("text".into(), json!("b"))]), Duratio
 let (first, second) = tokio::join!(first.result(), second.result());
 ```
 
-Pools are cold and do not reuse workers:
+Pools are cold and, by default, do not reuse workers:
 
 - Creating a pool starts no process. Requests wait in a FIFO queue and each
   starts its own worker when a pool slot is free. A pool runs at most
   `max_workers` workers (default: the Manager's `max_workers`), and every
   pool and direct `spawn` share the Manager-wide worker cap.
-- A worker runs exactly one request and is terminated after the request's
-  terminal result. Its pool slot frees only once its process group has been
-  stopped and reaped, so no state carries between requests and requests must
-  not rely on affinity.
+- Without reuse, a worker runs exactly one request and is terminated after
+  the request's terminal result. Its pool slot frees only once its process
+  group has been stopped and reaped, so no state carries between requests
+  and requests must not rely on affinity.
 - `submit` waits within the request deadline for pool queue capacity
   (`queue_capacity`, default 64) and the Manager-wide `max_pending_requests`;
   `try_submit` fails with `QueueFull` instead of waiting. The pending budget
@@ -369,10 +369,39 @@ Pools are cold and do not reuse workers:
   out while running keeps its worker and pool slot busy until the worker
   answers. Requests are never replayed.
 - `WorkerPool::close` rejects new requests, fails queued ones with
-  `PoolClosed`, terminates running workers within the shutdown grace (their
-  requests fail with `OutcomeUnknown`), and returns their exits. The Manager
-  owns every pool: dropping all handles keeps serving submitted requests,
-  and dropping the Manager stops pool tasks and kills their workers.
+  `PoolClosed`, terminates running and idle workers within the shutdown grace
+  (interrupted requests fail with `OutcomeUnknown`), and returns their exits.
+  The Manager owns every pool: dropping all handles keeps serving submitted
+  requests, and dropping the Manager stops pool tasks and kills their workers.
+
+### Opt-in worker reuse
+
+`PoolConfig::reuse_workers(true)` keeps a worker after its request and hands
+it the next queued request before starting a new process. A worker is parked
+for reuse only after `done` or a reported execution error; a worker that
+exited, broke the protocol, or lost its connection is retired. A request whose
+caller timed out still occupies its worker until it answers, so a worker never
+runs two requests. An idle worker is retired after `idle_timeout` (default
+30 s); taking it for new work cancels that timer, so a stale timer never stops
+a busy worker.
+
+Reuse keeps everything a process accumulated: imports, module globals,
+caches, open files, and leaked memory. Nothing is reset between requests, and
+any request may land on any worker. Use reuse to amortize startup, and keep
+results independent of what a worker served before. A per-process cache is
+fine when a miss gives the same answer:
+
+```python
+from functools import lru_cache
+
+@lru_cache(maxsize=1024)
+def load_model(name):  # warm after the first request on this process
+    ...
+
+class Parser(Worker):
+    def execute(self, data):
+        return {"tokens": load_model(data["model"]).parse(data["text"])}
+```
 
 ## Protocol reference
 

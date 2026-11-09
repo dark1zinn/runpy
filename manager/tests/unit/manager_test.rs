@@ -65,6 +65,8 @@ while True:
         sys.exit(0)
     if operation == "execute":
         data = envelope["data"]
+        if data.get("exit"):
+            os._exit(1)
         if "record" in data:
             record(data["record"], "start")
         if "barrier" in data:
