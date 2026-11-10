@@ -150,6 +150,45 @@ async fn failed_warm_start_rolls_back_the_reservation() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn a_busy_pool_stays_open_while_a_request_restores_its_minimum() {
+    let fixture = Fixture::new().await;
+    let pool = fixture.pool(warm(1).max_workers(2)).await;
+    let minimum = pool.execute(data(json!({})), LONG).await.unwrap()["pid"]
+        .as_u64()
+        .unwrap();
+
+    // Both pool slots run long requests and a third waits for a slot.
+    let first = pool
+        .submit(data(json!({ "sleep": 7 })), LONG * 2)
+        .await
+        .unwrap();
+    let second = pool
+        .submit(data(json!({ "sleep": 7 })), LONG * 2)
+        .await
+        .unwrap();
+    eventually(async || fixture.launches() == 2, "both slots busy").await;
+    let queued = pool
+        .submit(data(json!({ "sleep": 1 })), LONG * 2)
+        .await
+        .unwrap();
+
+    // The minimum dies mid-request. The queued request takes its slot and
+    // reservation before the replacement can, and so restores the minimum;
+    // the replacement must wait instead of closing the busy pool.
+    unsafe { libc::kill(minimum as libc::pid_t, libc::SIGKILL) };
+    assert!(matches!(
+        first.result().await,
+        Err(RunpyError::OutcomeUnknown { .. })
+    ));
+    queued.result().await.unwrap();
+    second.result().await.unwrap();
+    // Past the 5 s after which replacement used to give up and close.
+    pool.execute(data(json!({})), LONG).await.unwrap();
+    pool.close().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn lost_minimum_worker_is_replaced_once_or_the_pool_closes() {
     let fixture = Fixture::new().await;
     let pool = fixture.pool(warm(1).max_workers(1)).await;

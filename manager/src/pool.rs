@@ -735,7 +735,9 @@ async fn run(
     };
     if pending.is_abandoned() || core.closed.load(Ordering::Acquire) {
         pending.fail_unsent(RunpyError::PoolClosed);
-        return finish_lease(&core, lease, false).await;
+        // A still-ready worker is parked (parking refuses once the pool is
+        // closed or reuse is off); one that is no longer ready is retired.
+        return finish_lease(&core, lease, true).await;
     }
 
     let worker_id = lease.worker.id().to_string();
@@ -754,8 +756,8 @@ async fn run(
     finish_lease(&core, lease, ended_normally).await
 }
 
-/// Park a healthy worker or retire it; a retired minimum worker that failed
-/// is replaced once.
+/// Park a healthy worker or retire it; a retired minimum worker is replaced
+/// once while the pool is open (parking only fails once it closed).
 async fn finish_lease(core: &Arc<PoolCore>, lease: Lease, healthy: bool) -> Option<WorkerExit> {
     let lease = if healthy && lease.worker.is_ready() {
         match core.park(lease) {
@@ -767,32 +769,34 @@ async fn finish_lease(core: &Arc<PoolCore>, lease: Lease, healthy: bool) -> Opti
     };
     let reserved = lease.reserved;
     let exit = retire_lease(lease).await;
-    if reserved && !healthy && !core.closed.load(Ordering::Acquire) {
+    if reserved && !core.closed.load(Ordering::Acquire) {
         core.spawn_run(replace_minimum(core.clone()));
     }
     exit
 }
 
-/// One startup attempt to restore a lost minimum worker. If it fails the
-/// pool closes rather than retrying in a loop.
+/// Restore a lost minimum worker with one startup attempt.
+///
+/// Waits, until the pool closes, for a free reservation and a pool slot
+/// instead of failing a busy pool: the lost worker's reservation frees once
+/// it is reaped, and if a request claims it first that worker restores the
+/// minimum and this task keeps waiting harmlessly. The reservation semaphore
+/// bounds reserved workers, so waiting can never overshoot the minimum. Only
+/// a failed start closes the pool, rather than retrying in a loop.
 async fn replace_minimum(core: Arc<PoolCore>) -> Option<WorkerExit> {
-    /// Time allowed for the lost worker's slots to be released.
-    const SLOT_WAIT: Duration = Duration::from_secs(5);
+    let mut closing = core.closing.subscribe();
+    let permits = async {
+        let process = core.reserve.clone().acquire_owned().await.ok()?;
+        let slot = core.slots.clone().acquire_owned().await.ok()?;
+        Some((slot, process))
+    };
+    let (slot, process) = tokio::select! {
+        permits = permits => permits?,
+        _ = closing.wait_for(|closing| *closing) => return None,
+    };
     if core.closed.load(Ordering::Acquire) {
         return None;
     }
-    let slots = timeout(SLOT_WAIT, async {
-        let slot = core.slots.clone().acquire_owned().await.ok()?;
-        let process = core.reserve.clone().acquire_owned().await.ok()?;
-        Some((slot, process))
-    })
-    .await
-    .ok()
-    .flatten();
-    let Some((slot, process)) = slots else {
-        core.fail(&RunpyError::Timeout(TimeoutStage::Admission));
-        return None;
-    };
     match core.template.clone().spawn_with(Some(process)).await {
         Ok(worker) => {
             let lease = Lease {
