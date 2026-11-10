@@ -172,9 +172,10 @@ Manager's stdin, which is otherwise the null device.
 
 ### 3. Spawn the process
 
-`WorkerBuilder::spawn` revalidates `uv` and the scripts directory,
-canonicalizes runtime paths, verifies the root-level script file, creates a
-unique identity and socket in the Manager's socket directory, and starts:
+`WorkerBuilder::spawn` does not recheck `uv`. It requires the name to be a
+single path component, canonicalizes runtime paths, verifies that
+`<scripts-directory>/<name>.py` is a file, creates a unique identity and
+socket in the Manager's socket directory, and starts:
 
 ```text
 uv run --no-project [--locked] --script <script.py> <socket-path> <worker-id> [--key=value ...]
