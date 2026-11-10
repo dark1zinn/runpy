@@ -90,9 +90,11 @@ class Waiting(AsyncWorker):
     def __init__(self, *args):
         super().__init__(*args)
         self.released = asyncio.Event()
+        self.started = asyncio.Event()
         self.cancelled = False
 
     async def execute(self, data):
+        self.started.set()
         if data.get("forever"):
             try:
                 await asyncio.sleep(3600)
@@ -124,7 +126,7 @@ def test_cancel_stops_the_active_request_with_one_terminal_answer():
     async def scenario():
         manager, worker, task, _ = await connect(Waiting)
         await manager.send({"x_op": "execute", "x_req": "1"}, {"forever": True})
-        await asyncio.sleep(0.05)
+        await asyncio.wait_for(worker.started.wait(), TIMEOUT)
         await manager.send({"x_op": "cancel", "x_req": "1"})
         answer = await manager.recv()
         assert answer["meta"] == {
@@ -147,8 +149,35 @@ def test_cancel_stops_the_active_request_with_one_terminal_answer():
     run(scenario())
 
 
+def test_cancel_right_behind_execute_gets_exactly_one_terminal_answer():
+    async def scenario():
+        manager, _, task, _ = await connect(Waiting)
+        # Both frames arrive together; the cancel may be read before the
+        # request task has run at all.
+        await manager.send({"x_op": "execute", "x_req": "1"}, {"forever": True})
+        await manager.send({"x_op": "cancel", "x_req": "1"})
+        answer = await manager.recv()
+        assert (answer["meta"]["x_op"], answer["meta"]["x_req"]) == ("cancelled", "1")
+        assert answer["data"] == {"status": "cancelled"}
+
+        # The worker accepts the next request, and nothing else follows for 1.
+        await manager.send({"x_op": "execute", "x_req": "2"})
+        await manager.send({"note": "release"})
+        done = await manager.recv()
+        assert (done["meta"]["x_op"], done["meta"]["x_req"]) == ("done", "2")
+        await manager.send({"x_op": "terminate"})
+        await asyncio.wait_for(task, TIMEOUT)
+
+    run(scenario())
+
+
 class Stubborn(AsyncWorker):
+    def __init__(self, *args):
+        super().__init__(*args)
+        self.started = asyncio.Event()
+
     async def execute(self, data):
+        self.started.set()
         try:
             await asyncio.sleep(3600)
         except asyncio.CancelledError:
@@ -158,9 +187,9 @@ class Stubborn(AsyncWorker):
 
 def test_suppressed_cancellation_reports_the_result_then_already_finished():
     async def scenario():
-        manager, _, task, _ = await connect(Stubborn)
+        manager, worker, task, _ = await connect(Stubborn)
         await manager.send({"x_op": "execute", "x_req": "1"})
-        await asyncio.sleep(0.05)
+        await asyncio.wait_for(worker.started.wait(), TIMEOUT)
         await manager.send({"x_op": "cancel", "x_req": "1"})
         done = await manager.recv()
         assert (done["meta"]["x_op"], done["data"]) == ("done", {"finished": True})
@@ -192,7 +221,7 @@ def test_terminate_cancels_the_active_request():
     async def scenario():
         manager, worker, task, _ = await connect(Waiting)
         await manager.send({"x_op": "execute", "x_req": "1"}, {"forever": True})
-        await asyncio.sleep(0.05)
+        await asyncio.wait_for(worker.started.wait(), TIMEOUT)
         await manager.send({"x_op": "terminate"})
         await asyncio.wait_for(task, TIMEOUT)
         assert worker.cancelled

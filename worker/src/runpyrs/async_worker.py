@@ -329,6 +329,11 @@ class AsyncWorker:
                         self._run_request(active, envelope["data"])
                     )
                     self._active = active
+                    # Let the task enter `_run_request` before the next frame
+                    # is read: a task cancelled before it starts never runs
+                    # its handler, so a `cancel` already buffered behind this
+                    # `execute` would get no answer and leave it active.
+                    await asyncio.sleep(0)
                 elif operation == "cancel":
                     await self._cancel(envelope["meta"]["x_req"])
                 else:
