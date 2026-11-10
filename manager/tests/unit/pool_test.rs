@@ -189,6 +189,46 @@ async fn a_busy_pool_stays_open_while_a_request_restores_its_minimum() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn close_returns_promptly_while_a_replacement_waits_for_capacity() {
+    let fixture = Fixture::new().await;
+    let pool = fixture.pool(warm(1).max_workers(2)).await;
+    let minimum = pool.execute(data(json!({})), LONG).await.unwrap()["pid"]
+        .as_u64()
+        .unwrap();
+    let first = pool
+        .submit(data(json!({ "sleep": 30 })), LONG * 6)
+        .await
+        .unwrap();
+    let _second = pool
+        .submit(data(json!({ "sleep": 30 })), LONG * 6)
+        .await
+        .unwrap();
+    eventually(async || fixture.launches() == 2, "both slots busy").await;
+    let _queued = pool
+        .submit(data(json!({ "sleep": 30 })), LONG * 6)
+        .await
+        .unwrap();
+
+    // The queued request takes the dead minimum's slot and reservation, so
+    // the replacement is left waiting for capacity that will not free up.
+    unsafe { libc::kill(minimum as libc::pid_t, libc::SIGKILL) };
+    assert!(matches!(
+        first.result().await,
+        Err(RunpyError::OutcomeUnknown { .. })
+    ));
+    eventually(async || fixture.launches() == 3, "queued request started").await;
+
+    // Running workers get the shutdown grace. The waiting replacement must
+    // not hold `close` beyond it: it leaves on the closing signal, and the
+    // capacity it waits for is released as `close` retires the workers.
+    tokio::time::timeout(Duration::from_secs(8), pool.close())
+        .await
+        .expect("close waited on the pending replacement");
+    assert!(fixture.manager.watchdog().report().await.is_empty());
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn lost_minimum_worker_is_replaced_once_or_the_pool_closes() {
     let fixture = Fixture::new().await;
     let pool = fixture.pool(warm(1).max_workers(1)).await;
