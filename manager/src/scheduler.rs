@@ -114,8 +114,8 @@ impl Scheduler {
     }
 
     /// Ask one pool other than `except` to retire an idle worker above its
-    /// minimum, freeing a Manager-wide slot.
-    fn reclaim_idle(&self, except: Option<u64>) {
+    /// minimum, freeing a Manager-wide slot. Returns whether one was retired.
+    fn reclaim_idle(&self, except: Option<u64>) -> bool {
         let pools: Vec<Arc<PoolCore>> = self
             .state
             .lock()
@@ -124,11 +124,7 @@ impl Scheduler {
             .filter(|(id, _)| Some(*id) != except)
             .filter_map(|(_, pool)| pool.upgrade())
             .collect();
-        for pool in pools {
-            if pool.retire_surplus_idle() {
-                return;
-            }
-        }
+        pools.iter().any(|pool| pool.retire_surplus_idle())
     }
 }
 
@@ -149,21 +145,29 @@ async fn grant(this: Arc<Scheduler>) {
             continue;
         };
 
-        let mut slot = loop {
-            match this.processes.clone().try_acquire_owned() {
-                Ok(slot) => break slot,
-                Err(TryAcquireError::Closed) => return,
-                Err(TryAcquireError::NoPermits) => {}
-            }
-            // No free slot: retire idle surplus elsewhere, then wait. Retry
-            // reclaiming periodically, since other pools may park workers.
-            this.reclaim_idle(Some(next));
-            tokio::select! {
-                slot = this.processes.clone().acquire_owned() => match slot {
-                    Ok(slot) => break slot,
-                    Err(_) => return,
-                },
-                () = sleep(RECLAIM_INTERVAL) => {}
+        let mut slot = match this.processes.clone().try_acquire_owned() {
+            Ok(slot) => slot,
+            Err(TryAcquireError::Closed) => return,
+            Err(TryAcquireError::NoPermits) => {
+                // One acquire future for the whole wait keeps this grant's
+                // place in the semaphore queue. Idle surplus elsewhere is
+                // retired at most once per grant; until one is found, retry
+                // periodically, since other pools may park workers.
+                let acquire = this.processes.clone().acquire_owned();
+                tokio::pin!(acquire);
+                let mut reclaimed = false;
+                loop {
+                    if !reclaimed {
+                        reclaimed = this.reclaim_idle(Some(next));
+                    }
+                    tokio::select! {
+                        slot = &mut acquire => match slot {
+                            Ok(slot) => break slot,
+                            Err(_) => return,
+                        },
+                        () = sleep(RECLAIM_INTERVAL), if !reclaimed => {}
+                    }
+                }
             }
         };
 
