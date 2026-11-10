@@ -49,3 +49,10 @@ def test_outbound_nesting_is_bounded():
     assert encode_frame({"meta": {}, "data": {"v": value}}, 1 << 20)
     with pytest.raises(ValueError, match="maximum depth"):
         encode_frame({"meta": {}, "data": {"v": [value]}}, 1 << 20)
+
+
+def test_self_referencing_values_are_rejected_instead_of_looping():
+    cyclic: list = []
+    cyclic.append(cyclic)
+    with pytest.raises(ValueError, match="maximum depth"):
+        encode_frame({"meta": {}, "data": {"v": cyclic}}, 1 << 20)

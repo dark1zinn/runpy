@@ -154,17 +154,22 @@ def check_depth(payload: bytes) -> None:
 
 
 def value_depth(value: object) -> int:
-    """Container nesting of ``value``, computed without recursion."""
+    """Container nesting of ``value``, computed without recursion.
+
+    Traversal stops at the first container deeper than
+    :data:`MAX_JSON_DEPTH` and returns that depth, so self-referencing
+    containers terminate and are rejected as too deep.
+    """
     deepest = 0
     pending = [(value, 1)]
     while pending:
         item, level = pending.pop()
-        if isinstance(item, dict):
+        if isinstance(item, (dict, list, tuple)):
+            if level > MAX_JSON_DEPTH:
+                return level
             deepest = max(deepest, level)
-            pending.extend((child, level + 1) for child in item.values())
-        elif isinstance(item, (list, tuple)):
-            deepest = max(deepest, level)
-            pending.extend((child, level + 1) for child in item)
+            children = item.values() if isinstance(item, dict) else item
+            pending.extend((child, level + 1) for child in children)
     return deepest
 
 
