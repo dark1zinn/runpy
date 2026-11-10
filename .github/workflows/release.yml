@@ -36,6 +36,9 @@ jobs:
 
       - name: Check tag format, manifest versions, and reachability from main
         id: check
+        # An explicit bash shell runs with `-eo pipefail`, so a failing check
+        # fails the step even though `tee` succeeds.
+        shell: bash
         run: python3 scripts/release-check.py "$GITHUB_REF_NAME" | tee -a "$GITHUB_OUTPUT"
 
   # The full quality gate on the exact tag commit.
