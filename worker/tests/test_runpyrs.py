@@ -797,13 +797,16 @@ def _serve(path, behaviour):
     listener.listen(1)
 
     def manager():
-        connection, _ = listener.accept()
-        connection.settimeout(5)
+        connection = None
         try:
+            listener.settimeout(10)
+            connection, _ = listener.accept()
+            connection.settimeout(5)
             read_envelope(connection)
             behaviour(connection)
         finally:
-            connection.close()
+            if connection is not None:
+                connection.close()
             listener.close()
 
     return manager
