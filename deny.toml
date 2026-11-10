@@ -1,0 +1,42 @@
+# cargo-deny policy. Run `cargo deny check` from the repository root.
+#
+# Suppressions: every `[advisories] ignore` entry must be a table with the
+# advisory `id` and a `reason` that ends with "(expires YYYY-MM-DD)".
+# scripts/check-suppressions.py enforces this and fails after the date.
+
+[graph]
+all-features = true
+
+[advisories]
+# Unmaintained and unsound crates are reported like vulnerabilities.
+unmaintained = "all"
+yanked = "deny"
+ignore = []
+
+[licenses]
+# Permissive licenses compatible with distributing runpy under Apache-2.0.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+]
+confidence-threshold = 0.9
+# BSD-3-Clause and ISC are approved even while no dependency uses them.
+unused-allowed-license = "allow"
+# The examples are unpublished workspace members, not distributed code.
+private = { ignore = true }
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Workspace path dependencies are versionless by design.
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

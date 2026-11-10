@@ -15,16 +15,32 @@
 //!
 //! ## Usage
 //!
-//! ```ignore
-//! let manager = runpy::Manager::new("./scripts");
+//! ```no_run
+//! # fn demo(manager: &runpy::Manager) {
 //! let log = manager.logger();
 //! log.info("Worker started");
 //! log.debug("Connection established");
 //! log.error("Failed to connect");
+//! # }
 //! ```
 
 use chrono::Local;
 use std::env;
+use std::fmt;
+use std::io::Write;
+
+/// Write one diagnostic line to stderr.
+///
+/// Logging is best effort: a closed or broken stderr must not panic (as
+/// `eprintln!` would) or recursively log, so write errors are ignored. The
+/// line is written under the stderr lock so concurrent lines do not
+/// interleave.
+fn write_line(line: fmt::Arguments<'_>) {
+    let mut stderr = std::io::stderr().lock();
+    let _ = stderr
+        .write_fmt(line)
+        .and_then(|()| stderr.write_all(b"\n"));
+}
 
 // ── ANSI Color Codes ───────────────────────────────────────────────────
 
@@ -108,11 +124,10 @@ impl LogLevel {
 /// defaults to `info`. Presence of `NO_COLOR` disables ANSI colors.
 ///
 /// ```no_run
-/// use runpy::Manager;
-///
-/// let manager = Manager::new("worker");
+/// # fn demo(manager: &runpy::Manager) {
 /// let logger = manager.logger();
 /// logger.info_with("Startup", "manager created");
+/// # }
 /// ```
 #[derive(Debug, Clone)]
 pub struct Scribbler {
@@ -180,13 +195,16 @@ impl Scribbler {
                 .map(|c| format!("{CYAN}{}{RESET} ", c))
                 .unwrap_or_default();
 
-            eprintln!(
+            write_line(format_args!(
                 "{DIM}{}{RESET} {BOLD}{}{}{RESET} {component_str}{}",
                 timestamp, color, prefix, message
-            );
+            ));
         } else {
             let component_str = component.map(|c| format!("[{}] ", c)).unwrap_or_default();
-            eprintln!("{} {} {}{}", timestamp, prefix, component_str, message);
+            write_line(format_args!(
+                "{} {} {}{}",
+                timestamp, prefix, component_str, message
+            ));
         }
     }
 
@@ -195,8 +213,9 @@ impl Scribbler {
     /// Log an untagged error unless logging is off.
     ///
     /// ```no_run
-    /// # let manager = runpy::Manager::new("worker");
+    /// # fn demo(manager: &runpy::Manager) {
     /// manager.logger().error("worker launch failed");
+    /// # }
     /// ```
     pub fn error(&self, message: &str) {
         self.log(LogLevel::Error, None, message);
@@ -205,8 +224,9 @@ impl Scribbler {
     /// Log an error with a component tag.
     ///
     /// ```no_run
-    /// # let manager = runpy::Manager::new("worker");
+    /// # fn demo(manager: &runpy::Manager) {
     /// manager.logger().error_with("Worker", "launch failed");
+    /// # }
     /// ```
     pub fn error_with(&self, component: &str, message: &str) {
         self.log(LogLevel::Error, Some(component), message);
@@ -215,8 +235,9 @@ impl Scribbler {
     /// Log an untagged warning when warning output is enabled.
     ///
     /// ```no_run
-    /// # let manager = runpy::Manager::new("worker");
+    /// # fn demo(manager: &runpy::Manager) {
     /// manager.logger().warning("worker stderr was non-empty");
+    /// # }
     /// ```
     pub fn warning(&self, message: &str) {
         self.log(LogLevel::Warning, None, message);
@@ -225,8 +246,9 @@ impl Scribbler {
     /// Log a warning with a component tag.
     ///
     /// ```no_run
-    /// # let manager = runpy::Manager::new("worker");
+    /// # fn demo(manager: &runpy::Manager) {
     /// manager.logger().warning_with("Watchdog", "worker exited");
+    /// # }
     /// ```
     pub fn warning_with(&self, component: &str, message: &str) {
         self.log(LogLevel::Warning, Some(component), message);
@@ -235,8 +257,9 @@ impl Scribbler {
     /// Log untagged operational information when info output is enabled.
     ///
     /// ```no_run
-    /// # let manager = runpy::Manager::new("worker");
+    /// # fn demo(manager: &runpy::Manager) {
     /// manager.logger().info("worker connected");
+    /// # }
     /// ```
     pub fn info(&self, message: &str) {
         self.log(LogLevel::Info, None, message);
@@ -245,8 +268,9 @@ impl Scribbler {
     /// Log operational information with a component tag.
     ///
     /// ```no_run
-    /// # let manager = runpy::Manager::new("worker");
+    /// # fn demo(manager: &runpy::Manager) {
     /// manager.logger().info_with("Protocol", "worker ready");
+    /// # }
     /// ```
     pub fn info_with(&self, component: &str, message: &str) {
         self.log(LogLevel::Info, Some(component), message);
@@ -255,8 +279,9 @@ impl Scribbler {
     /// Log untagged diagnostics when debug or verbose output is enabled.
     ///
     /// ```no_run
-    /// # let manager = runpy::Manager::new("worker");
+    /// # fn demo(manager: &runpy::Manager) {
     /// manager.logger().debug("indexed worker scripts");
+    /// # }
     /// ```
     pub fn debug(&self, message: &str) {
         self.log(LogLevel::Debug, None, message);
@@ -265,8 +290,9 @@ impl Scribbler {
     /// Log diagnostics with a component tag.
     ///
     /// ```no_run
-    /// # let manager = runpy::Manager::new("worker");
+    /// # fn demo(manager: &runpy::Manager) {
     /// manager.logger().debug_with("Integrity", "check complete");
+    /// # }
     /// ```
     pub fn debug_with(&self, component: &str, message: &str) {
         self.log(LogLevel::Debug, Some(component), message);
@@ -275,8 +301,9 @@ impl Scribbler {
     /// Log untagged trace detail only when verbose output is enabled.
     ///
     /// ```no_run
-    /// # let manager = runpy::Manager::new("worker");
+    /// # fn demo(manager: &runpy::Manager) {
     /// manager.logger().verbose("received envelope");
+    /// # }
     /// ```
     pub fn verbose(&self, message: &str) {
         self.log(LogLevel::Verbose, None, message);
@@ -285,8 +312,9 @@ impl Scribbler {
     /// Log trace detail with a component tag.
     ///
     /// ```no_run
-    /// # let manager = runpy::Manager::new("worker");
+    /// # fn demo(manager: &runpy::Manager) {
     /// manager.logger().verbose_with("Protocol", "frame decoded");
+    /// # }
     /// ```
     pub fn verbose_with(&self, component: &str, message: &str) {
         self.log(LogLevel::Verbose, Some(component), message);
@@ -297,19 +325,20 @@ impl Scribbler {
     /// Log a visually emphasized success message at info level.
     ///
     /// ```no_run
-    /// # let manager = runpy::Manager::new("worker");
+    /// # fn demo(manager: &runpy::Manager) {
     /// manager.logger().success("worker spawned");
+    /// # }
     /// ```
     pub fn success(&self, message: &str) {
         if self.should_log(LogLevel::Info) {
             let timestamp = Local::now().format("%H:%M:%S%.3f");
             if self.use_colors {
-                eprintln!(
+                write_line(format_args!(
                     "{DIM}{}{RESET} {BOLD}{GREEN}  ✓  {RESET} {}",
                     timestamp, message
-                );
+                ));
             } else {
-                eprintln!("{} [OK] {}", timestamp, message);
+                write_line(format_args!("{} [OK] {}", timestamp, message));
             }
         }
     }
@@ -317,19 +346,20 @@ impl Scribbler {
     /// Log a numbered progress step at info level.
     ///
     /// ```no_run
-    /// # let manager = runpy::Manager::new("worker");
+    /// # fn demo(manager: &runpy::Manager) {
     /// manager.logger().step(2, "starting workers");
+    /// # }
     /// ```
     pub fn step(&self, step: u32, message: &str) {
         if self.should_log(LogLevel::Info) {
             let timestamp = Local::now().format("%H:%M:%S%.3f");
             if self.use_colors {
-                eprintln!(
+                write_line(format_args!(
                     "{DIM}{}{RESET} {BOLD}{CYAN}[{:>2}]{RESET} {}",
                     timestamp, step, message
-                );
+                ));
             } else {
-                eprintln!("{} [{:>2}] {}", timestamp, step, message);
+                write_line(format_args!("{} [{:>2}] {}", timestamp, step, message));
             }
         }
     }
@@ -337,15 +367,18 @@ impl Scribbler {
     /// Log a visual separator when info output is enabled.
     ///
     /// ```no_run
-    /// # let manager = runpy::Manager::new("worker");
+    /// # fn demo(manager: &runpy::Manager) {
     /// manager.logger().separator();
+    /// # }
     /// ```
     pub fn separator(&self) {
         if self.should_log(LogLevel::Info) {
             if self.use_colors {
-                eprintln!("{DIM}────────────────────────────────────────{RESET}");
+                write_line(format_args!(
+                    "{DIM}────────────────────────────────────────{RESET}"
+                ));
             } else {
-                eprintln!("----------------------------------------");
+                write_line(format_args!("----------------------------------------"));
             }
         }
     }
@@ -368,6 +401,43 @@ impl Scribbler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Child half of [`logging_survives_a_closed_stderr`]: logs every kind of
+    /// line into a stderr whose reader is gone.
+    #[test]
+    #[ignore = "run only as a subprocess of logging_survives_a_closed_stderr"]
+    fn closed_stderr_child() {
+        if std::env::var_os("RUNPY_CLOSED_STDERR_CHILD").is_none() {
+            return;
+        }
+        let log = Scribbler::with_level(LogLevel::Verbose);
+        for _ in 0..1000 {
+            log.error("error");
+            log.info_with("Component", "info");
+            log.success("success");
+            log.step(1, "step");
+            log.separator();
+        }
+    }
+
+    #[test]
+    fn logging_survives_a_closed_stderr() {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "scribbler::tests::closed_stderr_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("RUNPY_CLOSED_STDERR_CHILD", "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        // Close the read end so every write to the child's stderr fails.
+        drop(child.stderr.take());
+        assert!(child.wait().unwrap().success(), "logging panicked");
+    }
 
     #[test]
     fn log_level_ordering() {

@@ -1,0 +1,67 @@
+name: Audit
+
+# Advisory databases change independently of this repository, so the
+# advisory audit runs on a schedule and on lockfile changes instead of
+# gating unrelated pull requests. Licenses, bans, and sources are part of the
+# required quality gate.
+on:
+  schedule:
+    - cron: "41 5 * * *"
+  push:
+    branches:
+      - main
+    paths:
+      - 'Cargo.lock'
+      - 'uv.lock'
+      - 'deny.toml'
+      - 'audit-suppressions.toml'
+  pull_request:
+    paths:
+      - 'Cargo.lock'
+      - 'uv.lock'
+      - 'deny.toml'
+      - 'audit-suppressions.toml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: Rust advisories
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install cargo-deny
+        run: scripts/install-cargo-deny.sh
+
+      - name: Validate suppressions
+        run: python3 scripts/check-suppressions.py
+
+      - name: Check advisories
+        run: cargo deny --locked check advisories
+
+  python:
+    name: Python advisories
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
+
+      # runpyrs has no runtime dependencies; this audits the locked
+      # development and build tooling (pytest, ruff, mypy, build, ...).
+      - name: Audit the locked Python environment
+        run: |
+          ignores=$(python3 scripts/check-suppressions.py --pip-audit-args)
+          uv export --frozen --all-packages --group dev --no-emit-workspace \
+            --format requirements-txt -o "$RUNNER_TEMP/requirements.txt"
+          # shellcheck disable=SC2086 # ignores is a list of flags
+          uv run --frozen pip-audit --disable-pip --require-hashes \
+            -r "$RUNNER_TEMP/requirements.txt" $ignores

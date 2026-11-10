@@ -1,0 +1,42 @@
+{
+  "description": "Frame bodies and whether the receiving peer accepts them. direction is the sender: worker_to_manager vectors are checked by the Rust Manager, manager_to_worker vectors by both Python SDKs. Bodies are UTF-8 strings unless body_hex is given; depth vectors are generated envelopes nested that many levels. frames are complete wire byte streams (8-byte little-endian length header plus body) checked by every reader under default limits.",
+  "frames": [
+    {"name": "valid frame", "valid": true, "frame_hex": "15000000000000007b226d657461223a7b7d2c2264617461223a7b7d7d"},
+    {"name": "zero length", "valid": false, "frame_hex": "0000000000000000"},
+    {"name": "length beyond any limit", "valid": false, "frame_hex": "ffffffffffffffff7b7d"},
+    {"name": "truncated header", "valid": false, "frame_hex": "1500"},
+    {"name": "truncated body", "valid": false, "frame_hex": "15000000000000007b226d65"}
+  ],
+  "vectors": [
+    {"name": "minimal custom", "direction": "worker_to_manager", "valid": true, "body": "{\"meta\":{},\"data\":{}}"},
+    {"name": "unicode names and values", "direction": "worker_to_manager", "valid": true, "body": "{\"meta\":{\"clé\":\"値\"},\"data\":{\"emoji\":\"😀\",\"\\u00e9\":1,\"e\\u0301\":2}}"},
+    {"name": "done with request id", "direction": "worker_to_manager", "valid": true, "body": "{\"meta\":{\"x_op\":\"done\",\"x_req\":\"1\"},\"data\":{}}"},
+    {"name": "unsolicited error", "direction": "worker_to_manager", "valid": true, "body": "{\"meta\":{\"x_op\":\"error\"},\"data\":{\"kind\":\"E\",\"message\":\"m\"}}"},
+    {"name": "missing data", "direction": "worker_to_manager", "valid": false, "body": "{\"meta\":{}}"},
+    {"name": "extra top-level field", "direction": "worker_to_manager", "valid": false, "body": "{\"meta\":{},\"data\":{},\"extra\":1}"},
+    {"name": "array data", "direction": "worker_to_manager", "valid": false, "body": "{\"meta\":{},\"data\":[]}"},
+    {"name": "unknown reserved key", "direction": "worker_to_manager", "valid": false, "body": "{\"meta\":{\"x_unknown\":\"v\"},\"data\":{}}"},
+    {"name": "non-string reserved value", "direction": "worker_to_manager", "valid": false, "body": "{\"meta\":{\"x_req\":7,\"x_op\":\"done\"},\"data\":{}}"},
+    {"name": "unknown operation", "direction": "worker_to_manager", "valid": false, "body": "{\"meta\":{\"x_op\":\"retry\"},\"data\":{}}"},
+    {"name": "wrong direction", "direction": "worker_to_manager", "valid": false, "body": "{\"meta\":{\"x_op\":\"execute\",\"x_req\":\"1\"},\"data\":{}}"},
+    {"name": "request id on log", "direction": "worker_to_manager", "valid": false, "body": "{\"meta\":{\"x_op\":\"log\",\"x_req\":\"1\"},\"data\":{}}"},
+    {"name": "duplicate top-level key", "direction": "worker_to_manager", "valid": false, "body": "{\"meta\":{},\"meta\":{},\"data\":{}}"},
+    {"name": "duplicate escaped key", "direction": "worker_to_manager", "valid": false, "body": "{\"meta\":{},\"data\":{\"é\":1,\"\\u00e9\":2}}"},
+    {"name": "non-finite number", "direction": "worker_to_manager", "valid": false, "body": "{\"meta\":{},\"data\":{\"v\":NaN}}"},
+    {"name": "invalid utf-8", "direction": "worker_to_manager", "valid": false, "body_hex": "7b226d657461223a7b7d2c2264617461223a7b2261223a22ff227d7d"},
+    {"name": "truncated json", "direction": "worker_to_manager", "valid": false, "body": "{\"meta\":{},\"data\":{"},
+    {"name": "depth 64", "direction": "worker_to_manager", "valid": true, "depth": 64},
+    {"name": "depth 65", "direction": "worker_to_manager", "valid": false, "depth": 65},
+
+    {"name": "execute", "direction": "manager_to_worker", "valid": true, "body": "{\"meta\":{\"x_op\":\"execute\",\"x_req\":\"1\"},\"data\":{\"k\":[1,2,{\"z\":null}]}}"},
+    {"name": "terminate", "direction": "manager_to_worker", "valid": true, "body": "{\"meta\":{\"x_op\":\"terminate\"},\"data\":{}}"},
+    {"name": "custom with unicode", "direction": "manager_to_worker", "valid": true, "body": "{\"meta\":{\"correlation_id\":42},\"data\":{\"texte\":\"héllo \\\"quoted\\\" [}\"}}"},
+    {"name": "execute without request id", "direction": "manager_to_worker", "valid": false, "body": "{\"meta\":{\"x_op\":\"execute\"},\"data\":{}}"},
+    {"name": "request id on terminate", "direction": "manager_to_worker", "valid": false, "body": "{\"meta\":{\"x_op\":\"terminate\",\"x_req\":\"1\"},\"data\":{}}"},
+    {"name": "worker operation", "direction": "manager_to_worker", "valid": false, "body": "{\"meta\":{\"x_op\":\"done\",\"x_req\":\"1\"},\"data\":{}}"},
+    {"name": "duplicate data key", "direction": "manager_to_worker", "valid": false, "body": "{\"meta\":{},\"data\":{\"k\":1,\"k\":2}}"},
+    {"name": "infinity", "direction": "manager_to_worker", "valid": false, "body": "{\"meta\":{},\"data\":{\"v\":Infinity}}"},
+    {"name": "manager depth 64", "direction": "manager_to_worker", "valid": true, "depth": 64},
+    {"name": "manager depth 65", "direction": "manager_to_worker", "valid": false, "depth": 65}
+  ]
+}

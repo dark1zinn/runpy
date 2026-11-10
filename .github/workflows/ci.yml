@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  quality:
+    name: Quality
+    uses: ./.github/workflows/quality.yml
+
+  # The single required status check. It always runs and fails unless every
+  # gate succeeded, so a skipped, failed, or cancelled gate cannot pass.
+  ci-success:
+    name: CI success
+    if: always()
+    needs: [quality]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every gate to succeed
+        env:
+          RESULT: ${{ needs.quality.result }}
+        run: |
+          echo "quality: $RESULT"
+          test "$RESULT" = success

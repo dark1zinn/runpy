@@ -1,15 +1,20 @@
 # /// script
 # requires-python = ">=3.10"
 # dependencies = [
-#   "runpyrs @ git+https://github.com/dark1zinn/runpy#subdirectory=worker",
+#   "runpyrs",
 # ]
+#
+# # Development example: use the SDK from this checkout. Applications install
+# # runpyrs from Git or a package index instead (see docs/installation.md).
+# [tool.uv.sources]
+# runpyrs = { path = "../../../worker", editable = true }
 # ///
 
-from runpyrs import Worker, RunScript
+from runpyrs import Data, Envelope, RunScript, Worker
 
 
 class MyWorker(Worker):
-    def handle_envelope(self, envelope: dict):
+    def handle_envelope(self, envelope: Envelope) -> None:
         """Handle an application-defined envelope with no ``meta.x_op``."""
         self.log(
             {"message": "Received custom envelope", "envelope": envelope},
@@ -20,7 +25,7 @@ class MyWorker(Worker):
             meta={"some_custom_meta": envelope["meta"].get("some_custom_meta")},
         )
 
-    def execute(self, payload: dict) -> dict:
+    def execute(self, payload: Data) -> Data:
         """Business logic is isolated here."""
         try:
             self.log({"message": "Starting parse operation", "payload": payload})

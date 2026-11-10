@@ -3,9 +3,19 @@ revision = 3
 requires-python = ">=3.10"
 
 [manifest]
-requirements = [{ name = "runpyrs", git = "https://github.com/dark1zinn/runpy?subdirectory=worker" }]
+requirements = [{ name = "runpyrs", editable = "../../../worker" }]
 
 [[package]]
 name = "runpyrs"
 version = "0.1.0"
-source = { git = "https://github.com/dark1zinn/runpy?subdirectory=worker#16caa5383b6e9e031fa18df408cb184c1705b4bd" }
+source = { editable = "../../../worker" }
+
+[package.metadata]
+requires-dist = [{ name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0" }]
+provides-extras = ["dev"]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "pytest", specifier = ">=9.0.2" },
+    { name = "uv", specifier = ">=0.11.2" },
+]

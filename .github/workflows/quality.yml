@@ -1,0 +1,169 @@
+name: Quality
+
+# Every correctness gate, callable from CI and the release workflows. There
+# are no path filters: cross-language integration always runs.
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  LOG: "off"
+
+jobs:
+  workflows:
+    name: Workflow syntax
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Run actionlint
+        run: |
+          scripts/install-actionlint.sh
+          ./actionlint -color
+
+  supply-chain:
+    name: Licenses, bans, and sources
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install cargo-deny
+        run: scripts/install-cargo-deny.sh
+
+      - name: Validate suppressions
+        run: python3 scripts/check-suppressions.py
+
+      - name: Check licenses, bans, and sources
+        run: cargo deny --locked check bans licenses sources
+
+  rust:
+    name: Rust ${{ matrix.rust }} (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            rust: 1.93.0
+          - os: ubuntu-latest
+            rust: stable
+          - os: macos-latest
+            rust: stable
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: ${{ matrix.rust }}
+          components: rustfmt, clippy
+
+      # Rust tests run fake workers on python3 and real ones through uv.
+      - name: Setup uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+      - name: Run tests
+        run: cargo test --workspace --all-features --locked
+
+      - name: Build documentation
+        run: cargo rustdoc -p runpy --locked -- -D warnings -D missing-docs
+
+  integration:
+    name: Integration (${{ matrix.os }}, Python ${{ matrix.python }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.10", "3.14"]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      UV_PYTHON: ${{ matrix.python }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
+
+      - name: Run real uv workers on the local SDK
+        run: cargo test -p runpy --test end_to_end --locked
+
+      - name: Run the playground
+        run: cargo run -p playground --locked
+
+  python:
+    name: Python ${{ matrix.python }}
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
+        with:
+          enable-cache: true
+
+      - name: Check formatting
+        if: matrix.python == '3.10'
+        run: >-
+          uv run --frozen ruff format --check
+          worker/src/runpyrs worker/tests tests scripts examples/playground/worker/my_script.py
+
+      - name: Run Ruff
+        if: matrix.python == '3.10'
+        run: >-
+          uv run --frozen ruff check
+          worker/src/runpyrs worker/tests tests scripts examples/playground/worker/my_script.py
+
+      - name: Type-check the SDK and samples
+        run: uv run --frozen --all-packages --python ${{ matrix.python }} mypy --python-version ${{ matrix.python }}
+
+      - name: Run tests and doctests
+        run: >-
+          uv run --frozen --all-packages --python ${{ matrix.python }}
+          pytest worker/tests tests/docs tests/hooks tests/release --doctest-modules worker/src/runpyrs
+
+  packages:
+    name: Package smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
+
+      - name: Package and consume both packages
+        run: scripts/package-smoke.sh

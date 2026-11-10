@@ -1,35 +1,75 @@
 name: Release
 
+# Source-only releases for vX.Y.Z (stable) and vX.Y.Z-dev[.N] (prerelease).
+# Every tag starting with "v" triggers this workflow so that malformed tags
+# fail visibly instead of being ignored. No artifacts are attached and no
+# registry is published to.
 on:
   push:
     tags:
-      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v*'
+
+# Read-only by default; only the release job may write.
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  release:
-    name: Release
+  verify:
+    name: Verify tag and versions
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      tag: ${{ steps.check.outputs.tag }}
+      prerelease: ${{ steps.check.outputs.prerelease }}
+    steps:
+      - name: Checkout tag commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+
+      - name: Fetch main
+        run: git fetch --no-tags origin main:refs/remotes/origin/main
+
+      - name: Check tag format, manifest versions, and reachability from main
+        id: check
+        # An explicit bash shell runs with `-eo pipefail`, so a failing check
+        # fails the step even though `tee` succeeds.
+        shell: bash
+        run: python3 scripts/release-check.py "$GITHUB_REF_NAME" | tee -a "$GITHUB_OUTPUT"
+
+  # The full quality gate on the exact tag commit.
+  quality:
+    name: Quality
+    needs: verify
+    uses: ./.github/workflows/quality.yml
+
+  release:
+    name: Create or update release
+    needs: [verify, quality]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: write
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Validate tag format (must be exact vX.X.X)
-        run: |
-          TAG="${GITHUB_REF#refs/tags/}"
-          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::Tag '$TAG' does not match release format vX.X.X"
-            exit 1
-          fi
-          echo "TAG=$TAG" >> $GITHUB_ENV
-          echo "✓ Valid release tag: $TAG"
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          name: Release ${{ env.TAG }}
-          generate_release_notes: true
+      # Idempotent: a rerun updates the existing release instead of failing
+      # or creating a duplicate.
+      - name: Publish source release
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.verify.outputs.tag }}
+          PRERELEASE: ${{ needs.verify.outputs.prerelease }}
+        run: |
+          if [ "$PRERELEASE" = true ]; then title="Pre-release $TAG"; else title="Release $TAG"; fi
+          notes="Source-only release: build from this tag; no packages are published.
+          Breaking changes and upgrade steps: https://github.com/$GH_REPO/blob/$TAG/docs/migration.md"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --title "$title" --prerelease="$PRERELEASE"
+          else
+            gh release create "$TAG" --verify-tag --title "$title" \
+              --prerelease="$PRERELEASE" --notes "$notes" --generate-notes
+          fi

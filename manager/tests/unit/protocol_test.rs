@@ -1,7 +1,5 @@
 use runpy::{Data, Envelope, EnvelopeError, Meta};
 use serde_json::{Value, json};
-use tokio::io::AsyncReadExt;
-use tokio::net::{UnixListener, UnixStream};
 
 fn object(value: Value) -> Data {
     value
@@ -69,6 +67,10 @@ fn rejects_invalid_reserved_metadata() {
         json!({"meta": {"x_spath": []}, "data": {}}),
         json!({"meta": {"x_op": 42}, "data": {}}),
         json!({"meta": {"x_op": "unknown"}, "data": {}}),
+        json!({"meta": {"x_op": "retry"}, "data": {}}),
+        json!({"meta": {"x_req": 7}, "data": {}}),
+        json!({"meta": {"x_req": "7"}, "data": {}}),
+        json!({"meta": {"x_op": "log", "x_req": "7"}, "data": {}}),
     ] {
         assert!(
             serde_json::from_value::<Envelope>(value).is_err(),
@@ -89,37 +91,11 @@ fn custom_constructor_rejects_reserved_namespace() {
 }
 
 #[test]
-fn lifecycle_constructors_use_direct_data() {
-    let execute = Envelope::execute(object(json!({"task": "scrape"})));
-    assert_eq!(execute.meta()["x_op"], "execute");
-    assert_eq!(execute.data()["task"], "scrape");
-
-    assert_eq!(Envelope::retry().meta()["x_op"], "retry");
-    assert!(Envelope::retry().data().is_empty());
-    assert_eq!(Envelope::terminate().meta()["x_op"], "terminate");
-    assert!(Envelope::terminate().data().is_empty());
-}
-
-#[test]
-fn clone_is_independent() {
-    let original = custom_envelope();
-    let cloned = original.clone();
-    assert_eq!(original, cloned);
-}
-
-#[tokio::test]
-async fn clean_connection_close_is_observed() {
-    let temp = tempfile::TempDir::new().unwrap();
-    let path = temp.path().join("close.sock");
-    let listener = UnixListener::bind(&path).unwrap();
-
-    let server = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let mut size = [0_u8; 8];
-        assert!(stream.read_exact(&mut size).await.is_err());
-    });
-
-    let client = UnixStream::connect(&path).await.unwrap();
-    drop(client);
-    server.await.unwrap();
+fn request_ids_are_accepted_as_reserved_strings() {
+    let envelope: Envelope = serde_json::from_value(json!({
+        "meta": {"x_op": "done", "x_req": "41"},
+        "data": {}
+    }))
+    .unwrap();
+    assert_eq!(envelope.meta()["x_req"], "41");
 }

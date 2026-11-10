@@ -1,5 +1,6 @@
 use runpy::{Data, Envelope, Manager, Meta};
 use serde_json::{json, Value};
+use std::time::Duration;
 
 fn object(value: Value) -> Data {
     value
@@ -13,7 +14,13 @@ async fn main() {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let scripts_path = format!("{}/worker", manifest_dir);
 
-    let mut manager = Manager::new(&scripts_path);
+    let manager = match Manager::builder(&scripts_path).build().await {
+        Ok(manager) => manager,
+        Err(error) => {
+            eprintln!("Failed to start Runpy: {error}");
+            return;
+        }
+    };
     let logger = manager.logger();
     logger.success("Manager initialized");
 
@@ -31,62 +38,71 @@ async fn main() {
         );
     });
 
-    let mut worker = manager.worker("my_script");
-    worker.env("MY_ENV_VAR", "some_value");
-
     let worker_logger = logger.clone();
-    worker.on_message(move |inbound| {
-        let operation = inbound.envelope.meta().get("x_op").and_then(Value::as_str);
+    let builder = manager
+        .worker("my_script")
+        .env("MY_ENV_VAR", "some_value")
+        .on_message(move |inbound| {
+            let operation = inbound.envelope.meta().get("x_op").and_then(Value::as_str);
 
-        match operation {
-            Some("ready") => {
-                worker_logger.info_with("Worker", "ready");
-                inbound.reply(Envelope::execute(object(json!({"name": "RunPy"}))));
+            match operation {
+                Some("log") => {
+                    let level = inbound
+                        .envelope
+                        .meta()
+                        .get("level")
+                        .and_then(Value::as_str)
+                        .unwrap_or("info");
+                    worker_logger.info_with(level, &format!("{:?}", inbound.envelope.data()));
+                }
+                // Request results (`done`, correlated `error`) are returned
+                // by `execute` and logged there, so the observer ignores them.
+                Some("done") => {}
+                Some("error") => {
+                    worker_logger.error_with("Worker", &format!("{:?}", inbound.envelope.data()));
+                }
+                None => {
+                    worker_logger.info_with(
+                        "Custom",
+                        &format!(
+                            "meta={:?} data={:?}",
+                            inbound.envelope.meta(),
+                            inbound.envelope.data()
+                        ),
+                    );
+                }
+                Some(other) => {
+                    worker_logger.warning_with("Worker", &format!("Unexpected operation: {other}"));
+                }
+            }
+        });
 
-                let mut meta = Meta::new();
-                meta.insert("some_custom_meta".into(), json!(42));
-                inbound.reply(
-                    Envelope::new(meta, object(json!({"event": "custom manager message"})))
-                        .expect("custom metadata must not use x_ keys"),
-                );
-            }
-            Some("log") => {
-                let level = inbound
-                    .envelope
-                    .meta()
-                    .get("level")
-                    .and_then(Value::as_str)
-                    .unwrap_or("info");
-                worker_logger.info_with(level, &format!("{:?}", inbound.envelope.data()));
-            }
-            Some("done") => {
-                worker_logger.success(&format!("Done: {:?}", inbound.envelope.data()));
-            }
-            Some("error") => {
-                worker_logger.error_with("Worker", &format!("{:?}", inbound.envelope.data()));
-            }
-            None => {
-                worker_logger.info_with(
-                    "Custom",
-                    &format!(
-                        "meta={:?} data={:?}",
-                        inbound.envelope.meta(),
-                        inbound.envelope.data()
-                    ),
-                );
-            }
-            Some(other) => {
-                worker_logger.warning_with("Worker", &format!("Unexpected operation: {other}"));
-            }
+    let worker = match builder.spawn().await {
+        Ok(worker) => {
+            logger.success(&format!("Worker spawned and ready: {}", worker.id()));
+            worker
         }
-    });
-
-    match worker.spawn().await {
-        Ok(id) => logger.success(&format!("Worker spawned: {id}")),
         Err(error) => {
             logger.error(&format!("Failed to spawn worker: {error}"));
             return;
         }
+    };
+
+    // `spawn` returns once the worker reported `ready`, so work can be sent
+    // immediately. A request is correlated with its own result.
+    match worker
+        .execute(object(json!({"name": "RunPy"})), Duration::from_secs(30))
+        .await
+    {
+        Ok(result) => logger.success(&format!("Result: {result:?}")),
+        Err(error) => logger.error_with("Worker", &format!("execute failed: {error}")),
+    }
+    let mut meta = Meta::new();
+    meta.insert("some_custom_meta".into(), json!(42));
+    let custom = Envelope::new(meta, object(json!({"event": "custom manager message"})))
+        .expect("custom metadata must not use x_ keys");
+    if let Err(error) = worker.send_message(custom).await {
+        logger.error_with("Worker", &format!("custom message not sent: {error}"));
     }
 
     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
@@ -102,4 +118,9 @@ async fn main() {
     }
 
     logger.info("Shutting down...");
+    match worker.terminate().await {
+        Ok(exit) => logger.info(&format!("Worker stopped: {:?}", exit.reason)),
+        Err(error) => logger.warning(&format!("terminate failed: {error}")),
+    }
+    manager.terminate_all().await;
 }

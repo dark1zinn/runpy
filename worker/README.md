@@ -57,23 +57,87 @@ if __name__ == "__main__":
 
 The Manager supplies the socket path and trusted worker ID as positional
 arguments. Additional `--key=value` arguments become `Worker.extra`.
-`RunScript` constructs the class, sends `ready`, and runs the receive loop.
+`RunScript` constructs the class and calls `run()`, which first sends a
+versioned `ready` (`protocol_version` 1) and then runs the receive loop. The
+Rust Manager rejects a worker speaking another protocol version, so upgrade
+both packages together.
 
 ## Execution model
 
-- `execute(data)` handles `execute`; return a dictionary for `done.data` or
-  `None` for an empty result.
-- An exception or non-dictionary result becomes an `error` envelope. It does
-  not automatically terminate the worker.
-- `retry` reuses the same mutable payload stored by `Worker._dispatch` and
-  passed to `Worker._complete_execution`. Mutations made by `execute` remain
-  present on retry; copy inputs before mutating them. Retry before execute
-  returns an error envelope.
+- `execute(data)` handles one `execute` request; return a dictionary for
+  `done.data` or `None` for an empty result. The result is correlated with the
+  request's `x_req`; the Manager sends one request at a time.
+- An exception, non-dictionary result, or unencodable result becomes an
+  `error` envelope with `{"kind": "<exception type>", "message": "<text>"}`.
+  It does not terminate the worker. `SystemExit` and `KeyboardInterrupt` are
+  not converted and end the worker.
 - `handle_envelope(envelope)` receives application messages without `x_op`.
 - `send(data, meta=...)` sends an application envelope.
 - `log(data, level=..., meta=...)` sends a structured `log` envelope.
-- `run()` closes the connection on malformed frames, invalid reserved
-  metadata, or a wrong-direction operation.
+- `run()` raises on malformed frames, invalid reserved metadata, or a
+  wrong-direction operation (`ValueError`), and on socket failures
+  (`OSError`). `RunScript` turns those into one stderr diagnostic and exit
+  status 1; `terminate` or a Manager close exits with status 0.
+- `send` and `log` are thread-safe: a lock writes each frame atomically, so
+  background threads can report progress while `execute` runs. Hooks such as
+  `execute` and `handle_envelope` still run one at a time on the receive-loop
+  thread.
+- A failed socket write may have sent part of a frame, so it closes the
+  connection; later sends raise `ConnectionError` instead of corrupting the
+  stream.
+- `close()` is idempotent and safe from any thread. `Worker` is also a context
+  manager, and `run()` always closes the connection when it returns.
+
+### Frame limits
+
+The worker enforces the limits the Manager passes in `RUNPY_MAX_FRAME_BYTES`
+(maximum JSON body, default 8 MiB) and `RUNPY_FRAME_TIMEOUT_MS` (time to
+finish a frame after its first byte, default 30 seconds). A non-positive or
+non-numeric value raises `ValueError` before the socket is opened. `send`,
+`log`, and results are encoded before anything is written: a body above the
+limit raises `FrameTooLargeError` (a `ValueError`), and NaN or infinite numbers
+raise `ValueError`, leaving the connection usable. An inbound frame that is
+empty, oversized, or stalled closes the connection. Keep bulk data outside
+envelopes.
+
+### Sync or async
+
+`Worker` runs hooks on the receive-loop thread: simple, and right for
+blocking or CPU-bound code. Its requests cannot be cancelled once started;
+Rust reports `Unsupported` for them.
+
+`AsyncWorker` runs each request as an asyncio task while a separate loop keeps
+reading control messages, so a running request can be cancelled from Rust:
+
+```python
+import asyncio
+from runpyrs import AsyncWorker, RunAsyncScript
+
+class Fetcher(AsyncWorker):
+    async def execute(self, data: dict) -> dict:
+        await asyncio.sleep(data["delay"])  # a cancel interrupts this await
+        return {"fetched": data["url"]}
+
+if __name__ == "__main__":
+    RunAsyncScript(Fetcher)
+```
+
+- Requests still run one at a time; a second `execute` while one runs is a
+  protocol violation.
+- `cancel` cancels the request's task. The worker answers with exactly one of
+  `done`, `error`, or `cancelled` (`{"status": "cancelled"}`), and reports
+  `cancelled` only after the task stopped. A request that suppresses
+  `CancelledError` finishes normally and the cancel is acknowledged with
+  `{"status": "already_finished"}`, as is a cancel for a request that is not
+  running.
+- Custom envelopes go to `handle_envelope` one at a time, alongside a running
+  request, through a queue of 64. When it is full the envelope is not
+  dispatched and an unsolicited `error` of kind `QueueFull` is sent instead.
+- `terminate` cancels the running request and custom handler and closes the
+  connection. Code that blocks the event loop also blocks `cancel` and
+  `terminate`; the Manager then kills the process after its shutdown grace.
+- `RunAsyncScript` uses the same arguments, diagnostics, and exit statuses as
+  `RunScript`.
 
 ## Envelope model
 
@@ -83,7 +147,7 @@ Every message is exactly two objects:
 {
   "meta": {
     "x_wid": "manager-generated-worker-id",
-    "x_spath": "/tmp/runpy/rp_worker.sock",
+    "x_spath": "/tmp/runpy-Xk3p9Q/w8f3c2a1b0e9d7c6a.sock",
     "correlation_id": 42
   },
   "data": {
@@ -100,10 +164,11 @@ reserves the complete `x_` namespace:
 | `x_wid` | Trusted worker identity stamped by Runpy. |
 | `x_spath` | Trusted socket path stamped by Runpy. |
 | `x_op` | Optional lifecycle operation. |
+| `x_req` | Request ID on `execute`/`cancel` and the matching `done`, `error`, or `cancelled`. |
 
-The reserved operations are `ready`, `execute`, `retry`, `terminate`, `done`,
-`error`, and `log`. `create_envelope` copies its inputs and rejects
-application-provided `x_` metadata.
+The reserved operations are `ready`, `execute`, `cancel`, `terminate`,
+`done`, `error`, `cancelled`, and `log`. `create_envelope` copies its inputs
+and rejects application-provided `x_` metadata.
 
 ## Public API
 
@@ -119,6 +184,8 @@ application-provided `x_` metadata.
 | `create_envelope(data, meta=...)` | Copy a custom envelope and reject reserved metadata. |
 | `Envelope`, `Meta`, `Data` | Typed dictionary aliases for the wire model. |
 | `RunpyOperation` | Literal type for all reserved operation strings. |
+| `AsyncWorker` | asyncio base class: `async execute(data)`, `async handle_envelope(envelope)`, `async send`/`log`/`close`, `async run()`. Supports cancellation. |
+| `RunAsyncScript` | CLI bootstrap for an `AsyncWorker` subclass; runs it with `asyncio.run`. |
 | `ExecutePayload`, `ExecuteResult` | Execute input and optional dictionary result aliases. |
 
 The package includes `py.typed`, so type checkers can consume these annotations.

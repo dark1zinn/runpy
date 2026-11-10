@@ -17,13 +17,14 @@ For architecture, lifecycle, protocol, and operations details, see the
 - A Unix-like operating system with Unix domain sockets.
 - Rust and Cargo.
 - `uv` available on `PATH`, or at a path supplied to
-  `Manager::with_uv_path`.
+  `Manager::builder(...).uv_path(...)`.
 - Python 3.10 or newer for the `runpyrs` SDK. `uv` can install the Python
   version declared by each worker.
 
-The repository development environment requires `uv >= 0.11.2`. At runtime,
-Runpy executes the configured binary with `uv --version` and requires a
-successful exit status; it does not parse or compare the reported version.
+Developing this repository requires uv 0.10 or newer (see
+[Contributor setup](#contributor-setup)). At runtime, Runpy executes the
+configured binary with `uv --version` and requires a successful exit status;
+it does not parse or compare the reported version.
 
 ## Install the Rust crate
 
@@ -123,42 +124,27 @@ To exclude packages uploaded after a deployment cutoff, add uv's RFC 3339
 
 ## Configure the manager
 
-`Manager::new` resolves `uv` from `PATH` and accepts the directory containing
-worker scripts:
-
-```rust
-use runpy::Manager;
-
-let manager = Manager::new("worker");
-drop(manager);
-```
-
-Packaged deployments can provide an explicit executable:
-
-```rust
-use runpy::Manager;
-
-let manager = Manager::with_uv_path("worker", "/opt/runpy/bin/uv");
-drop(manager);
-```
-
-Runpy checks the configured executable and scripts directory during Manager
-construction. Construction logs an integrity failure; `Manager::check_integrity`
-and `Worker::spawn` return validation failures to the caller.
-
-The worker name passed to `Manager::worker` is a file stem, without `.py`:
+`Manager::builder` takes the directory containing worker scripts and resolves
+`uv` from `PATH` by default. `build` must be awaited inside a Tokio runtime:
 
 ```rust
 use runpy::Manager;
 
 #[tokio::main]
-async fn main() {
-    let manager = Manager::new("worker");
-    let mut worker = manager.worker("my_worker");
-    let worker_id = worker.spawn().await.expect("worker should start");
-    println!("spawned {worker_id}");
+async fn main() -> Result<(), runpy::RunpyError> {
+    let manager = Manager::builder("worker").build().await?;
+    // The worker name is a file stem, without `.py`.
+    let worker = manager.worker("my_worker").spawn().await?;
+    println!("spawned {}", worker.id());
+    worker.terminate().await?;
+    Ok(())
 }
 ```
+
+Packaged deployments can provide an explicit executable with
+`.uv_path("/opt/runpy/bin/uv")`. `build` fails with `UvUnavailable` when the
+executable cannot run and with `ScriptsDirectory` when the scripts directory is
+missing; `Manager::check_integrity` repeats these checks later.
 
 The effective command is:
 
@@ -170,3 +156,26 @@ Runpy forces `PYTHONUNBUFFERED=1`, captures both process streams, and owns the
 worker process group until explicit termination or Manager drop. Continue with
 the [project overview](overview.md) for message routing, output guarantees, and
 shutdown behavior.
+
+## Contributor setup
+
+Two equivalent paths prepare a checkout for development.
+
+**Nix and direnv.** `flake.nix` provides Rust 1.93.0 (rustfmt, Clippy,
+rust-src), rust-analyzer, cargo-deny, cargo-edit, cargo-watch, Python 3.14,
+uv, git, gh, and actionlint. With direnv, `.envrc` enters that shell, runs
+`uv sync --frozen --all-packages --group dev --python 3.14`, and activates
+`.venv`; it re-runs when `pyproject.toml`, `worker/pyproject.toml`, or
+`uv.lock` change. `nix flake check` verifies the shell's tool versions on the
+host system. Shells evaluate for x86_64/aarch64 Linux and macOS; CI executes
+them on x86_64 Linux and Apple Silicon macOS only.
+
+**uv only.** Install Rust 1.93.0 or newer and uv 0.10 or newer, then:
+
+```bash
+uv sync --all-packages --group dev
+```
+
+Python development tools (pytest, Ruff, mypy, Hypothesis, build, pip-audit)
+live in the root `dev` dependency group of the uv workspace and are pinned by
+`uv.lock`; uv itself is a bootstrap tool, not a project dependency.

@@ -3,30 +3,25 @@ name = "runpyrs"
 version = "0.1.0"
 description = "Python worker SDK for the Runpy manager — build workers that are spawned and orchestrated by Rust."
 readme = "README.md"
-license = { text = "Apache-2.0" }
+license = "Apache-2.0"
+# A symlink to the repository LICENSE; builds include its contents.
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 authors = [
     { name = "dark1zinn" },
 ]
 dependencies = []
 
-[project.optional-dependencies]
-dev = ["pytest>=7.0"]
-
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
-[tool.hatch.build]
-packages = ["src/runpyrs"]
-# This ensures it also ends up in the built distributions.
-include = ["../LICENSE"]
+# The sdist keeps the src/ layout so a wheel built from it finds the package.
+[tool.hatch.build.targets.sdist]
+include = ["src/runpyrs", "README.md", "LICENSE"]
 
-[dependency-groups]
-dev = [
-    "pytest>=9.0.2",
-    "uv>=0.11.2",
-]
+[tool.hatch.build.targets.wheel]
+packages = ["src/runpyrs"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

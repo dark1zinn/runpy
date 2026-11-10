@@ -1,10 +1,21 @@
 """Managed worker connection, protocol validation, and dispatch lifecycle."""
 
-import json
 import socket
-import struct
-from typing import Dict, Optional
+import threading
+from types import TracebackType
+from typing import Dict, Optional, Type
 
+from ._protocol import (
+    PROTOCOL_VERSION,
+    FrameLimits,
+    decode_envelope,
+    encode_frame,
+    error_data,
+    invalid_result,
+    operation_envelope,
+    recv_frame,
+    stamp,
+)
 from .utils import (
     Data,
     Envelope,
@@ -15,11 +26,9 @@ from .utils import (
 )
 
 
-_RUNPY_OPERATIONS = frozenset(
-    {"ready", "execute", "retry", "terminate", "done", "error", "log"}
-)
-_MANAGER_OPERATIONS = frozenset({"execute", "retry", "terminate"})
-_RESERVED_KEYS = frozenset({"x_wid", "x_spath", "x_op"})
+_MANAGER_OPERATIONS = frozenset({"execute", "terminate"})
+#: Capabilities this SDK advertises in ``ready``.
+_CAPABILITIES = ("requests",)
 
 
 class Worker:
@@ -48,15 +57,17 @@ class Worker:
                 RunScript(Parser)
     """
 
-    _INTERNAL_OPS = _MANAGER_OPERATIONS
-
     def __init__(
         self,
         sock: str,
         name: str,
         extra: Optional[Dict[str, str]] = None,
     ):
-        """Connect to the Manager and send the initial ``ready`` envelope.
+        """Connect to the Manager.
+
+        The ``ready`` envelope is sent by :meth:`run`, after the subclass has
+        finished constructing, so the Manager never sends work to a worker
+        that is still initializing.
 
         Args:
             sock: Manager-created Unix socket path.
@@ -64,15 +75,18 @@ class Worker:
             extra: Parsed ``--key=value`` arguments.
 
         Raises:
-            ValueError: If ``name`` is empty.
-            OSError: If socket creation, connection, or the initial send fails.
+            ValueError: If ``name`` is empty or a Manager-supplied frame limit
+                in ``RUNPY_MAX_FRAME_BYTES``/``RUNPY_FRAME_TIMEOUT_MS`` is not
+                a positive integer.
+            OSError: If socket creation or connection fails. The socket is
+                closed before the error propagates.
         """
         if not name:
             raise ValueError("Worker ID is required")
 
+        self._limits = FrameLimits.from_env()
         self.__ok = False
-        self.__cycles = 0
-        self.__exec_payload: Optional[Data] = None
+        self.__send_lock = threading.Lock()
         self.__sock_path = sock
         self.name = name
         self.extra: Dict[str, str] = extra or {}
@@ -80,35 +94,62 @@ class Worker:
         self.stream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             self.stream.connect(self.__sock_path)
-        except Exception:
-            self.stream.close()
+            self.__ok = True
+        except BaseException:
+            self.close()
             raise
 
-        self.__ok = True
-        self._send_operation("ready", {})
+    def __enter__(self) -> "Worker":
+        return self
 
-    def _send_bytes(self, payload: bytes) -> None:
-        """Write one 8-byte little-endian length-prefixed payload.
+    def __exit__(
+        self,
+        exc_type: Optional[Type[BaseException]],
+        exc: Optional[BaseException],
+        traceback: Optional[TracebackType],
+    ) -> None:
+        self.close()
 
-        Any write failure marks the receive loop as closed and is re-raised.
+    def close(self) -> None:
+        """Close the connection; safe to call repeatedly and from any thread.
+
+        A receive loop blocked in another thread observes end-of-stream and
+        returns. Later sends raise ``ConnectionError``.
         """
+        self.__ok = False
         try:
-            self.stream.sendall(struct.pack("<Q", len(payload)) + payload)
-        except Exception:
-            self.__ok = False
-            raise
+            self.stream.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        self.stream.close()
+
+    def _send_bytes(self, frame: bytes) -> None:
+        """Write one complete pre-encoded frame atomically.
+
+        A lock keeps frames from different threads from interleaving. A failed
+        write may have sent part of a frame, so it closes the connection and
+        every later send raises ``ConnectionError`` instead of writing onto a
+        corrupted stream.
+        """
+        with self.__send_lock:
+            if not self.__ok:
+                raise ConnectionError("Worker connection is closed")
+            try:
+                self.stream.sendall(frame)
+            except BaseException:
+                self.close()
+                raise
 
     def _send_envelope(self, envelope: Envelope) -> None:
         """Copy, trust-stamp, serialize, and send one complete envelope.
 
         Caller-provided ``x_wid`` and ``x_spath`` values are overwritten with
-        this connection's Manager-supplied identity and socket path.
+        this connection's Manager-supplied identity and socket path. Encoding
+        happens before any byte is written, so an oversized or non-finite
+        envelope raises ``ValueError`` and leaves the connection usable.
         """
-        meta = dict(envelope["meta"])
-        meta["x_wid"] = self.name
-        meta["x_spath"] = self.__sock_path
-        stamped: Envelope = {"meta": meta, "data": dict(envelope["data"])}
-        self._send_bytes(json.dumps(stamped, separators=(",", ":")).encode("utf-8"))
+        stamped = stamp(envelope, self.name, self.__sock_path)
+        self._send_bytes(encode_frame(stamped, self._limits.max_frame_bytes))
 
     def _send_operation(
         self,
@@ -118,9 +159,7 @@ class Worker:
         meta: Optional[Meta] = None,
     ) -> None:
         """Build and send one Python-to-Manager operation envelope."""
-        envelope = create_envelope(data, meta)
-        envelope["meta"]["x_op"] = operation
-        self._send_envelope(envelope)
+        self._send_envelope(operation_envelope(operation, data, meta=meta))
 
     def send(self, data: Data, *, meta: Optional[Meta] = None) -> None:
         """Send an application-defined envelope without ``x_op``.
@@ -187,7 +226,7 @@ class Worker:
         """
 
     def execute(self, data: ExecutePayload) -> ExecuteResult:
-        """Process one ``execute`` or ``retry`` payload.
+        """Process one ``execute`` request payload.
 
         Override this hook and return a dictionary for ``done.data`` or
         ``None`` for an empty result. Exceptions and non-dictionary results are
@@ -196,154 +235,100 @@ class Worker:
 
         return None
 
-    @staticmethod
-    def _recv_exact(
-        stream: socket.socket,
-        size: int,
-        *,
-        allow_clean_close: bool = False,
-    ) -> Optional[bytes]:
-        """Read exactly ``size`` bytes from a socket.
-
-        A clean close before any bytes returns ``None`` only when
-        ``allow_clean_close`` is true. Mid-frame closure raises
-        ``ConnectionError``.
-        """
-        chunks = bytearray()
-        while len(chunks) < size:
-            chunk = stream.recv(size - len(chunks))
-            if not chunk:
-                if allow_clean_close and not chunks:
-                    return None
-                raise ConnectionError("Connection closed during a frame")
-            chunks.extend(chunk)
-        return bytes(chunks)
-
     def _recv_envelope(self) -> Optional[Envelope]:
         """Read, decode, and validate one Manager-to-worker frame.
 
         The frame uses an 8-byte little-endian payload size followed by UTF-8
-        JSON. Invalid encoding, JSON, shape, metadata, or operation direction
-        raises ``ValueError``.
+        JSON, bounded by the Manager-supplied size and partial-frame deadline.
+        Invalid size, encoding, JSON, shape, metadata, or operation direction
+        raises ``ValueError``; a stalled frame raises ``TimeoutError``. This
+        worker does not support ``cancel``, so it is a protocol violation.
         """
-        size_data = self._recv_exact(self.stream, 8, allow_clean_close=True)
-        if size_data is None:
-            return None
-
-        size = struct.unpack("<Q", size_data)[0]
-        payload = self._recv_exact(self.stream, size)
+        payload = recv_frame(self.stream, self._limits)
         if payload is None:
-            raise ConnectionError("Connection closed before envelope payload")
+            return None
+        return decode_envelope(payload, _MANAGER_OPERATIONS)
 
-        try:
-            decoded = json.loads(payload.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise ValueError(f"Invalid JSON envelope: {error}") from error
+    def _send_result(self, operation: str, data: Data, request_id: str) -> None:
+        """Send ``done`` or ``error`` correlated with ``request_id``."""
+        self._send_envelope(operation_envelope(operation, data, request_id=request_id))
 
-        return self._validate_inbound(decoded)
+    def _complete_execution(self, request_id: str, payload: Data) -> None:
+        """Run one request and reply with ``done`` or ``error`` for it.
 
-    @staticmethod
-    def _validate_inbound(value: object) -> Envelope:
-        """Validate the exact envelope shape and Manager operation boundary.
-
-        Custom envelopes omit ``x_op``. Only ``execute``, ``retry``, and
-        ``terminate`` are valid internal operations from Manager to worker.
+        An exception, an invalid result type, and a result that cannot be
+        encoded produce structured ``error`` envelopes carrying the same
+        request ID. ``SystemExit``, ``KeyboardInterrupt``, and other
+        non-``Exception`` signals are not converted; they propagate and end
+        the worker. A socket failure while sending propagates too.
         """
-        if not isinstance(value, dict) or set(value) != {"meta", "data"}:
-            raise ValueError("Envelope must contain exactly 'meta' and 'data'")
-
-        meta = value["meta"]
-        data = value["data"]
-        if not isinstance(meta, dict) or not isinstance(data, dict):
-            raise ValueError("Envelope 'meta' and 'data' must be objects")
-
-        for key, item in meta.items():
-            if not key.startswith("x_"):
-                continue
-            if key not in _RESERVED_KEYS:
-                raise ValueError(f"Unknown Runpy metadata key '{key}'")
-            if not isinstance(item, str):
-                raise ValueError(f"Runpy metadata '{key}' must be a string")
-
-        operation = meta.get("x_op")
-        if operation is not None:
-            if operation not in _RUNPY_OPERATIONS:
-                raise ValueError(f"Unknown Runpy operation '{operation}'")
-            if operation not in _MANAGER_OPERATIONS:
-                raise ValueError(
-                    f"Runpy operation '{operation}' is invalid for manager-to-worker envelopes"
-                )
-
-        return {"meta": dict(meta), "data": dict(data)}
-
-    def _complete_execution(self, *, retry: bool = False) -> None:
-        """Run the current execute payload and emit ``done`` or ``error``.
-
-        Retry reuses the last payload. A retry before execute and an invalid
-        result type produce explicit ``error`` messages.
-        """
-        if self.__exec_payload is None:
-            self._send_operation(
-                "error", {"message": "Retry requested before an execute operation"}
-            )
-            return
-
         try:
-            result = self.execute(self.__exec_payload)
-            if result is not None and not isinstance(result, dict):
-                self._send_operation(
-                    "error",
-                    {"message": "Worker.execute must return a dictionary or None"},
-                )
-                return
-            self._send_operation("done", result or {})
+            result = self.execute(payload)
         except Exception as error:
-            prefix = "Retry execution error" if retry else "Execution error"
-            self._send_operation("error", {"message": f"{prefix}: {error}"})
+            self._send_result("error", error_data(error), request_id)
+            return
+        invalid = invalid_result(result, "Worker.execute")
+        if invalid is not None:
+            self._send_result("error", invalid, request_id)
+            return
+        try:
+            self._send_result("done", result or {}, request_id)
+        except (TypeError, ValueError) as error:
+            # Encoding failed before any byte was written.
+            self._send_result("error", error_data(error), request_id)
 
     def _dispatch(self, envelope: Envelope) -> None:
         """Dispatch one validated envelope to lifecycle or developer hooks."""
         operation = envelope["meta"].get("x_op")
         if operation == "terminate":
-            self.__ok = False
-            self.stream.close()
+            self.close()
             return
 
         if operation == "execute":
-            self.__exec_payload = envelope["data"]
-            self._complete_execution()
-            return
-
-        if operation == "retry":
-            self.__cycles += 1
-            self._complete_execution(retry=True)
+            self._complete_execution(envelope["meta"]["x_req"], envelope["data"])
             return
 
         try:
             self.handle_envelope(envelope)
         except Exception as error:
-            self._send_operation(
-                "error", {"message": f"Envelope handler error: {error}"}
-            )
+            # No request to answer: an unsolicited error without ``x_req``.
+            self._send_operation("error", error_data(error))
 
     def run(self) -> None:
-        """Receive and dispatch envelopes until termination or protocol failure.
+        """Announce readiness, then receive and dispatch envelopes until
+        termination or failure.
 
-        ``terminate`` closes normally. A malformed frame or handler-level
-        protocol failure prints one diagnostic, marks the worker closed, and
-        closes the socket.
+        The first frame sent is ``ready`` with this SDK's protocol version and
+        capabilities. Returns normally after ``terminate``, after the Manager
+        closes the connection, or after :meth:`close` from another thread. A
+        malformed frame, invalid envelope, stalled frame, or socket failure
+        raises the underlying exception. The connection is always closed
+        first.
+
+        Raises:
+            ValueError: For protocol violations such as invalid JSON, an
+                oversized frame, or a wrong-direction operation.
+            OSError: For socket failures, including a stalled frame
+                (``TimeoutError``) or a lost connection.
         """
 
-        while self.__ok:
-            try:
-                envelope = self._recv_envelope()
+        try:
+            self._send_operation(
+                "ready",
+                {
+                    "protocol_version": PROTOCOL_VERSION,
+                    "capabilities": list(_CAPABILITIES),
+                },
+            )
+            while self.__ok:
+                try:
+                    envelope = self._recv_envelope()
+                except OSError:
+                    if not self.__ok:
+                        return
+                    raise
                 if envelope is None:
-                    self.__ok = False
-                    self.stream.close()
-                    break
+                    return
                 self._dispatch(envelope)
-            except Exception as error:
-                print(f"Protocol violation: {error}")
-                self.__ok = False
-                self.stream.close()
-                break
+        finally:
+            self.close()

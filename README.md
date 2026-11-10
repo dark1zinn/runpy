@@ -73,55 +73,27 @@ if __name__ == "__main__":
 Start it from Rust:
 
 ```rust
-use runpy::{Data, Envelope, Manager};
-use serde_json::{json, Value};
+use runpy::{Data, Manager};
+use serde_json::json;
 use std::time::Duration;
 
-fn object(value: Value) -> Data {
-    value.as_object().cloned().expect("JSON object")
-}
-
 #[tokio::main]
-async fn main() {
-    let mut manager = Manager::new("worker");
-    let (finished_tx, mut finished_rx) = tokio::sync::mpsc::unbounded_channel();
-    manager.on_message(move |inbound| {
-        let operation = inbound
-            .envelope
-            .meta()
-            .get("x_op")
-            .and_then(Value::as_str);
+async fn main() -> Result<(), runpy::RunpyError> {
+    let manager = Manager::builder("worker").build().await?;
 
-        match operation {
-            Some("ready") => inbound.reply(Envelope::execute(object(
-                json!({"task": "example"}),
-            ))),
-            Some("done") => {
-                println!(
-                    "result: {}",
-                    Value::Object(inbound.envelope.data().clone())
-                );
-                let _ = finished_tx.send(());
-            }
-            Some("error") => {
-                eprintln!(
-                    "worker error: {}",
-                    Value::Object(inbound.envelope.data().clone())
-                );
-                let _ = finished_tx.send(());
-            }
-            _ => {}
-        }
-    });
+    // `spawn` returns once the worker reported `ready`.
+    let worker = manager.worker("my_worker").spawn().await?;
+    println!("spawned {}", worker.id());
 
-    let mut worker = manager.worker("my_worker");
-    let worker_id = worker.spawn().await.expect("worker should start");
-    println!("spawned {worker_id}");
-    tokio::time::timeout(Duration::from_secs(30), finished_rx.recv())
-        .await
-        .expect("worker response timed out")
-        .expect("worker response channel closed");
-    worker.terminate().await.expect("worker should stop");
+    let input = Data::from_iter([("task".into(), json!("example"))]);
+    match worker.execute(input, Duration::from_secs(30)).await {
+        Ok(output) => println!("result: {output:?}"),
+        Err(error) => eprintln!("request failed: {error}"),
+    }
+
+    let exit = worker.terminate().await?;
+    println!("worker stopped: {:?}", exit.reason);
+    Ok(())
 }
 ```
 
@@ -131,18 +103,19 @@ Runpy starts:
 uv run --no-project [--locked] --script <worker.py> <socket-path> <worker-id>
 ```
 
-The worker sends `ready`, Rust replies with `execute`, and the Python return
-value arrives as `done`. Runpy owns trusted worker/socket metadata and cleans up
-the process group and socket when the worker terminates or the Manager drops.
+The worker sends a versioned `ready` and `spawn` returns. `execute` sends a
+request with its own ID; the worker runs one request at a time, and the Python
+return value comes back as that request's result. Runpy owns trusted
+worker/socket metadata and cleans up the process group and socket when the
+worker terminates or the Manager drops.
 
 ## Observe worker output
 
 Process output is separate from structured socket envelopes:
 
 ```rust
-use runpy::{Manager, WorkerOutputStream};
+use runpy::WorkerOutputStream;
 
-let mut manager = Manager::new("worker");
 manager.on_worker_output(|output| match output.stream {
     WorkerOutputStream::Stdout => {
         println!("{}: {}", output.worker_id, output.line);
@@ -158,12 +131,32 @@ return promptly. Capture is bounded and best effort. Runpy never treats stderr
 or output text as an automatic termination signal; applications own that
 policy.
 
+## Run requests in parallel
+
+A pool runs independent requests for one script on separate, fresh worker
+processes, bounded per pool and by the Manager-wide `max_workers` (default 3):
+
+```rust
+use runpy::PoolConfig;
+
+let pool = manager.pool(manager.worker("parse"), PoolConfig::default()).await?;
+let first = pool.submit(Data::from_iter([("text".into(), json!("a"))]), Duration::from_secs(30)).await?;
+let second = pool.submit(Data::from_iter([("text".into(), json!("b"))]), Duration::from_secs(30)).await?;
+let (first, second) = tokio::join!(first.result(), second.result());
+```
+
+Each worker serves one request and is then retired. See
+[Worker pools](docs/overview.md#worker-pools) for queueing, deadlines, and
+shutdown.
+
 ## Documentation
 
 - [Project overview](docs/overview.md) — architecture, lifecycle, protocol,
   output guarantees, Python execution model, and operations.
 - [Installation and worker setup](docs/installation.md) — Git dependencies,
   PEP 723 scripts, uv lockfiles, and Manager configuration.
+- [Migration guide](docs/migration.md) — breaking API and protocol changes
+  with their replacements.
 - [Python SDK guide](worker/README.md) — `runpyrs` setup and API.
 - [Playground](examples/playground/) — executable Rust/Python integration.
 - Rust API reference — generate locally with
@@ -190,22 +183,36 @@ Enable the pre-commit hook once per clone:
 git config --local core.hooksPath .githooks
 ```
 
+The hook runs quick format and lint checks on a snapshot of the staged tree,
+never on unstaged edits; behavior tests run in CI (see the
+[overview](docs/overview.md#development-and-validation)).
+
 Run Rust checks:
 
 ```bash
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-cargo test --workspace --all-features --locked -- --test-threads=1
-cargo test --doc -p runpy --locked
+cargo test --workspace --all-features --locked
+cargo rustdoc -p runpy --locked -- -D warnings -D missing-docs
 ```
+
+The Rust tests include end-to-end runs through real `uv` and the local Python
+SDK, so `uv` must be on `PATH`.
 
 Run Python checks:
 
 ```bash
-uv run --frozen --python 3.10 ruff format --check worker/src/runpyrs worker/tests examples/playground/worker/my_script.py
-uv run --frozen --python 3.10 ruff check worker/src/runpyrs worker/tests examples/playground/worker/my_script.py
-uv run --frozen --python 3.10 --package runpyrs --extra dev pytest worker/tests
+uv run --frozen ruff format --check worker/src/runpyrs worker/tests tests scripts examples/playground/worker/my_script.py
+uv run --frozen ruff check worker/src/runpyrs worker/tests tests scripts examples/playground/worker/my_script.py
+uv run --frozen mypy
+uv run --frozen --all-packages pytest worker/tests tests/docs tests/hooks tests/release --doctest-modules worker/src/runpyrs
+# Against the minimum Python without replacing .venv:
+uv run --frozen --all-packages --isolated --python 3.10 pytest worker/tests
 ```
+
+CI runs these on the platform matrix described in the
+[overview](docs/overview.md#continuous-integration), plus
+`scripts/package-smoke.sh`.
 
 Run the integration playground:
 

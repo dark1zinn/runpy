@@ -1,0 +1,55 @@
+name: Development shell
+
+# Executes the Nix development shell natively; other systems in flake.nix
+# are evaluated only.
+on:
+  pull_request:
+    paths:
+      - 'flake.nix'
+      - 'flake.lock'
+      - '.envrc'
+      - 'pyproject.toml'
+      - 'worker/pyproject.toml'
+      - 'uv.lock'
+      - '.github/workflows/dev-shell.yml'
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  shell:
+    name: Nix shell (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@e50d5f73bfe71c2dd0aa4218de8f4afa59f8f81d # v16
+
+      - name: Check flake on the native system
+        run: nix flake check --print-build-logs
+
+      - name: Evaluate every supported system
+        run: nix flake show --all-systems
+
+      - name: Run documented tools in the shell
+        run: >-
+          nix develop --command sh -c '
+          rustc --version | grep -F "rustc 1.93.0 " &&
+          cargo fmt --version && cargo clippy --version && cargo deny --version &&
+          python3.14 --version && uv --version && gh --version && actionlint --version &&
+          uv sync --frozen --all-packages --group dev --python 3.14 &&
+          uv run --frozen ruff --version && uv run --frozen mypy --version &&
+          uv run --frozen pytest --version && uv run --frozen pip-audit --version'

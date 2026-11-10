@@ -1,14 +1,31 @@
 #!/bin/sh
+# Quick format and lint checks on exactly what is being committed.
+#
+# The staged tree is exported from the index into a private snapshot under
+# the Git directory, and every check runs there. Unstaged edits and untracked
+# files never influence the result, and the index and working tree are never
+# modified: no stash, reset, or checkout over user files. Build caches are
+# shared outside the snapshot; source files never are. Full behavior tests
+# run in CI, not here.
 set -eu
 
 repo_root=$(git rev-parse --show-toplevel)
-cd "$repo_root"
+git_dir=$(git rev-parse --absolute-git-dir)
+snapshot="$git_dir/runpy-pre-commit/tree"
 
-# Return success for matching staged changes or a Git diff error.
+if [ -n "$(git ls-files --unmerged)" ]; then
+    printf '%s\n' 'pre-commit: resolve unmerged index entries before committing.' >&2
+    exit 1
+fi
+
+# Return success when staged changes (including deletions and both sides of
+# renames) touch the given pathspecs.
 has_staged_changes() {
-    ! git diff --cached --quiet -- "$@"
+    [ -n "$(git diff --cached --no-renames --name-only -- "$@")" ]
 }
 
+check_rust=false
+check_python=false
 if has_staged_changes \
     ':(glob)**/*.rs' \
     'Cargo.toml' \
@@ -24,12 +41,8 @@ if has_staged_changes \
     '.clippy.toml' \
     '.githooks/pre-commit'
 then
-    printf '%s\n' 'Checking Rust formatting...'
-    cargo fmt --all -- --check
-    printf '%s\n' 'Checking Rust lints...'
-    cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+    check_rust=true
 fi
-
 if has_staged_changes \
     ':(glob)**/*.py' \
     'pyproject.toml' \
@@ -43,14 +56,51 @@ if has_staged_changes \
     'worker/src/runpyrs/py.typed' \
     '.githooks/pre-commit'
 then
+    check_python=true
+fi
+if [ "$check_rust" = false ] && [ "$check_python" = false ]; then
+    exit 0
+fi
+
+# A fixed path keeps incremental build caches valid between commits; Git's
+# index lock already serializes commits in one working tree.
+cleanup() {
+    rm -rf "$snapshot"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+cleanup
+mkdir -p "$snapshot"
+# Tracked index entries only, with their modes (executable bits, symlinks).
+git checkout-index --all --prefix="$snapshot/"
+cd "$snapshot"
+
+if [ "$check_rust" = true ]; then
+    export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$repo_root/target}"
+    printf '%s\n' 'Checking Rust formatting...'
+    cargo fmt --all -- --check
+    printf '%s\n' 'Checking Rust lints...'
+    cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+fi
+
+if [ "$check_python" = true ]; then
+    # The environment comes from the snapshot's own lock, in a reusable
+    # location outside the snapshot.
+    export UV_PROJECT_ENVIRONMENT="$git_dir/runpy-pre-commit/venv"
+    unset VIRTUAL_ENV
     printf '%s\n' 'Checking Python formatting...'
-    uv run --frozen ruff format --check \
+    uv run --frozen --python 3.10 ruff format --check \
         worker/src/runpyrs \
         worker/tests \
+        tests \
+        scripts \
         examples/playground/worker/my_script.py
     printf '%s\n' 'Checking Python lints...'
-    uv run --frozen ruff check \
+    uv run --frozen --python 3.10 ruff check \
         worker/src/runpyrs \
         worker/tests \
+        tests \
+        scripts \
         examples/playground/worker/my_script.py
 fi

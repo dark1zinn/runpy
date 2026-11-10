@@ -23,7 +23,7 @@ class Envelope(TypedDict):
 
 #: Operation names reserved for Runpy in ``meta["x_op"]``.
 RunpyOperation = Literal[
-    "ready", "execute", "retry", "terminate", "done", "error", "log"
+    "ready", "execute", "cancel", "terminate", "done", "error", "cancelled", "log"
 ]
 
 #: Direct ``data`` object supplied to :meth:`runpyrs.Worker.execute`.
