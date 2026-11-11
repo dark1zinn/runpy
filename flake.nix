@@ -37,16 +37,16 @@
         );
 
       # The Rust release CI and `rust-version` target. The hash is that of
-      # https://static.rust-lang.org/dist/channel-rust-1.93.0.toml, checked
+      # https://static.rust-lang.org/dist/channel-rust-1.95.0.toml, checked
       # against the published .sha256.
-      rustVersion = "1.93.0";
+      rustVersion = "1.95.0";
     in
     {
       overlays.default = final: prev: {
         rustToolchain =
           (inputs.fenix.packages.${prev.stdenv.hostPlatform.system}.fromToolchainName {
             name = rustVersion;
-            sha256 = "sha256-vra6TkHITpwRyA5oBKAHSX0Mi6CBDNQD+ryPSpxFsfg=";
+            sha256 = "sha256-gh/xTkxKHL4eiRXzWv8KP7vfjSk61Iq48x47BEDFgfk=";
           }).withComponents
             [
               "cargo"

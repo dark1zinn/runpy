@@ -18,7 +18,7 @@
 //! printed (as GitHub warning annotations under Actions) and never fail the
 //! process: shared hosts are too noisy for automatic gating.
 
-use rand::{Rng, SeedableRng, distributions::Alphanumeric, rngs::StdRng};
+use rand::{RngExt, SeedableRng, distr::Alphanumeric, rngs::StdRng};
 use runpy::{Data, Manager, PoolConfig};
 use serde_json::{Map, Value, json};
 use std::path::{Path, PathBuf};
