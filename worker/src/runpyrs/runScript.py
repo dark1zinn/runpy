@@ -3,19 +3,18 @@
 import os
 import sys
 
-from typing import Dict, Type
 from .worker import Worker
 
 # ── Helper ──────────────────────────────────────────────────────────────
 
 
-def _parse_extra_args(args: list[str]) -> Dict[str, str]:
+def _parse_extra_args(args: list[str]) -> dict[str, str]:
     """Parse ``--key=value`` arguments, ignoring every other token.
 
     Later occurrences of the same key replace earlier values. Values may
     contain additional ``=`` characters.
     """
-    extra: Dict[str, str] = {}
+    extra: dict[str, str] = {}
     for arg in args:
         if arg.startswith("--") and "=" in arg:
             key, value = arg[2:].split("=", 1)
@@ -36,13 +35,14 @@ def _fail(message: str) -> None:
         print(message, file=sys.stderr, flush=True)
     except (OSError, ValueError, AttributeError):
         try:
-            sys.stderr = open(os.devnull, "w")
+            # Replaces stderr for the rest of the process, so no `with` block.
+            sys.stderr = open(os.devnull, "w")  # noqa: SIM115
         except OSError:
             sys.stderr = None
     sys.exit(1)
 
 
-def RunScript(worker_class: Type[Worker]) -> None:
+def RunScript(worker_class: type[Worker]) -> None:
     """Instantiate a :class:`Worker` subclass and run its receive loop.
 
     The Rust Manager supplies the Unix socket path in ``sys.argv[1]`` and the
@@ -81,10 +81,10 @@ def RunScript(worker_class: Type[Worker]) -> None:
 
     try:
         worker = worker_class(socket_path, worker_name, extra_args)
-    except Exception as error:
+    except Exception as error:  # noqa: BLE001 - every failure exits with status 1
         _fail(f"Worker initialization failed: {type(error).__name__}: {error}")
 
     try:
         worker.run()
-    except Exception as error:
+    except Exception as error:  # noqa: BLE001 - every failure exits with status 1
         _fail(f"Protocol violation: {type(error).__name__}: {error}")

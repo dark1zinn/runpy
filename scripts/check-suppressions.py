@@ -13,8 +13,9 @@ from __future__ import annotations
 import datetime
 import re
 import sys
-import tomllib
 from pathlib import Path
+
+import tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
 EXPIRY = re.compile(r"\(expires (\d{4}-\d{2}-\d{2})\)$")

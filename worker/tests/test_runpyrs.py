@@ -5,16 +5,15 @@ import sys
 import tempfile
 import threading
 import time
-from typing import get_args, get_origin, get_type_hints, Union
+from typing import Union, get_args, get_origin, get_type_hints
 
 import pytest
-
-from runpyrs import FrameTooLargeError
 from runpyrs import (
     Data,
     Envelope,
     ExecutePayload,
     ExecuteResult,
+    FrameTooLargeError,
     Meta,
     RunScript,
     Worker,

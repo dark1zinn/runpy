@@ -7,7 +7,6 @@ import sys
 import tempfile
 
 import pytest
-
 from runpyrs import AsyncWorker, RunAsyncScript
 from runpyrs.async_worker import CUSTOM_QUEUE_CAPACITY
 

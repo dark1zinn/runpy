@@ -15,8 +15,8 @@ import select
 import socket
 import struct
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import FrozenSet, Mapping, Optional
 
 from .utils import Data, Envelope, Meta, create_envelope
 
@@ -67,7 +67,7 @@ class FrameLimits:
     frame_timeout: float = DEFAULT_FRAME_TIMEOUT_MS / 1000
 
     @classmethod
-    def from_env(cls, environ: Optional[Mapping[str, str]] = None) -> "FrameLimits":
+    def from_env(cls, environ: Mapping[str, str] | None = None) -> FrameLimits:
         """Read limits supplied by the Manager, defaulting missing values.
 
         Raises:
@@ -203,7 +203,7 @@ def _recv_until(stream: socket.socket, size: int, deadline: float) -> bytes:
     return bytes(received)
 
 
-def recv_frame(stream: socket.socket, limits: FrameLimits) -> Optional[bytes]:
+def recv_frame(stream: socket.socket, limits: FrameLimits) -> bytes | None:
     """Read one frame body from a blocking socket.
 
     Waiting for the first byte is unbounded and a clean close before it
@@ -234,7 +234,7 @@ def recv_frame(stream: socket.socket, limits: FrameLimits) -> Optional[bytes]:
 
 async def recv_frame_async(
     reader: asyncio.StreamReader, limits: FrameLimits
-) -> Optional[bytes]:
+) -> bytes | None:
     """Asynchronous :func:`recv_frame` for an asyncio stream, same contract."""
     first = await reader.read(1)
     if not first:
@@ -260,7 +260,7 @@ async def recv_frame_async(
         raise TimeoutError("Frame did not complete before the frame timeout") from error
 
 
-def decode_envelope(payload: bytes, manager_operations: FrozenSet[str]) -> Envelope:
+def decode_envelope(payload: bytes, manager_operations: frozenset[str]) -> Envelope:
     """Decode and validate one Manager-to-worker frame body.
 
     Raises:
@@ -275,7 +275,7 @@ def decode_envelope(payload: bytes, manager_operations: FrozenSet[str]) -> Envel
     return validate_inbound(decoded, manager_operations)
 
 
-def validate_inbound(value: object, manager_operations: FrozenSet[str]) -> Envelope:
+def validate_inbound(value: object, manager_operations: frozenset[str]) -> Envelope:
     """Validate the exact envelope shape and Manager operation boundary.
 
     Custom envelopes omit ``x_op``. ``execute`` and ``cancel`` must carry a
@@ -286,8 +286,10 @@ def validate_inbound(value: object, manager_operations: FrozenSet[str]) -> Envel
 
     meta = value["meta"]
     data = value["data"]
+    # Wrong JSON types are protocol violations, which `run` reports as
+    # ValueError, so these are not TypeError.
     if not isinstance(meta, dict) or not isinstance(data, dict):
-        raise ValueError("Envelope 'meta' and 'data' must be objects")
+        raise ValueError("Envelope 'meta' and 'data' must be objects")  # noqa: TRY004
 
     for key, item in meta.items():
         if not key.startswith("x_"):
@@ -295,7 +297,7 @@ def validate_inbound(value: object, manager_operations: FrozenSet[str]) -> Envel
         if key not in RESERVED_KEYS:
             raise ValueError(f"Unknown Runpy metadata key '{key}'")
         if not isinstance(item, str):
-            raise ValueError(f"Runpy metadata '{key}' must be a string")
+            raise ValueError(f"Runpy metadata '{key}' must be a string")  # noqa: TRY004
 
     operation = meta.get("x_op")
     if operation is not None:
@@ -324,8 +326,8 @@ def operation_envelope(
     operation: str,
     data: Data,
     *,
-    meta: Optional[Meta] = None,
-    request_id: Optional[str] = None,
+    meta: Meta | None = None,
+    request_id: str | None = None,
 ) -> Envelope:
     """Build a worker-to-Manager operation envelope."""
     envelope = create_envelope(data, meta)
@@ -343,7 +345,7 @@ def stamp(envelope: Envelope, name: str, sock_path: str) -> Envelope:
     return {"meta": meta, "data": dict(envelope["data"])}
 
 
-def invalid_result(result: object, hook: str) -> Optional[Data]:
+def invalid_result(result: object, hook: str) -> Data | None:
     """Error data when an ``execute`` result is not a dictionary or None."""
     if result is None or isinstance(result, dict):
         return None

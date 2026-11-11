@@ -4,8 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import sys
+from collections.abc import Coroutine
 from types import TracebackType
-from typing import Any, Coroutine, Dict, Optional, Set, Type
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    # Annotation-only: `typing.Self` needs Python 3.11, and the SDK has no
+    # runtime dependencies.
+    from typing_extensions import Self
 
 from ._protocol import (
     PROTOCOL_VERSION,
@@ -33,7 +39,7 @@ class _Active:
 
     def __init__(self, request_id: str) -> None:
         self.request_id = request_id
-        self.task: Optional["asyncio.Task[None]"] = None
+        self.task: asyncio.Task[None] | None = None
         self.cancel_requested = False
         #: Set once ``execute`` returned; the request can no longer be cancelled.
         self.finished = False
@@ -71,7 +77,7 @@ class AsyncWorker:
                 RunAsyncScript(Fetcher)
     """
 
-    def __init__(self, sock: str, name: str, extra: Optional[Dict[str, str]] = None):
+    def __init__(self, sock: str, name: str, extra: dict[str, str] | None = None):
         """Store the connection settings; :meth:`run` connects.
 
         Args:
@@ -88,21 +94,21 @@ class AsyncWorker:
         self._limits = FrameLimits.from_env()
         self._sock_path = sock
         self.name = name
-        self.extra: Dict[str, str] = extra or {}
-        self._writer: Optional[asyncio.StreamWriter] = None
-        self._write_lock: Optional[asyncio.Lock] = None
+        self.extra: dict[str, str] = extra or {}
+        self._writer: asyncio.StreamWriter | None = None
+        self._write_lock: asyncio.Lock | None = None
         self._open = False
-        self._active: Optional[_Active] = None
-        self._tasks: Set["asyncio.Task[None]"] = set()
+        self._active: _Active | None = None
+        self._tasks: set[asyncio.Task[None]] = set()
 
-    async def __aenter__(self) -> "AsyncWorker":
+    async def __aenter__(self) -> Self:
         return self
 
     async def __aexit__(
         self,
-        exc_type: Optional[Type[BaseException]],
-        exc: Optional[BaseException],
-        traceback: Optional[TracebackType],
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
     ) -> None:
         await self.close()
 
@@ -127,7 +133,7 @@ class AsyncWorker:
 
     # -- Sending ---------------------------------------------------------------
 
-    async def send(self, data: Data, *, meta: Optional[Meta] = None) -> None:
+    async def send(self, data: Data, *, meta: Meta | None = None) -> None:
         """Send an application-defined envelope without ``x_op``.
 
         Raises:
@@ -138,7 +144,7 @@ class AsyncWorker:
         await self._send_envelope(create_envelope(data, meta))
 
     async def log(
-        self, data: Data, *, level: str = "info", meta: Optional[Meta] = None
+        self, data: Data, *, level: str = "info", meta: Meta | None = None
     ) -> None:
         """Send a structured ``log`` operation; ``level`` replaces ``meta``'s.
 
@@ -230,7 +236,7 @@ class AsyncWorker:
                     "cancelled", {"status": "cancelled"}, request_id
                 )
                 return
-            except Exception as error:
+            except Exception as error:  # noqa: BLE001 - becomes this request's error
                 active.finished = True
                 await self._send_result("error", error_data(error), request_id)
             else:
@@ -270,12 +276,12 @@ class AsyncWorker:
                 await asyncio.wait({active.task})
         await self._send_result("cancelled", {"status": "already_finished"}, request_id)
 
-    async def _handle_custom(self, queue: "asyncio.Queue[Envelope]") -> None:
+    async def _handle_custom(self, queue: asyncio.Queue[Envelope]) -> None:
         while True:
             envelope = await queue.get()
             try:
                 await self.handle_envelope(envelope)
-            except Exception as error:
+            except Exception as error:  # noqa: BLE001 - any hook failure is reported
                 await self._send_envelope(
                     operation_envelope("error", error_data(error))
                 )
@@ -297,7 +303,7 @@ class AsyncWorker:
         self._writer = writer
         self._write_lock = asyncio.Lock()
         self._open = True
-        custom: "asyncio.Queue[Envelope]" = asyncio.Queue(CUSTOM_QUEUE_CAPACITY)
+        custom: asyncio.Queue[Envelope] = asyncio.Queue(CUSTOM_QUEUE_CAPACITY)
         custom_task = self._spawn(self._handle_custom(custom))
         try:
             await self._send_envelope(
@@ -355,7 +361,7 @@ class AsyncWorker:
             await self.close()
 
 
-def RunAsyncScript(worker_class: Type[AsyncWorker]) -> None:
+def RunAsyncScript(worker_class: type[AsyncWorker]) -> None:
     """Instantiate an :class:`AsyncWorker` subclass and run it with asyncio.
 
     Arguments, diagnostics, and exit statuses match :func:`runpyrs.RunScript`:
@@ -376,9 +382,9 @@ def RunAsyncScript(worker_class: Type[AsyncWorker]) -> None:
         _fail(f"Configuration error: {name} must inherit from AsyncWorker")
     try:
         worker = worker_class(sys.argv[1], sys.argv[2], _parse_extra_args(sys.argv[3:]))
-    except Exception as error:
+    except Exception as error:  # noqa: BLE001 - every failure exits with status 1
         _fail(f"Worker initialization failed: {type(error).__name__}: {error}")
     try:
         asyncio.run(worker.run())
-    except Exception as error:
+    except Exception as error:  # noqa: BLE001 - every failure exits with status 1
         _fail(f"Protocol violation: {type(error).__name__}: {error}")

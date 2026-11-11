@@ -26,19 +26,19 @@ class MyWorker(Worker):
         )
 
     def execute(self, payload: Data) -> Data:
-        """Business logic is isolated here."""
-        try:
-            self.log({"message": "Starting parse operation", "payload": payload})
-            # logic here...
-            return {
-                "status": "success",
-                "title": "Hello from Python!",
-                "links_count": 1,
-            }
-        except Exception as e:
-            # The Worker base class converts this exception into an error envelope.
-            # The receive loop stays alive until Rust sends terminate or the socket closes.
-            raise RuntimeError(f"Error during execution: {e}")
+        """Business logic is isolated here.
+
+        An exception raised here becomes an ``error`` envelope for this
+        request; the worker keeps serving until Rust sends ``terminate`` or
+        closes the socket.
+        """
+        self.log({"message": "Starting parse operation", "payload": payload})
+        # logic here...
+        return {
+            "status": "success",
+            "title": "Hello from Python!",
+            "links_count": 1,
+        }
 
 
 if __name__ == "__main__":

@@ -73,6 +73,7 @@ def run_hook(clone: Path) -> subprocess.CompletedProcess[str]:
         capture_output=True,
         text=True,
         env=env,
+        check=False,
     )
     assert state(clone) == before, "the hook changed the index or working tree"
     assert not (
