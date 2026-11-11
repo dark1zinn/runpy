@@ -50,7 +50,7 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            rust: 1.93.0
+            rust: 1.95.0
           - os: ubuntu-latest
             rust: stable
           - os: macos-latest

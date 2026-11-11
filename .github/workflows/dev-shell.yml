@@ -47,7 +47,7 @@ jobs:
       - name: Run documented tools in the shell
         run: >-
           nix develop --command sh -c '
-          rustc --version | grep -F "rustc 1.93.0 " &&
+          rustc --version | grep -F "rustc 1.95.0 " &&
           cargo fmt --version && cargo clippy --version && cargo deny --version &&
           python3.14 --version && uv --version && gh --version && actionlint --version &&
           uv sync --frozen --all-packages --group dev --python 3.14 &&

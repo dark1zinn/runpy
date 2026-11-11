@@ -2,7 +2,7 @@
 name = "runpy"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.93"
+rust-version = "1.95"
 authors = ["dark1zinn"]
 keywords = ["python", "script", "manager", "runner"]
 description = "A Rust manager for running and controlling Python scripts"

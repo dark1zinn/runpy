@@ -721,9 +721,9 @@ groups are never included. Zombies and threads are skipped. Metrics that
 cannot be read (sampling races, permissions) are reported as `None`, never as
 zero. Sampling refreshes the process table once per second, which costs a few
 milliseconds with typical process counts; it runs only while workers exist.
-Runpy disables sysinfo's per-process file caching
-(`sysinfo::set_open_files_limit(0)`, process-wide) so sampling holds no
-descriptor per host process between refreshes.
+sysinfo opens each process's files only for the duration of a refresh, so
+sampling holds no descriptor per host process between refreshes. If sysinfo
+cannot initialize on a host, every report is `Unknown` with no metrics.
 
 The watchdog reports process state; application-level retry, alerting, and
 termination policy remains the caller's responsibility.
@@ -817,14 +817,14 @@ unless all gates succeeded, so skipped or cancelled gates cannot pass.
 
 | Gate | Platforms |
 | --- | --- |
-| Rust fmt, Clippy, tests (parallel), docs with warnings denied | Linux: Rust 1.93.0 and stable; macOS: stable |
+| Rust fmt, Clippy, tests (parallel), docs with warnings denied | Linux: Rust 1.95.0 and stable; macOS: stable |
 | Real uv integration and playground | Linux and macOS × Python 3.10 and 3.14 |
 | Ruff, mypy strict, pytest, doctests, Markdown, hook tests | Linux × Python 3.10–3.14 |
 | `scripts/package-smoke.sh` | Linux |
 | actionlint | Linux |
 | cargo-deny licenses, bans, sources; suppression validity | Linux |
 
-The declared minimum Rust is `rust-version = "1.93"`. The development shell
+The declared minimum Rust is `rust-version = "1.95"`. The development shell
 job (`dev-shell.yml`), the scheduled benchmarks, and the advisory audit are
 separate and not required.
 
