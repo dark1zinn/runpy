@@ -39,7 +39,7 @@ source:
 
 ```bash
 cargo add runpy --git https://github.com/dark1zinn/runpy --branch main
-cargo add runpy --git https://github.com/dark1zinn/runpy --tag v0.1.0-dev.1
+cargo add runpy --git https://github.com/dark1zinn/runpy --tag v0.3.0-dev
 cargo add runpy --git https://github.com/dark1zinn/runpy --rev <commit>
 ```
 

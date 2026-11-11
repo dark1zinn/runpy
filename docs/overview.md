@@ -893,8 +893,8 @@ instead of encoding `-dev` in the manifests. To release:
 2. Tag a commit on `main` and push the tag:
 
    ```bash
-   git tag v0.2.0-dev.1 <commit-on-main>
-   git push origin v0.2.0-dev.1
+   git tag v0.3.0-dev.1 <commit-on-main>
+   git push origin v0.3.0-dev.1
    ```
 
 `release.yml` runs for every `v*` tag. Its `verify` job runs
