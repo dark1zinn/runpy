@@ -1,8 +1,9 @@
 # Migration guide
 
-This guide lists breaking changes to the Rust `runpy` crate and the Python
-`runpyrs` SDK, with the replacement for each removed or changed API. Rust and
-Python must be upgraded together because the wire protocol changes too.
+This guide lists the breaking changes in Runpy 0.3.0 (since `v0.2.0-dev`) to
+the Rust `runpy` crate and the Python `runpyrs` SDK, with the replacement for
+each removed or changed API. Rust and Python must be upgraded together because
+the wire protocol changes too.
 
 ## Rust toolchain
 

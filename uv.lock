@@ -1156,7 +1156,7 @@ wheels = [
 
 [[package]]
 name = "runpy-monorepo"
-version = "0.1.0"
+version = "0.3.0"
 source = { virtual = "." }
 
 [package.dev-dependencies]
@@ -1184,7 +1184,7 @@ dev = [
 
 [[package]]
 name = "runpyrs"
-version = "0.1.0"
+version = "0.3.0"
 source = { editable = "worker" }
 
 [[package]]
