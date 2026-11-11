@@ -13,7 +13,7 @@ authors = [
 dependencies = []
 
 [build-system]
-requires = ["hatchling>=1.27"]
+requires = ["hatchling>=1.33.0"]
 build-backend = "hatchling.build"
 
 # The sdist keeps the src/ layout so a wheel built from it finds the package.

@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, Literal, Optional, TypedDict
-
+from typing import Any, Literal, Optional, TypedDict
 
 #: Developer-owned metadata. Every key beginning with ``x_`` is reserved.
-Meta = Dict[str, Any]
+Meta = dict[str, Any]
 
 #: Developer-owned message body.
-Data = Dict[str, Any]
+Data = dict[str, Any]
 
 
 class Envelope(TypedDict):
@@ -30,10 +29,11 @@ RunpyOperation = Literal[
 ExecutePayload = Data
 
 #: Dictionary returned by ``execute``, or ``None`` for an empty ``done`` body.
-ExecuteResult = Optional[Data]
+#: A runtime alias: ``Optional`` keeps ``typing.get_origin`` at ``Union``.
+ExecuteResult = Optional[Data]  # noqa: UP045
 
 
-def create_envelope(data: Data, meta: Optional[Meta] = None) -> Envelope:
+def create_envelope(data: Data, meta: Meta | None = None) -> Envelope:
     """Build an application-defined envelope with no internal operation.
 
     ``data`` and ``meta`` must be dictionaries. Both are shallow-copied so

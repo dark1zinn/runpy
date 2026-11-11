@@ -1,9 +1,16 @@
 """Managed worker connection, protocol validation, and dispatch lifecycle."""
 
+from __future__ import annotations
+
 import socket
 import threading
 from types import TracebackType
-from typing import Dict, Optional, Type
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    # Annotation-only: `typing.Self` needs Python 3.11, and the SDK has no
+    # runtime dependencies.
+    from typing_extensions import Self
 
 from ._protocol import (
     PROTOCOL_VERSION,
@@ -24,7 +31,6 @@ from .utils import (
     Meta,
     create_envelope,
 )
-
 
 _MANAGER_OPERATIONS = frozenset({"execute", "terminate"})
 #: Capabilities this SDK advertises in ``ready``.
@@ -61,7 +67,7 @@ class Worker:
         self,
         sock: str,
         name: str,
-        extra: Optional[Dict[str, str]] = None,
+        extra: dict[str, str] | None = None,
     ):
         """Connect to the Manager.
 
@@ -89,7 +95,7 @@ class Worker:
         self.__send_lock = threading.Lock()
         self.__sock_path = sock
         self.name = name
-        self.extra: Dict[str, str] = extra or {}
+        self.extra: dict[str, str] = extra or {}
 
         self.stream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
@@ -99,14 +105,14 @@ class Worker:
             self.close()
             raise
 
-    def __enter__(self) -> "Worker":
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(
         self,
-        exc_type: Optional[Type[BaseException]],
-        exc: Optional[BaseException],
-        traceback: Optional[TracebackType],
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
     ) -> None:
         self.close()
 
@@ -156,12 +162,12 @@ class Worker:
         operation: str,
         data: Data,
         *,
-        meta: Optional[Meta] = None,
+        meta: Meta | None = None,
     ) -> None:
         """Build and send one Python-to-Manager operation envelope."""
         self._send_envelope(operation_envelope(operation, data, meta=meta))
 
-    def send(self, data: Data, *, meta: Optional[Meta] = None) -> None:
+    def send(self, data: Data, *, meta: Meta | None = None) -> None:
         """Send an application-defined envelope without ``x_op``.
 
         Args:
@@ -184,7 +190,7 @@ class Worker:
         data: Data,
         *,
         level: str = "info",
-        meta: Optional[Meta] = None,
+        meta: Meta | None = None,
     ) -> None:
         """Send a structured ``log`` operation.
 
@@ -235,7 +241,7 @@ class Worker:
 
         return None
 
-    def _recv_envelope(self) -> Optional[Envelope]:
+    def _recv_envelope(self) -> Envelope | None:
         """Read, decode, and validate one Manager-to-worker frame.
 
         The frame uses an 8-byte little-endian payload size followed by UTF-8
@@ -264,7 +270,7 @@ class Worker:
         """
         try:
             result = self.execute(payload)
-        except Exception as error:
+        except Exception as error:  # noqa: BLE001 - becomes this request's error
             self._send_result("error", error_data(error), request_id)
             return
         invalid = invalid_result(result, "Worker.execute")
@@ -290,7 +296,7 @@ class Worker:
 
         try:
             self.handle_envelope(envelope)
-        except Exception as error:
+        except Exception as error:  # noqa: BLE001 - any hook failure is reported
             # No request to answer: an unsolicited error without ``x_req``.
             self._send_operation("error", error_data(error))
 

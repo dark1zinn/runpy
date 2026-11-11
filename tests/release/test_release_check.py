@@ -64,7 +64,11 @@ def repo(tmp_path: Path) -> Path:
 
 def release_check(repo: Path, tag: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [sys.executable, str(SCRIPT), tag], cwd=repo, capture_output=True, text=True
+        [sys.executable, str(SCRIPT), tag],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=False,
     )
 
 

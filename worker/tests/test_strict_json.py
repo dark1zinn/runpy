@@ -3,7 +3,6 @@
 import json
 
 import pytest
-
 from runpyrs._protocol import MAX_JSON_DEPTH, decode_body, encode_frame
 
 
@@ -37,7 +36,7 @@ def test_duplicate_keys_are_rejected_at_any_level(body):
 
 
 def test_distinct_unicode_names_are_different_keys():
-    decoded = decode_body('{"\\u00e9": 1, "e\\u0301": 2}'.encode())
+    decoded = decode_body(b'{"\\u00e9": 1, "e\\u0301": 2}')
     assert len(decoded) == 2
 
 

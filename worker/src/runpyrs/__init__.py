@@ -8,7 +8,6 @@ one with cooperative cancellation; :func:`RunScript` and
 
 from ._protocol import FrameTooLargeError
 from .async_worker import AsyncWorker, RunAsyncScript
-from .worker import Worker
 from .runScript import RunScript
 from .utils import (
     Data,
@@ -19,18 +18,19 @@ from .utils import (
     RunpyOperation,
     create_envelope,
 )
+from .worker import Worker
 
 __all__ = [
-    "Worker",
-    "RunScript",
     "AsyncWorker",
-    "RunAsyncScript",
-    "Envelope",
-    "Meta",
     "Data",
-    "RunpyOperation",
-    "create_envelope",
+    "Envelope",
     "ExecutePayload",
     "ExecuteResult",
     "FrameTooLargeError",
+    "Meta",
+    "RunAsyncScript",
+    "RunScript",
+    "RunpyOperation",
+    "Worker",
+    "create_envelope",
 ]

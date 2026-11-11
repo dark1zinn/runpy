@@ -52,7 +52,9 @@ def manifest_version(path: Path, table: str) -> str:
 
 
 def git(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(["git", *args], cwd=root, capture_output=True, text=True)
+    return subprocess.run(
+        ["git", *args], cwd=root, capture_output=True, text=True, check=False
+    )
 
 
 def check(root: Path, tag: str, main_ref: str) -> dict[str, str]:
