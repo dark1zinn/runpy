@@ -4,6 +4,12 @@ This guide lists breaking changes to the Rust `runpy` crate and the Python
 `runpyrs` SDK, with the replacement for each removed or changed API. Rust and
 Python must be upgraded together because the wire protocol changes too.
 
+## Rust toolchain
+
+`runpy` requires Rust 1.95 or newer (`rust-version = "1.95"`, previously
+1.93), because its `sysinfo` 0.40 and `parking_lot` 0.13 dependencies do.
+Run `rustup update stable`, or pin `1.95.0` in your toolchain file.
+
 ## Rust: construction and worker handles
 
 | Before | After |

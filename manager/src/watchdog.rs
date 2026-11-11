@@ -61,7 +61,9 @@ struct GroupSample {
 
 /// Sampling state; one instance, used only on a blocking thread.
 struct Sampler {
-    system: System,
+    /// `None` when sysinfo cannot initialize on this host; reports then carry
+    /// no metrics, never fabricated zeros.
+    system: Option<System>,
     /// Accumulated CPU milliseconds per member PID, per group, from the
     /// previous sample; a CPU figure needs every current member in it.
     previous: HashMap<u32, HashMap<Pid, u64>>,
@@ -71,14 +73,8 @@ struct Sampler {
 
 impl Sampler {
     fn new() -> Self {
-        // On Linux sysinfo otherwise keeps `/proc/<pid>/stat` open for every
-        // process it has seen, up to half the descriptor limit: hundreds of
-        // descriptors per host for a scan that runs once per second. The
-        // setting is process-wide and only trades descriptors for reopening
-        // those files on each refresh.
-        sysinfo::set_open_files_limit(0);
         Self {
-            system: System::new(),
+            system: System::new().ok(),
             previous: HashMap::new(),
             previous_at: None,
         }
@@ -89,7 +85,10 @@ impl Sampler {
     /// Membership comes from `getpgid`, not sysinfo's user group. Zombies and
     /// threads are skipped; a process that vanished mid-sample is skipped.
     fn sample(&mut self, groups: &HashSet<u32>) -> HashMap<u32, GroupSample> {
-        self.system.refresh_processes_specifics(
+        let Some(system) = self.system.as_mut() else {
+            return HashMap::new();
+        };
+        system.refresh_processes_specifics(
             ProcessesToUpdate::All,
             true,
             ProcessRefreshKind::nothing().with_cpu().with_memory(),
@@ -98,7 +97,7 @@ impl Sampler {
         let sampled_at = SystemTime::now();
         let mut members: HashMap<u32, HashMap<Pid, u64>> = HashMap::new();
         let mut samples: HashMap<u32, GroupSample> = HashMap::new();
-        for (pid, process) in self.system.processes() {
+        for (pid, process) in system.processes() {
             if process.thread_kind().is_some()
                 || matches!(
                     process.status(),
@@ -166,7 +165,7 @@ fn group_cpu_percent(
 
 /// Whether `pid` is stopped by job control (for example `SIGSTOP`).
 ///
-/// sysinfo 0.37 on macOS reads a process's BSD status only when it first sees
+/// sysinfo (0.37 through 0.40) on macOS reads a process's BSD status only when it first sees
 /// the process and afterwards reports its first thread's run state, which a
 /// stop (a task suspension) does not change, so read the BSD status directly.
 #[cfg(target_os = "macos")]

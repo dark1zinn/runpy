@@ -1393,7 +1393,7 @@ impl ControlPlane {
     /// Allocate a request ID, failing rather than wrapping when exhausted.
     pub(crate) fn next_request_id(&self) -> Result<RequestId, RunpyError> {
         // A compare-exchange loop rather than `fetch_update`, which newer
-        // toolchains deprecate in favour of `try_update` (absent in 1.93).
+        // toolchains deprecate in favour of `try_update`.
         let mut id = self.next_request.load(Ordering::Acquire);
         loop {
             let next = id.checked_add(1).ok_or_else(|| {

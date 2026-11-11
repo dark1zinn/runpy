@@ -8,7 +8,7 @@
 //! Run with `cargo bench -p runpy --bench transport`.
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use rand::{Rng, SeedableRng, distributions::Alphanumeric, rngs::StdRng};
+use rand::{RngExt, SeedableRng, distr::Alphanumeric, rngs::StdRng};
 use runpy::{Data, Manager, PoolConfig};
 use serde_json::json;
 use std::os::unix::fs::PermissionsExt;

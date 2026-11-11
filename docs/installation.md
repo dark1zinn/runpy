@@ -161,7 +161,7 @@ shutdown behavior.
 
 Two equivalent paths prepare a checkout for development.
 
-**Nix and direnv.** `flake.nix` provides Rust 1.93.0 (rustfmt, Clippy,
+**Nix and direnv.** `flake.nix` provides Rust 1.95.0 (rustfmt, Clippy,
 rust-src), rust-analyzer, cargo-deny, cargo-edit, cargo-watch, Python 3.14,
 uv, git, gh, and actionlint. With direnv, `.envrc` enters that shell, runs
 `uv sync --frozen --all-packages --group dev --python 3.14`, and activates
@@ -170,7 +170,7 @@ uv, git, gh, and actionlint. With direnv, `.envrc` enters that shell, runs
 host system. Shells evaluate for x86_64/aarch64 Linux and macOS; CI executes
 them on x86_64 Linux and Apple Silicon macOS only.
 
-**uv only.** Install Rust 1.93.0 or newer and uv 0.10 or newer, then:
+**uv only.** Install Rust 1.95.0 or newer and uv 0.10 or newer, then:
 
 ```bash
 uv sync --all-packages --group dev
