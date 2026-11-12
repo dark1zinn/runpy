@@ -302,6 +302,7 @@ async fn invalid_configuration_is_rejected_before_checking_the_runtime() {
         base().max_frame_bytes(1024).queued_bytes(1024),
         base().send_timeout(Duration::ZERO),
         base().shutdown_grace(Duration::ZERO),
+        base().worker_output_rate(Some(0)),
     ] {
         let result = builder.build().await;
         assert!(

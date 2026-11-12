@@ -14,7 +14,13 @@ async fn main() {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let scripts_path = format!("{}/worker", manifest_dir);
 
-    let manager = match Manager::builder(&scripts_path).build().await {
+    // Development demo: show worker stdout/stderr in this process's log. Hosts
+    // that must keep worker output out of their logs leave this off (default).
+    let manager = match Manager::builder(&scripts_path)
+        .mirror_worker_output(true)
+        .build()
+        .await
+    {
         Ok(manager) => manager,
         Err(error) => {
             eprintln!("Failed to start Runpy: {error}");

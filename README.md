@@ -127,9 +127,12 @@ manager.on_worker_output(|output| match output.stream {
 ```
 
 The callback runs on Runpy's dedicated output-dispatcher thread and should
-return promptly. Capture is bounded and best effort. Runpy never treats stderr
-or output text as an automatic termination signal; applications own that
-policy.
+return promptly. Worker output can contain secrets, so it is not copied into
+the Manager's own log unless `Manager::builder(..).mirror_worker_output(true)`
+enables it. Each worker stream is limited to 1 MiB/s by default
+(`worker_output_rate`); excess records are dropped and counted. Runpy never
+treats stderr or output text as an automatic termination signal; applications
+own that policy.
 
 ## Run requests in parallel
 

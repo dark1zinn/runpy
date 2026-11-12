@@ -11,6 +11,19 @@ the wire protocol changes too.
 1.93), because its `sysinfo` 0.40 and `parking_lot` 0.13 dependencies do.
 Run `rustup update stable`, or pin `1.95.0` in your toolchain file.
 
+## Rust: worker output
+
+Changed after `v0.3.0-dev`:
+
+- Worker stdout and stderr are no longer copied into the Manager's log by
+  default; they reach only the `on_worker_output` handler. To keep the old
+  `[worker:<id>][<stream>] <line>` log lines, build with
+  `.mirror_worker_output(true)`, or log from your own handler.
+- Each worker stream delivers at most 1 MiB/s by default; records beyond that
+  are dropped and counted in the next record's `dropped_lines_before`. Use
+  `.worker_output_rate(Some(bytes_per_second))` to change the limit or
+  `.worker_output_rate(None)` to remove it.
+
 ## Rust: construction and worker handles
 
 | Before | After |

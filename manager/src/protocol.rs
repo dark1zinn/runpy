@@ -717,9 +717,12 @@ impl WorkerOutputStream {
 }
 
 impl WorkerOutputDispatcher {
+    /// Start the dispatcher thread. With `mirror`, every record is also
+    /// logged through Scribbler before the user handler runs.
     fn new(
         logger: Arc<Scribbler>,
         handler: Arc<RwLock<Option<WorkerOutputHandler>>>,
+        mirror: bool,
     ) -> Result<Self, String> {
         let (sender, receiver) = sync_channel::<WorkerOutput>(OUTPUT_QUEUE_CAPACITY);
         let closed = Arc::new(AtomicBool::new(false));
@@ -732,25 +735,26 @@ impl WorkerOutputDispatcher {
                         break;
                     }
 
-                    let mut message = format!(
-                        "[worker:{}][{}] {}",
-                        output.worker_id,
-                        output.stream.as_str(),
-                        output.line
-                    );
-                    if output.truncated {
-                        message.push_str(" [continued]");
-                    }
-                    if output.dropped_lines_before > 0 {
-                        message.push_str(&format!(
-                            " [dropped {} prior record(s)]",
-                            output.dropped_lines_before
-                        ));
-                    }
-
-                    match output.stream {
-                        WorkerOutputStream::Stdout => logger.info(&message),
-                        WorkerOutputStream::Stderr => logger.warning(&message),
+                    if mirror {
+                        let mut message = format!(
+                            "[worker:{}][{}] {}",
+                            output.worker_id,
+                            output.stream.as_str(),
+                            output.line
+                        );
+                        if output.truncated {
+                            message.push_str(" [continued]");
+                        }
+                        if output.dropped_lines_before > 0 {
+                            message.push_str(&format!(
+                                " [dropped {} prior record(s)]",
+                                output.dropped_lines_before
+                            ));
+                        }
+                        match output.stream {
+                            WorkerOutputStream::Stdout => logger.info(&message),
+                            WorkerOutputStream::Stderr => logger.warning(&message),
+                        }
                     }
                     let current_handler = handler.read().clone();
                     if let Some(handler) = current_handler
@@ -835,8 +839,44 @@ fn sanitize_output(bytes: &[u8]) -> String {
     sanitized
 }
 
-/// Submit without waiting; queue pressure drops records rather than blocking
-/// pipe drainage and reports accumulated loss on the next accepted record.
+/// Per-stream byte budget: one second of `rate` as burst, refilled
+/// continuously. A record larger than the whole budget costs the full budget
+/// so it can still pass once the stream has been quiet for a second.
+struct OutputBudget {
+    rate: f64,
+    available: f64,
+    refilled: tokio::time::Instant,
+}
+
+impl OutputBudget {
+    fn new(bytes_per_second: u64) -> Self {
+        let rate = bytes_per_second as f64;
+        Self {
+            rate,
+            available: rate,
+            refilled: tokio::time::Instant::now(),
+        }
+    }
+
+    /// Take budget for a record of `bytes`, or report that it must be dropped.
+    fn take(&mut self, bytes: usize) -> bool {
+        let now = tokio::time::Instant::now();
+        let elapsed = now.duration_since(self.refilled).as_secs_f64();
+        self.available = (self.available + elapsed * self.rate).min(self.rate);
+        self.refilled = now;
+        let cost = (bytes.max(1) as f64).min(self.rate);
+        if self.available >= cost {
+            self.available -= cost;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Submit without waiting. Records over the stream's byte budget, or arriving
+/// while the queue is full, are dropped rather than blocking pipe drainage;
+/// the next accepted record reports the accumulated loss.
 fn enqueue_worker_output(
     sender: &SyncSender<WorkerOutput>,
     worker_id: &str,
@@ -844,7 +884,14 @@ fn enqueue_worker_output(
     bytes: &[u8],
     truncated: bool,
     dropped_lines: &mut u64,
+    budget: Option<&mut OutputBudget>,
 ) {
+    if let Some(budget) = budget
+        && !budget.take(bytes.len())
+    {
+        *dropped_lines = dropped_lines.saturating_add(1);
+        return;
+    }
     let output = WorkerOutput {
         worker_id: worker_id.to_string(),
         stream,
@@ -865,23 +912,27 @@ fn enqueue_worker_output(
 ///
 /// Newline is the only delimiter, one preceding carriage return is normalized,
 /// EOF emits an unterminated fragment, and 16 KiB segments bound retained
-/// memory for newline-free output.
+/// memory for newline-free output. `rate` caps the bytes per second this
+/// stream delivers; `None` is unlimited.
 async fn capture_worker_output<R>(
     reader: R,
     worker_id: String,
     stream: WorkerOutputStream,
     sender: SyncSender<WorkerOutput>,
+    rate: Option<u64>,
 ) where
     R: AsyncRead + Unpin,
 {
     let mut reader = BufReader::with_capacity(OUTPUT_READ_BUFFER_SIZE, reader);
     let mut pending = Vec::with_capacity(OUTPUT_RECORD_LIMIT);
     let mut dropped_lines = 0_u64;
+    let mut budget = rate.map(OutputBudget::new);
 
     loop {
         let available = match reader.fill_buf().await {
             Ok(available) => available,
             Err(error) => {
+                // Runpy's own diagnostic is not worker output: never budgeted.
                 let diagnostic = format!("Failed to read {} pipe: {error}", stream.as_str());
                 enqueue_worker_output(
                     &sender,
@@ -890,6 +941,7 @@ async fn capture_worker_output<R>(
                     diagnostic.as_bytes(),
                     false,
                     &mut dropped_lines,
+                    None,
                 );
                 return;
             }
@@ -904,6 +956,7 @@ async fn capture_worker_output<R>(
                     &pending,
                     false,
                     &mut dropped_lines,
+                    budget.as_mut(),
                 );
             }
             return;
@@ -929,6 +982,7 @@ async fn capture_worker_output<R>(
                     &pending,
                     false,
                     &mut dropped_lines,
+                    budget.as_mut(),
                 );
                 pending.clear();
                 consumed += position + 1;
@@ -941,6 +995,7 @@ async fn capture_worker_output<R>(
                     &pending,
                     true,
                     &mut dropped_lines,
+                    budget.as_mut(),
                 );
                 pending.clear();
                 consumed += capacity;
@@ -1231,6 +1286,7 @@ impl ControlPlane {
                 let new_dispatcher = match WorkerOutputDispatcher::new(
                     self.logger.clone(),
                     self.output_handler.clone(),
+                    self.queue.mirror_worker_output,
                 ) {
                     Ok(dispatcher) => dispatcher,
                     Err(error) => {
@@ -1289,17 +1345,20 @@ impl ControlPlane {
             lifecycle,
             active_request,
         }));
+        let output_rate = self.queue.worker_output_rate;
         let stdout = tokio::spawn(capture_worker_output(
             stdout,
             worker_id.clone(),
             WorkerOutputStream::Stdout,
             output_sender.clone(),
+            output_rate,
         ));
         let stderr = tokio::spawn(capture_worker_output(
             stderr,
             worker_id.clone(),
             WorkerOutputStream::Stderr,
             output_sender,
+            output_rate,
         ));
         sessions.insert(
             worker_id,
@@ -2248,6 +2307,7 @@ mod tests {
             "worker".to_string(),
             WorkerOutputStream::Stdout,
             tx,
+            None,
         ));
 
         writer.write_all(b"one\r").await.unwrap();
@@ -2466,6 +2526,7 @@ mod tests {
             "worker".to_string(),
             WorkerOutputStream::Stderr,
             tx,
+            None,
         ));
         let mut output = vec![b'x'; OUTPUT_RECORD_LIMIT + 3];
         output.extend_from_slice(&[b'\n', 0xff, 0x1b, b'A']);
@@ -2652,6 +2713,7 @@ mod tests {
             b"first",
             false,
             &mut dropped,
+            None,
         );
         enqueue_worker_output(
             &tx,
@@ -2660,6 +2722,7 @@ mod tests {
             b"dropped",
             false,
             &mut dropped,
+            None,
         );
         assert_eq!(dropped, 1);
         assert_eq!(rx.recv().unwrap().line, "first");
@@ -2671,11 +2734,48 @@ mod tests {
             b"next",
             false,
             &mut dropped,
+            None,
         );
         let next = rx.recv().unwrap();
         assert_eq!(next.line, "next");
         assert_eq!(next.dropped_lines_before, 1);
         assert_eq!(dropped, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn output_over_the_byte_budget_is_dropped_and_counted() {
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        let (tx, rx) = sync_channel(64);
+        let task = tokio::spawn(capture_worker_output(
+            reader,
+            "worker".to_string(),
+            WorkerOutputStream::Stderr,
+            tx,
+            Some(100),
+        ));
+
+        // Ten 49-byte records at once: the one-second burst of 100 bytes
+        // admits two, and the other eight are dropped without blocking.
+        for _ in 0..10 {
+            writer.write_all(&[b'a'; 49]).await.unwrap();
+            writer.write_all(b"\n").await.unwrap();
+        }
+        // The budget refills over (virtual) time; the next record reports
+        // every record lost in between.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        writer.write_all(b"late\n").await.unwrap();
+        drop(writer);
+        task.await.unwrap();
+
+        let records: Vec<_> = rx.try_iter().collect();
+        assert_eq!(records.len(), 3, "{records:?}");
+        assert!(
+            records[..2]
+                .iter()
+                .all(|record| record.dropped_lines_before == 0)
+        );
+        assert_eq!(records[2].line, "late");
+        assert_eq!(records[2].dropped_lines_before, 8);
     }
 
     #[test]
@@ -2690,7 +2790,7 @@ mod tests {
             observed_tx.send(output.line).unwrap();
         });
         let dispatcher =
-            WorkerOutputDispatcher::new(test_logger(), Arc::new(RwLock::new(Some(handler))))
+            WorkerOutputDispatcher::new(test_logger(), Arc::new(RwLock::new(Some(handler))), false)
                 .unwrap();
         for line in ["first", "second"] {
             dispatcher

@@ -47,12 +47,14 @@
 //!
 //! ## Worker process output
 //!
-//! The control plane drains worker stdout and stderr independently and emits
-//! attributed records through [`Scribbler`] and
-//! [`Manager::on_worker_output`]. This best-effort channel is separate from
-//! structured socket messages. The observer runs on a dedicated dispatcher
-//! thread; Runpy catches and logs observer panics and never derives worker
-//! lifecycle policy from output text.
+//! The control plane drains worker stdout and stderr independently and
+//! delivers attributed records to [`Manager::on_worker_output`]. Output is
+//! not copied into the Manager's [`Scribbler`] log unless
+//! [`ManagerBuilder::mirror_worker_output`] enables it, and each stream is
+//! limited by [`ManagerBuilder::worker_output_rate`] (1 MiB/s by default).
+//! This best-effort channel is separate from structured socket messages. The
+//! observer runs on a dedicated dispatcher thread; Runpy catches and logs
+//! observer panics and never derives worker lifecycle policy from output text.
 //!
 //! ## Complete lifecycle
 //!
@@ -112,7 +114,7 @@ use crate::scheduler::Scheduler;
 pub use config::{
     DEFAULT_FRAME_TIMEOUT, DEFAULT_MAX_FRAME_BYTES, DEFAULT_MAX_PENDING_REQUESTS,
     DEFAULT_MAX_WORKERS, DEFAULT_OUTBOUND_CAPACITY, DEFAULT_QUEUED_BYTES, DEFAULT_SEND_TIMEOUT,
-    DEFAULT_SHUTDOWN_GRACE, DEFAULT_STARTUP_TIMEOUT,
+    DEFAULT_SHUTDOWN_GRACE, DEFAULT_STARTUP_TIMEOUT, DEFAULT_WORKER_OUTPUT_RATE,
 };
 pub use error::{InvalidScriptReason, RunpyError, TimeoutStage};
 pub use lifecycle::{ExitReason, WorkerExit};
@@ -252,6 +254,33 @@ impl ManagerBuilder {
         self
     }
 
+    /// Copy captured worker stdout and stderr into the Manager's log;
+    /// default `false`.
+    ///
+    /// Worker output can contain anything a script or its libraries print,
+    /// including secrets, so by default it reaches only the
+    /// [`Manager::on_worker_output`] handler, if one is registered. When
+    /// enabled, stdout is logged at info level and stderr at warning level as
+    /// `[worker:<id>][<stream>] <line>`.
+    pub fn mirror_worker_output(mut self, mirror: bool) -> Self {
+        self.queue.mirror_worker_output = mirror;
+        self
+    }
+
+    /// Bytes per second each worker's stdout and stderr may each deliver;
+    /// default [`DEFAULT_WORKER_OUTPUT_RATE`] (1 MiB/s). `None` removes the
+    /// limit; `Some(0)` is rejected.
+    ///
+    /// Each stream starts with one second of budget and refills continuously.
+    /// Records beyond the budget are dropped before mirroring and before the
+    /// handler, and counted in the next delivered record's
+    /// [`WorkerOutput::dropped_lines_before`]. Output pipes keep draining, so
+    /// a noisy worker is never blocked.
+    pub fn worker_output_rate(mut self, bytes_per_second: Option<u64>) -> Self {
+        self.queue.worker_output_rate = bytes_per_second;
+        self
+    }
+
     fn validate(&self) -> Result<ProtocolLimits, RunpyError> {
         let limits = ProtocolLimits::new(self.max_frame_bytes, self.frame_timeout)
             .map_err(RunpyError::InvalidConfig)?;
@@ -280,6 +309,11 @@ impl ManagerBuilder {
                     "{name} must be greater than zero"
                 )));
             }
+        }
+        if self.queue.worker_output_rate == Some(0) {
+            return Err(RunpyError::InvalidConfig(
+                "worker_output_rate must be greater than zero; use None for no limit".to_string(),
+            ));
         }
         Ok(limits)
     }
@@ -481,6 +515,11 @@ impl Manager {
     }
 
     /// Replace the observer for attributed worker stdout/stderr records.
+    ///
+    /// This is where worker output goes: the Manager's own log receives it
+    /// only with [`ManagerBuilder::mirror_worker_output`]. Records over a
+    /// stream's [`ManagerBuilder::worker_output_rate`] budget never reach
+    /// the observer; the next one reports them in `dropped_lines_before`.
     ///
     /// The observer runs on Runpy's dedicated output-dispatcher thread and
     /// should return promptly. A panic is caught and logged so later records
