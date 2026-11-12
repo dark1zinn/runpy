@@ -102,15 +102,16 @@ groups whose `uv` parent has exited.
 
 `Scribbler` is the Manager-owned stderr logger. It provides severity filtering,
 optional component tags, color control, and convenience output. Worker stdout
-and stderr are routed through the same logger without being interpreted as
-protocol messages.
+and stderr reach it only when `mirror_worker_output` is enabled, and are never
+interpreted as protocol messages.
 
 ### Output dispatcher
 
-Each worker has independent asynchronous stdout and stderr readers. They submit
-records without waiting to a bounded queue. One detached standard thread owns
-synchronous Scribbler output and invokes the current user observer, keeping
-terminal writes and callbacks off Tokio runtime workers.
+Each worker has independent asynchronous stdout and stderr readers. They apply
+the per-stream byte budget and submit records without waiting to a bounded
+queue. One detached standard thread mirrors records to Scribbler when enabled
+and invokes the current user observer, keeping terminal writes and callbacks
+off Tokio runtime workers.
 
 ## End-to-end lifecycle
 
@@ -146,6 +147,8 @@ the runtime checks later. The Watchdog monitor starts during `build`.
 | `shutdown_grace` | 2 s | Time a worker gets to exit after termination starts. |
 | `max_workers` | 3 | Worker processes, across all scripts, that may exist at once. |
 | `max_pending_requests` | 64 | Submitted requests, across all workers, not yet consumed. |
+| `mirror_worker_output` | off | Copy worker stdout/stderr into the Manager's log. |
+| `worker_output_rate` | 1 MiB/s | Bytes per second each worker stream may deliver; `None` for no limit. |
 
 `max_workers` counts managed workers, not OS processes: each worker is a `uv`
 process plus its Python descendants. A worker holds a slot from before `uv`
@@ -566,19 +569,9 @@ message routing and have a reply-capable callback context.
 ## Worker process output
 
 Runpy captures output inherited by `uv`, Python, and their descendants unless a
-process redirects its descriptors. It emits newline-free records through
-Scribbler with trusted attribution:
-
-```text
-[worker:<worker-id>][stdout] <line>
-[worker:<worker-id>][stderr] <line>
-```
-
-Stdout uses `info`; stderr uses `warning`. Both pipes are drained regardless of
-the configured log filter. Stderr is diagnostic, not proof that a worker
-failed, and Runpy never terminates a worker based on captured text.
-
-Applications can observe the raw record:
+process redirects its descriptors, and delivers newline-free records with
+trusted attribution to the `on_worker_output` handler. The host decides where
+output goes:
 
 ```rust
 use runpy::WorkerOutputStream;
@@ -589,6 +582,20 @@ manager.on_worker_output(|output| match output.stream {
 });
 ```
 
+Worker output can contain anything a script or a library it imports prints,
+including secrets, so Runpy does not copy it into the Manager's own log by
+default. `ManagerBuilder::mirror_worker_output(true)` enables that copy:
+
+```text
+[worker:<worker-id>][stdout] <line>
+[worker:<worker-id>][stderr] <line>
+```
+
+Mirrored stdout uses `info`; stderr uses `warning`. Both pipes are drained
+whether or not output is mirrored or observed. Stderr is diagnostic, not proof
+that a worker failed, and Runpy never terminates a worker based on captured
+text.
+
 The latest observer replaces the previous one. It runs on the dedicated output
 dispatcher thread and must return promptly. A callback panic is caught and
 logged so later records continue to dispatch. Applications can send policy
@@ -596,10 +603,14 @@ decisions to their own async channel rather than blocking the observer.
 
 Capture is bounded and best effort:
 
-- a shared queue holds 256 records;
-- a full queue drops records instead of backpressuring the worker;
-- the next accepted record reports prior loss in `dropped_lines_before` when
-  possible;
+- each worker stream may deliver `worker_output_rate` bytes per second
+  (default 1 MiB/s, `None` for no limit), with up to one second of budget as
+  burst; records beyond it are dropped before mirroring and before the
+  handler, so a chatty worker cannot flood the host;
+- a shared queue holds 256 records, and a full queue drops records instead
+  of backpressuring the worker;
+- the next delivered record reports either kind of prior loss in
+  `dropped_lines_before` (mirrored as `[dropped N prior record(s)]`);
 - reaching 16 KiB without a newline emits the bounded record with
   `truncated = true`; later bytes continue in subsequent records;
 - byte order is preserved within one stream, but stdout, stderr, and socket
@@ -630,8 +641,12 @@ ID from `sys.argv[1]` and `sys.argv[2]`. Later arguments matching
 `RunScript` returns normally (exit status 0) after `terminate` or when the
 Manager closes the connection. Missing required arguments, an invalid class,
 a construction or connection failure, a protocol violation, or a socket
-failure writes one diagnostic to stderr and exits with status 1, so Rust
-captures it at warning level. A closed stderr does not change the status.
+failure writes one diagnostic to stderr and exits with status 1. The
+diagnostic is ordinary worker output: it reaches the `on_worker_output`
+handler (and the host log with `mirror_worker_output(true)`) on a best-effort
+basis and is dropped like any other record when the stream is over its rate
+budget or the output queue is full, so hosts must not rely on receiving it.
+The exit status is always reported. A closed stderr does not change it.
 `SystemExit` and `KeyboardInterrupt` from worker code propagate unchanged.
 
 ### Worker hooks

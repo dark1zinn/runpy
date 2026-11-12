@@ -29,8 +29,11 @@ pub const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 pub const DEFAULT_MAX_PENDING_REQUESTS: usize = 64;
 /// Default Manager-wide bound on starting, running, and stopping workers.
 pub const DEFAULT_MAX_WORKERS: usize = 3;
+/// Default byte budget per second for each worker output stream: 1 MiB.
+pub const DEFAULT_WORKER_OUTPUT_RATE: u64 = 1024 * 1024;
 
-/// Bounds on outbound memory and time shared by every worker route.
+/// Manager-wide bounds on outbound memory and time, process admission, and
+/// worker output delivery.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct QueueLimits {
     /// Admitted frames per worker that may wait for the writer.
@@ -45,6 +48,10 @@ pub(crate) struct QueueLimits {
     pub max_pending_requests: usize,
     /// Worker processes, across all scripts, that may exist at once.
     pub max_workers: usize,
+    /// Whether captured worker output is copied into the Manager's log.
+    pub mirror_worker_output: bool,
+    /// Bytes per second each worker stream may deliver; `None` is unlimited.
+    pub worker_output_rate: Option<u64>,
 }
 
 impl Default for QueueLimits {
@@ -56,6 +63,8 @@ impl Default for QueueLimits {
             shutdown_grace: DEFAULT_SHUTDOWN_GRACE,
             max_pending_requests: DEFAULT_MAX_PENDING_REQUESTS,
             max_workers: DEFAULT_MAX_WORKERS,
+            mirror_worker_output: false,
+            worker_output_rate: Some(DEFAULT_WORKER_OUTPUT_RATE),
         }
     }
 }
