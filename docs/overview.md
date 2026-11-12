@@ -641,9 +641,12 @@ ID from `sys.argv[1]` and `sys.argv[2]`. Later arguments matching
 `RunScript` returns normally (exit status 0) after `terminate` or when the
 Manager closes the connection. Missing required arguments, an invalid class,
 a construction or connection failure, a protocol violation, or a socket
-failure writes one diagnostic to stderr and exits with status 1, which reaches
-the `on_worker_output` handler (and the host log with
-`mirror_worker_output(true)`). A closed stderr does not change the status.
+failure writes one diagnostic to stderr and exits with status 1. The
+diagnostic is ordinary worker output: it reaches the `on_worker_output`
+handler (and the host log with `mirror_worker_output(true)`) on a best-effort
+basis and is dropped like any other record when the stream is over its rate
+budget or the output queue is full, so hosts must not rely on receiving it.
+The exit status is always reported. A closed stderr does not change it.
 `SystemExit` and `KeyboardInterrupt` from worker code propagate unchanged.
 
 ### Worker hooks

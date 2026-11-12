@@ -840,8 +840,8 @@ fn sanitize_output(bytes: &[u8]) -> String {
 }
 
 /// Per-stream byte budget: one second of `rate` as burst, refilled
-/// continuously. A record larger than the whole budget costs the full budget
-/// so it can still pass once the stream has been quiet for a second.
+/// continuously. A record larger than the whole budget passes once the budget
+/// is full, then debits its full size, so later records wait for the refill.
 struct OutputBudget {
     rate: f64,
     available: f64,
@@ -864,9 +864,12 @@ impl OutputBudget {
         let elapsed = now.duration_since(self.refilled).as_secs_f64();
         self.available = (self.available + elapsed * self.rate).min(self.rate);
         self.refilled = now;
-        let cost = (bytes.max(1) as f64).min(self.rate);
-        if self.available >= cost {
-            self.available -= cost;
+        let size = bytes.max(1) as f64;
+        // Admission is capped at a full budget so an oversized record can
+        // pass at all; the debit is its real size, so the balance may go
+        // negative and the stream stays within `rate` over time.
+        if self.available >= size.min(self.rate) {
+            self.available -= size;
             true
         } else {
             false
@@ -2776,6 +2779,43 @@ mod tests {
         );
         assert_eq!(records[2].line, "late");
         assert_eq!(records[2].dropped_lines_before, 8);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn oversized_records_cannot_exceed_the_byte_budget_over_time() {
+        const RATE: u64 = 1024;
+        const RECORD: usize = 4096;
+        let (mut writer, reader) = tokio::io::duplex(2 * RECORD);
+        let (tx, rx) = sync_channel(64);
+        let task = tokio::spawn(capture_worker_output(
+            reader,
+            "worker".to_string(),
+            WorkerOutputStream::Stderr,
+            tx,
+            Some(RATE),
+        ));
+
+        // One 4 KiB record per second for ten seconds against 1 KiB/s. Each
+        // admitted record overdraws the budget by 3 KiB, so the next one
+        // passes only four seconds later: at 0 s, 4 s, and 8 s.
+        let seconds = 10;
+        for _ in 0..seconds {
+            writer.write_all(&[b'a'; RECORD]).await.unwrap();
+            writer.write_all(b"\n").await.unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        drop(writer);
+        task.await.unwrap();
+
+        let records: Vec<_> = rx.try_iter().collect();
+        let delivered: usize = records.iter().map(|record| record.line.len()).sum();
+        // Within the rate over the run, plus the initial burst and the one
+        // record that may overdraw it.
+        let bound = RATE as usize * seconds + RATE as usize + RECORD;
+        assert!(delivered <= bound, "{delivered} bytes > {bound}");
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[1].dropped_lines_before, 3);
+        assert_eq!(records[2].dropped_lines_before, 3);
     }
 
     #[test]
